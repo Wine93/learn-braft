@@ -3,30 +3,26 @@ learn-raft
 
 raft 理论、实现与应用
 
-目录
-===
-
-raft 论文解析
+第一章：理论
 ---
 
-* [选主](blog/paper.md)
-* [配置变更](blog/paper.md)
+* [raft 论文解析 - 选主](blog/paper.md)
+* [raft 论文解析 - 配置变更](blog/paper.md)
+* [raft 论文解析 - 日志压缩](blog/paper.md)
 
-braft 源码解析
+第二章：实现
 ---
 
-* [整体实现](blog/overview.md)
-* [服务初始化](blog/init.md)
-* [选举](blog/election.md)
-* [心跳](blog/heartbeat.md)
-* [日志复制](blog/log_replication.md)
-* [快照](blog/snapshot.md)
-* [配置变更](blog/configuration_change.md)
-* [multi-raft 实现](blog/multi_raft.md)
+* [braft 源码解析 - 整体实现](blog/overview.md)
+* [braft 源码解析 - 服务初始化](blog/init.md)
+* [braft 源码解析 - 选举](blog/election.md)
+* [braft 源码解析 - 心跳](blog/heartbeat.md)
+* [braft 源码解析 - 日志复制](blog/log_replication.md)
+* [braft 源码解析 - 快照](blog/snapshot.md)
+* [braft 源码解析 - 配置变更](blog/configuration_change.md)
+* [braft 源码解析 - multi-raft 实现](blog/multi_raft.md)
 
-// https://zhuanlan.zhihu.com/p/169904153
-// https://zhuanlan.zhihu.com/p/169840204
+第三章：应用
+---
 
-// 博士论文翻译：https://github.com/OneSizeFitsQuorum/raft-thesis-zh_cn/tree/master
-
-curvefs 中 raft 的
+* [braft 在 CurveFS 中的应用  - 心跳与调度](blog/curvefs/)

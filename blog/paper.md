@@ -1,5 +1,8 @@
 
 
+// https://zhuanlan.zhihu.com/p/169904153
+// https://zhuanlan.zhihu.com/p/169840204
+// 博士论文翻译：https://github.com/OneSizeFitsQuorum/raft-thesis-zh_cn/tree/master
 
 ```
 
