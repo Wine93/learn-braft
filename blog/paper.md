@@ -4,6 +4,8 @@
 // https://zhuanlan.zhihu.com/p/169840204
 // 博士论文翻译：https://github.com/OneSizeFitsQuorum/raft-thesis-zh_cn/tree/master
 
+// https://g.hz.netease.com/newstore
+
 ```
 
 ```
@@ -39,6 +41,19 @@ e.g.:
 ```
 
 ![](image/membership_change.jpg)
+
+快照
+---
+
+问题：
+* 打快照后，怎么进行日志对比和截断啊？
+* 日志里包含配置项？
+* 打快照是阻塞的吗？// 这时候还有日志过来怎么办？关于 apply
+
+* SST 怎么发送?
+
+```
+```
 
 
 

@@ -13,6 +13,8 @@ raft 理论、实现与应用
 第二章：实现
 ---
 
+#### braft 源码解析
+
 * [braft 源码解析 - 整体实现](blog/overview.md)
 * [braft 源码解析 - 服务初始化](blog/init.md)
 * [braft 源码解析 - 选举](blog/election.md)
@@ -22,7 +24,14 @@ raft 理论、实现与应用
 * [braft 源码解析 - 配置变更](blog/configuration_change.md)
 * [braft 源码解析 - multi-raft 实现](blog/multi_raft.md)
 
+#### etcd raft 源码解析
+
+* [etcd raft 源码解析 - 整体实现]()
+
 第三章：应用
 ---
 
 * [braft 在 CurveFS 中的应用  - 心跳与调度](blog/curvefs/)
+* [braft 在 CurveFS 中的应用  - 快照](blog/curvefs/)
+
+![](blog/image/2.jpg)
