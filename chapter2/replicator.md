@@ -1,11 +1,23 @@
-
-
+TODO
+---
 * 提交任务后，日志后被立马发送到各个 follower 吗？还是会等到下一次心跳
+* 复制时间消耗分析？
+
+## replicator 作用
+
+* 充当客户端
+* 一直不断发送日志，直到 follower 也有用这些日志，等待  LogManager 通知
+
 
 ```
 void NodeImpl::apply(const Task& task) {
     _apply_queue->execute(m, &bthread::TASK_OPTIONS_INPLACE, NULL)
 }
+```
+
+```C++
+DEFINE_int32(raft_apply_batch, 32, "Max number of tasks that can be applied "
+                                   " in a single batch");
 ```
 
 ```proto
@@ -28,7 +40,7 @@ message AppendEntriesResponse {
 };
 ```
 
-```cpp
+```c++
 int NodeImpl::execute_applying_tasks(void* meta,
                                      bthread::TaskIterator<LogEntryAndClosure>& iter) {
 }
@@ -126,7 +138,7 @@ int BallotBox::commit_at(int64_t first_log_index,
 }
 ```
 
-```
+```cpp
 int ReplicatorGroup::add_replicator(const PeerId& peer)
     Replicator::start(options, &rid);
 
@@ -179,6 +191,10 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
                                   int64_t rpc_send_time)
 
     r->_send_entries();
+    if (entries_size > 0) {
+        r->_options.ballot_box->commit_at(
+                min_flying_index, rpc_last_log_index,
+                r->_options.peer_id);
 ```
 
 ```cpp
@@ -324,3 +340,10 @@ int FSMCaller::on_committed(int64_t committed_index) {
 ```cpp
 int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter)
 ```
+
+
+参考
+---
+
+
+* [braft: 复制模型](https://github.com/baidu/braft/blob/master/docs/cn/replication.md)

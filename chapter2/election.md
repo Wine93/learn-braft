@@ -1,5 +1,50 @@
 
 
+分辨
+===
+
+* https://zhuanlan.zhihu.com/p/366661148
+
+```
+原集群commit了更多的日志，或Term增加。A重新加入集群后，由于没有足够新的日志或Term较小，它的选举请求将会被绝大多数节点拒绝。A将会在Leader节点控制下，重新成为Follower。
+// 会成为 follower 吗？term 比它大？
+
+原集群没有commit更多的日志且Term没有增加。A重新加入集群后，将可能引发集群中新一轮的选举，并产生一个新的Leader。
+```
+
+## Leader Lease
+
+```cpp
+int64_t NodeImpl::last_leader_active_timestamp(const Configuration& conf) {
+
+}
+```
+
+> 关于 replicator
+> 1. 作为客户端
+> 2.
+
+
+TODO
+---
+* lease 的作用? 如何利用其实现 follower 读？ // follower lease 吧?
+* leader lease 与 follower lease 的区别？
+// https://cn.pingcap.com/blog/lease-read/
+* raft_enable_leader_lease
+* https://github.com/baidu/braft/issues/154#issuecomment-517727551
+
+
+# prevote，怎么触发选举，leader 这么降为 follower?
+* leader 向心跳
+* 广播？
+
+# vote timeoout 作用
+
+`tradeoff`
+
+failure 的时间和
+
+https://infocenter.sybase.com/help/index.jsp?topic=/com.sybase.infocenter.dc31654.1570/html/sag1/sag1148.htm
 
 
 
