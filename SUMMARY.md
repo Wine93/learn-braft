@@ -1,6 +1,6 @@
 # Table of contents
 
-* [简介](introduction.md)
+* [Introduction](introduction.md)
 
 ## 一. 理论 - 论文解析
 * [In Search of an Understandable Consensus Algorithm (Extended Version)](chapter1/paper1.md)
