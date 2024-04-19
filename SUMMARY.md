@@ -14,6 +14,7 @@
     * [章节概览](chapter2/election_overview.md)
     * [选主流程](chapter2/election.md)
     * [选主优化](chapter2/election_optimization.md)
+    * [Leraner 与 Witness](chapter2/)
 * [日志复制](chapter2/log_replication)
     * [章节概览](chapter2/log_overview.md)
     * [复制流程](chapter2/log_replication.md)
