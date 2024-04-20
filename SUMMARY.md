@@ -6,7 +6,7 @@
 
 ## 二. 实现 - braft 源码解析
 * [简介](chapter2/01-introduction/introduction.md)
-* [初始化](chapter2/init)
+* [初始化](chapter2/initialization)
     * [章节概览](chapter2/init_overview.md)
     * [节点初始化](chapter2/init_node.md)
     * [Multi-Raft](chapter2/init_multi_raft.md)
