@@ -1,10 +1,4 @@
 
-角色
-
-* NodeManager
-* Node
-
-* vote timeout 啥作用啊？
 
 目录
 ===
@@ -15,6 +9,13 @@
 
 整体流程
 ---
+
+![alt text](image-3.png)
+
+主要做以下几件事：
+* 各类 timer 的初始化
+* 日志存储的初始化
+* 状态的初始化
 
 *Raft* 初始化流程主要为以下 6 个步骤：
 * (1)
@@ -81,6 +82,158 @@ int NodeManager::add_service(brpc::Server* server, const butil::EndPoint& listen
 归纳来说，主要做以下几类工作：
 
 ```cpp
+int NodeImpl::init(const NodeOptions& options) {
+    ...
+    // (1) 初始化以下 4 个定时器
+    //    `_election_timer`：选举定时器
+    //    `_vote_timer`：投票定时器
+    //    `_stepdown_timer`：降级定时器
+    //    `_snapshot_timer`：快照定时器
+    CHECK_EQ(0, _election_timer.init(this, options.election_timeout_ms));
+    CHECK_EQ(0, _vote_timer.init(this, options.election_timeout_ms + options.max_clock_drift_ms));
+    CHECK_EQ(0, _stepdown_timer.init(this, options.election_timeout_ms));
+    CHECK_EQ(0, _snapshot_timer.init(this, options.snapshot_interval_s * 1000));
+
+    // (2) 启动任务执行对垒
+    if (bthread::execution_queue_start(&_apply_queue_id, NULL,
+                                       execute_applying_tasks, this) != 0) {
+        ...
+        return -1;
+    }
+
+    _apply_queue = execution_queue_address(_apply_queue_id);
+
+
+    // (3)
+    // Create _fsm_caller first as log_manager needs it to report error
+    _fsm_caller = new FSMCaller();
+
+    // (4) 初始化
+    _leader_lease.init(options.election_timeout_ms);
+    _follower_lease.init(options.election_timeout_ms, options.max_clock_drift_ms);
+
+    // (5)
+    // log storage and log manager init
+    if (init_log_storage() != 0) {
+        ...
+        return -1;
+    }
+
+    // (6) 初始化
+    if (init_fsm_caller(LogId(0, 0)) != 0) {
+        ...
+        return -1;
+    }
+
+    // (7)
+    // commitment manager init
+    _ballot_box = new BallotBox();
+    BallotBoxOptions ballot_box_options;
+    ballot_box_options.waiter = _fsm_caller;
+    ballot_box_options.closure_queue = _closure_queue;
+    if (_ballot_box->init(ballot_box_options) != 0) {
+        LOG(ERROR) << "node " << _group_id << ":" << _server_id
+                   << " init _ballot_box failed";
+        return -1;
+    }
+
+    // (8)
+    // snapshot storage init and load
+    // NOTE: snapshot maybe discard entries when snapshot saved but not discard entries.
+    //      init log storage before snapshot storage, snapshot storage will update configration
+    if (init_snapshot_storage() != 0) {
+        LOG(ERROR) << "node " << _group_id << ":" << _server_id
+                   << " init_snapshot_storage failed";
+        return -1;
+    }
+
+    // (8)
+    butil::Status st = _log_manager->check_consistency();
+    if (!st.ok()) {
+        ...
+        return -1;
+    }
+
+    // (9)
+    _conf.id = LogId();
+    // if have log using conf in log, else using conf in options
+    if (_log_manager->last_log_index() > 0) {
+        _log_manager->check_and_set_configuration(&_conf);
+    } else {
+        _conf.conf = _options.initial_conf;
+    }
+
+    // (10)
+    // init meta and check term
+    if (init_meta_storage() != 0) {
+        LOG(ERROR) << "node " << _group_id << ":" << _server_id
+                   << " init_meta_storage failed";
+        return -1;
+    }
+
+    // first start, we can vote directly
+    if (_current_term == 1 && _voted_id.is_empty()) {
+        _follower_lease.reset();
+    }
+
+    // (11)
+    // init replicator
+    ReplicatorGroupOptions rg_options;
+    rg_options.heartbeat_timeout_ms = heartbeat_timeout(_options.election_timeout_ms);
+    rg_options.election_timeout_ms = _options.election_timeout_ms;
+    rg_options.log_manager = _log_manager;
+    rg_options.ballot_box = _ballot_box;
+    rg_options.node = this;
+    rg_options.snapshot_throttle = _options.snapshot_throttle
+        ? _options.snapshot_throttle->get()
+        : NULL;
+    rg_options.snapshot_storage = _snapshot_executor
+        ? _snapshot_executor->snapshot_storage()
+        : NULL;
+    _replicator_group.init(NodeId(_group_id, _server_id), rg_options);
+
+    // set state to follower
+    _state = STATE_FOLLOWER;
+
+    LOG(INFO) << "node " << _group_id << ":" << _server_id << " init,"
+              << " term: " << _current_term
+              << " last_log_id: " << _log_manager->last_log_id()
+              << " conf: " << _conf.conf
+              << " old_conf: " << _conf.old_conf;
+
+    // start snapshot timer
+    if (_snapshot_executor && _options.snapshot_interval_s > 0) {
+        BRAFT_VLOG << "node " << _group_id << ":" << _server_id
+                   << " term " << _current_term << " start snapshot_timer";
+        _snapshot_timer.start();
+    }
+
+    if (!_conf.empty()) {
+        step_down(_current_term, false, butil::Status::OK());
+    }
+
+    // add node to NodeManager
+    if (!global_node_manager->add(this)) {
+        LOG(ERROR) << "NodeManager add " << _group_id
+                   << ":" << _server_id << " failed";
+        return -1;
+    }
+
+    // Now the raft node is started , have to acquire the lock to avoid race
+    // conditions
+    std::unique_lock<raft_mutex_t> lck(_mutex);
+    if (_conf.stable() && _conf.conf.size() == 1u
+            && _conf.conf.contains(_server_id)) {
+        // The group contains only this server which must be the LEADER, trigger
+        // the timer immediately.
+        elect_self(&lck);
+    }
+
+    return 0;
+}
+```
+
+```cpp
 int NodeImpl::init(const NodeOptions& options)
     ...
 
@@ -120,3 +273,5 @@ int NodeImpl::init(const NodeOptions& options)
 typedef std::string GroupId;  // 表示复制组的 ID
 typedef std::multimap<GroupId, NodeImpl* > GroupMap;
 ```
+
+* vote timeout 啥作用啊？
