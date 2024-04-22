@@ -15,7 +15,7 @@ TODO
 
 具体实现
 ---
-
+![预先](election.svg)
 
 ### 阶段一: 预投票（*Pre-Vote*）
 

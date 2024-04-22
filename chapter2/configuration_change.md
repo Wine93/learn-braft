@@ -1,7 +1,8 @@
 配置变更
 ===
 
-新节点启动的时候需要为空节点
+新节点启动的时候需要为空节点，否则可能需要脑裂
+参考 https://github.com/baidu/braft/issues/303
 
 TODO
 ---
