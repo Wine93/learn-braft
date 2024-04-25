@@ -1,127 +1,73 @@
-
-
-快照
+简介
 ===
 
-* 简介
-* 整体设计
-* 整体实现
-* 实现细节
-
-### 必看：https://www.zhihu.com/people/yang-zhi-hu-65-47/posts
-
-*
-
-* 快照异步是不是有问题？会不会导致日志丢失？比如说快照没打成功，就把对应的日志给删除了???
-* 各个 follower 各自打快照有啥问题吗？ // 选择什么时机打？如果打的时候 leader 向 follower 发送快照呢？
-* raft meta 的作用
-* 定时器什么时候启动的
-* 快照的加载与保存流程？
-* 接受 leader 的快照，本地的快照这么办？删除吗？ // 现在看是指保存一个，以 snapshot_00000000012345 命名? 为什么需要这个后缀
-* 快照是否保存两份
-
-* 什么时候会触发安装快照？
-    * 一个是 leader 发现 follower 落后太多
-    * 重启的时候
-* follower 在接受快照的时候是不是得停止其它任务
-* 是否
-* raft_do_snapshot_min_index_gap // 这玩意官方文档好像没有？可以提个 PR 补充下
-
-![](image/aaa.png)
-
-* `do_snapshot_save` 和其他 task 任务不同的是?
-    * clouser 的调用交给用户了，不会等待 done->run 完成，允许你做异步操作
-
-## 快照元数据信息
-* 文件列表，以及每个文件对应的校验值
-```proto
-enum FileSource {
-    FILE_SOURCE_LOCAL = 0;
-    FILE_SOURCE_REFERENCE = 1;
-}
-
-message LocalFileMeta {
-    optional bytes user_meta   = 1;
-    optional FileSource source = 2;
-    optional string checksum   = 3;
-}
-
-message SnapshotMeta {
-    required int64 last_included_index = 1;
-    required int64 last_included_term = 2;
-    repeated string peers = 3;
-    repeated string old_peers = 4;
-}
-
-message LocalSnapshotPbMeta {
-    message File {
-        required string name = 1;
-        optional LocalFileMeta meta = 2;
-    };
-    optional SnapshotMeta meta = 1;
-    repeated File files = 2;
-}
-```
-
-
-# 打快照
-
 ```cpp
-void SnapshotTimer::run() {
-    _node->handle_snapshot_timeout();
-}
+快照对应的日志会不会重放？ // 应该没有被删除
 ```
 
-```cpp
-void NodeImpl::handle_snapshot_timeout() {
-}
-```
+整体流程
+===
 
-```cpp
-void NodeImpl::do_snapshot(Closure* done) {
-    LOG(INFO) << "node " << _group_id << ":" << _server_id
-              << " starts to do snapshot";
-    if (_snapshot_executor) {
-        _snapshot_executor->do_snapshot(done);
-    } else {
-        if (done) {
-            done->status().set_error(EINVAL, "Snapshot is not supported");
-            run_closure_in_bthread(done);
-        }
-    }
-}
-```
-
-```cpp
-void SnapshotExecutor::do_snapshot(Closure* done) {
-    // check snapshot install/load
-    if (_downloading_snapshot.load(butil::memory_order_relaxed)) {
-        ...
-        return;
-    }
-
-    // check snapshot saving?
-    if (_saving_snapshot) {
-        ...
-        return;
-    }
-    _saving_snapshot = true;
-
-    SaveSnapshotDone* snapshot_save_done = new SaveSnapshotDone(this, writer, done);
-    if (_fsm_caller->on_snapshot_save(snapshot_save_done) != 0) {
-    }
-}
-```
-
-```cpp
-int SnapshotExecutor::on_snapshot_save_done(
-    const butil::Status& st, const SnapshotMeta& meta, SnapshotWriter* writer) {
-
-}
-```
-
-安装快照
+步骤一：Leader 向 Follower 发送安装快照指令
 ---
+
+步骤二：Follower 从 Leader 下载快照文件
+---
+
+步骤三: Follower 加载快照
+---
+
+加载的时候是不是不再接受 Leader 的日志? 或者 Leader 不再发送日志
+
+>
+> 保存快照：
+>
+> 安装快照：*Follower*
+>
+> 加载快照：
+>
+> 对于任一节点来说，这 3 类任务是互斥的，当有
+>
+
+具体实现
+===
+
+加载快照
+---
+
+```cpp
+void SnapshotExecutor::load_downloading_snapshot(DownloadingSnapshot* ds,
+                                                 const SnapshotMeta& meta) {
+    _snapshot_storage->close(_cur_copier);
+    ...
+    InstallSnapshotDone* install_snapshot_done =
+            new InstallSnapshotDone(this, reader);
+    int ret = _fsm_caller->on_snapshot_load(install_snapshot_done);
+}
+```
+
+步骤二：从 Leader 下载快照文件
+---
+
+```proto
+message GetFileRequest {
+    required int64 reader_id = 1;
+    required string filename = 2;
+    required int64 count = 3;
+    required int64 offset = 4;
+    optional bool read_partly = 5;
+}
+
+message GetFileResponse {
+    // Data is in attachment
+    required bool eof = 1;
+    optional int64 read_size = 2;
+}
+
+service FileService {
+    rpc get_file(GetFileRequest) returns (GetFileResponse);
+}
+```
 
 ```proto
 message SnapshotMeta {
@@ -271,24 +217,14 @@ void LocalSnapshotCopier::copy() {
 }
 ```
 
-# 加载快照
 
-```cpp
-void SnapshotExecutor::load_downloading_snapshot(DownloadingSnapshot* ds,
-                                                 const SnapshotMeta& meta) {
-    _snapshot_storage->close(_cur_copier);
-    ...
-    InstallSnapshotDone* install_snapshot_done =
-            new InstallSnapshotDone(this, reader);
-    int ret = _fsm_caller->on_snapshot_load(install_snapshot_done);
-}
-```
 
-## 收尾工作
+收尾工作
+---
 
 ```cpp
 void InstallSnapshotDone::Run() {
-    _se->on_snapshot_load_done(status());
+    _se->on_snapshot_load_done(status());  // _se: SnapshotExecutor
     delete this;
 }
 

@@ -27,6 +27,76 @@
 pre vote
 ---
 
+check quorum
+---
+
+```cpp
+void NodeImpl::become_leader() {
+    ...
+    _state = STATE_LEADER;
+    ...
+    _stepdown_timer.start();
+}
+```
+
+```cpp
+void StepdownTimer::run() {
+    _node->handle_stepdown_timeout();
+}
+
+void NodeImpl::handle_stepdown_timeout() {
+    BAIDU_SCOPED_LOCK(_mutex);
+
+    // check state
+    if (_state > STATE_TRANSFERRING) {
+        BRAFT_VLOG << "node " << _group_id << ":" << _server_id
+            << " term " << _current_term << " stop stepdown_timer"
+            << " state is " << state2str(_state);
+        return;
+    }
+    check_witness(_conf.conf);
+    int64_t now = butil::monotonic_time_ms();
+    check_dead_nodes(_conf.conf, now);
+    if (!_conf.old_conf.empty()) {
+        check_dead_nodes(_conf.old_conf, now);
+    }
+}
+```
+
+```cpp
+void NodeImpl::check_dead_nodes(const Configuration& conf, int64_t now_ms) {
+    std::vector<PeerId> peers;
+    conf.list_peers(&peers);
+    size_t alive_count = 0;
+    Configuration dead_nodes;  // for easily print
+    for (size_t i = 0; i < peers.size(); i++) {
+        if (peers[i] == _server_id) {
+            ++alive_count;
+            continue;
+        }
+
+        if (now_ms - _replicator_group.last_rpc_send_timestamp(peers[i])
+                <= _options.election_timeout_ms) {
+            ++alive_count;
+            continue;
+        }
+        dead_nodes.add_peer(peers[i]);
+    }
+    if (alive_count >= peers.size() / 2 + 1) {
+        return;
+    }
+    LOG(WARNING) << "node " << node_id()
+                 << " term " << _current_term
+                 << " steps down when alive nodes don't satisfy quorum"
+                    " dead_nodes: " << dead_nodes
+                 << " conf: " << conf;
+    butil::Status status;
+    status.set_error(ERAFTTIMEDOUT, "Majority of the group dies");
+    step_down(_current_term, false, status);
+}
+
+```
+
 no-op
 ---
 

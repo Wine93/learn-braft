@@ -1,0 +1,55 @@
+
+[braft 非官方指南](https://zhuanlan.zhihu.com/p/454942497)
+
+[text](https://zhuanlan.zhihu.com/p/454942497)
+
+状态机接口
+===
+
+on_apply
+---
+
+```cpp
+virtual void on_apply(::braft::Iterator& iter) = 0;
+```
+
+* 可批量写以来提高吞吐，bacth 写可
+
+on_configuration_committed
+---
+
+不止在在状态变更成功后会回调这个接口，还会在事件中触发:
+
+* 当选 *Leader* 时
+* 状态变更成功时
+* 加载快照成功时?
+
+
+is_leader
+---
+
+切勿使用该接口来判断当前节点是否为 *Leader*，可能造成 *stale read* 和幽灵日志(?)的问题
+
+
+on_snapshot_save
+---
+
+* 不要有阻塞操作，因为是串行队列，和 *COMMITTED* 的 log 是放在一起的，可能会影响性能
+* 快照任务没有超时时间，即使卡主了，raft 也不知道
+* 关于快照的超时时间？
+
+两地三中心
+---
+
+跨机房迁移
+---
+需要 Leader?
+
+线性一致性保证
+---
+
+配置变更
+---
+
+新加入集群的配置应该为空，否则可能会产生脑裂
+

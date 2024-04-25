@@ -8,10 +8,18 @@ TODO
 
 看代码画一张流程图，leader 和 follower 分别（上下）
 
-![alt text](未命名文件-2.png)
+![hello world](未命名文件-2.png)
+
+在成为 *Leader* 后，主要做这几件事：
+
+* 通过发送空的 *AppendEntries* 请求来确定各个 *Follower* 的 *next_index*；
+* 啥时候可以服务?
+* next_index 和 committed_index 是这么确认的？
 
 阶段一：预投票
 ===
+
+![Pre-Vote](image/pre_vote.svg)
 
 发起投票
 ---
@@ -22,31 +30,49 @@ Follower
 处理响应
 ---
 
+阶段二：请求投票
+===
+
+当 *Pre-Vote* 阶段获得大多数节点的支持后，将调用 `elect_self` 正式进 *Vote* 阶段：
+* (1) 在 *elect_self* 函数中主要做以下几件事：
+    * (1.1): 将自己的状态设置为 *Candidate*；
+    * (1.2): 将当前的 *term* 加一；
+    * (1.3): 启动 *vote* 定时器：如果在指定时间内没有收到大多数节点的投票，则重新发起投票；
+    * (1.4): 对集群中的其他节点发送 *RPC* 请求 *RequestVoteRequest*
+    * (1.5): 这可以保证，确保每一个节点在一个 *term* 中只能投票给；
+
+> ***raft meta* 的持久化**
+> *raft meta* 主要用来保存 `voteFor` 等数据，作用：
+>
+>  * 重启后不会投票给其他候选人，确保在同一个任期内只有一个主
+>
+> *Follower* 在
+>
+
+![alt text](image/vote.svg)
+
+阶段三：成为 *Leader*
+===
+
+> **`is_leader` 与 `on_leader_start`**
+>
+> 仅仅依靠 `on_leader_start` 并不能完全避免 *stale read*，详见 [选主优化：leader lease]()
+> applied_index
 
 
-具体实现
----
-这里整理下
+> **关于 Replicator**
+> 作用有 2 个：
+>
+> * 做为 RPC 客户端给所有的 follower 发送各类 RPC 请求，如 `AppendEntries`、`InstallSnapshot`
+>
+> * 记录 *Follower* 的状态，如该 *Follower* 的 `next_index`、`last` 等
 
-具体实现
----
-![预先](election.svg)
+阶段四：稳定的 *Leader*
+===
 
-### 阶段一: 预投票（*Pre-Vote*）
-
-![alt text](未命名文件.png)
-
-![alt text](未命名文件-1.png)
+心跳
 
 
-### 阶段二: 请求投票（*vote*）
-
-当 *Pre-Vote* 阶段获得大多数节点的支持后，节点将进入 *vote* 阶段，此时节点将向其他节点请求投票。
-* (1.1)
-
-![alt text](vote.png)
-
-![alt text](vote.svg)
 
 
 
