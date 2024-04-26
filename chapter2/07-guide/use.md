@@ -14,6 +14,7 @@ virtual void on_apply(::braft::Iterator& iter) = 0;
 ```
 
 * 可批量写以来提高吞吐，bacth 写可
+* 操作需要确保幂等
 
 on_configuration_committed
 ---
@@ -37,6 +38,11 @@ on_snapshot_save
 * 不要有阻塞操作，因为是串行队列，和 *COMMITTED* 的 log 是放在一起的，可能会影响性能
 * 快照任务没有超时时间，即使卡主了，raft 也不知道
 * 关于快照的超时时间？
+
+on_snapshot_load
+---
+
+如果 3 个节点挂了 2 个节点，2 个节点重启的话，多久能恢复使用？这中间每个节点需要干什么？// 加载快照和回放日志?
 
 两地三中心
 ---

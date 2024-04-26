@@ -1,3 +1,28 @@
+TODO
+---
+
+* 介绍下 3 大队列，是不是顺序的保证
+
+```cpp
+bthread::ExecutionQueueId<StableClosure*> _disk_queue;  // LogManager
+bthread::ExecutionQueueId<ApplyTask> _queue_id; // FSMCaller
+bthread::ExecutionQueueId<LogEntryAndClosure> _apply_queue_id; // node
+```
+
+* apply 下去的 done 啥时候会设置成成功会失败？
+
+* 重启的时候啥时候回放日志？ 看下 on_snapshot_load
+
+* commitIndex / applid_index 是否会持久化
+
+```cpp
+RAFT需要三种不同的持久存储, 分别是:
+
+RaftMetaStorage, 用来存放一些RAFT算法自身的状态数据， 比如term, vote_for等信息.
+LogStorage, 用来存放用户提交的WAL
+SnapshotStorage, 用来存放用户的Snapshot以及元信息.
+```
+
 
 快照
 ===
