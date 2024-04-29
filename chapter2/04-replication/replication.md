@@ -8,7 +8,12 @@ replication
 整体流程
 ===
 
-![日志复制整体流程](image/replication.png)
+Leader 侧流程
+---
+![日志复制整体流程](image/replication-2.svg)
+
+Follower 侧流程
+---
 
 具体实现
 ===
