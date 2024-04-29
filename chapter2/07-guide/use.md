@@ -3,6 +3,8 @@
 
 [text](https://zhuanlan.zhihu.com/p/454942497)
 
+重点：[百度云说：解密braft的前世今生](https://zhuanlan.zhihu.com/p/38269185?utm_campaign=shareopn&utm_medium=social&utm_psn=1767850511339143169&utm_source=wechat_session)
+
 状态机接口
 ===
 

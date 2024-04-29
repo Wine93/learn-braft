@@ -121,8 +121,16 @@ braft log recovery
 check qurom
 ---
 
+
 leader lease
 ---
 
 * 作用：解决 leader 还是 leader 的问题，防止 stale read
 * API 介绍，使用
+
+参考
+===
+
+* [Raft 必备的优化手段（一）：Leader Election 篇](https://zhuanlan.zhihu.com/p/639480562)
+
+* [共识协议优质资料汇总（paxos，raft）](https://zhuanlan.zhihu.com/p/628681520)

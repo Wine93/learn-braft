@@ -1,9 +1,16 @@
 replication
 
+简介
+===
+
 介绍下 3 大队列，`ApplyTask`
 
 整理流程
 ===
+
+![日志复制整体流程](image/replication.svg)
+
+
 
 步骤一：用户向 Leader 提交任务
 ---
