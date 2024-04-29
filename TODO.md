@@ -13,7 +13,7 @@ bthread::ExecutionQueueId<LogEntryAndClosure> _apply_queue_id; // node
 
 * 重启的时候啥时候回放日志？ 看下 on_snapshot_load
 
-* commitIndex / applid_index 是否会持久化
+* commitIndex / applid_index 是否会持久化 // 不会持久化
 
 ```cpp
 RAFT需要三种不同的持久存储, 分别是:

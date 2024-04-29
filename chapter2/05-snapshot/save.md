@@ -30,12 +30,14 @@
 
 用户需要在
 
+用户需要确保在调用 `done->Run` 前，用户需要调用 `sync` 确保数据已经落盘，否则可能会导致数据丢失。
+
 步骤三：收尾工作
 ---
 
 `on_snapshot_save_done` 主要做以下几件事情：
 
-* 保存 *snapshot meta* 到 `__raft_snapshot_meta` 文件中，其通过将 *proto* 文件序列化后，包括快照中所有文件的列表以及每个每个文件的 *checksum*
+* 保存 *snapshot meta* 到 `__raft_snapshot_meta` 文件中，其通过将 *proto* 文件序列化后，包括快照中所有文件的列表以及每个每个文件的 *checksum*，需要注意的是 last_included_* 字段是快照启动时的 *index* 和 *term*
 ```proto
 message SnapshotMeta {
     required int64 last_included_index = 1;  // 快照对应最后一条日志的 index
