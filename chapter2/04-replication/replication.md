@@ -8,7 +8,7 @@ replication
 整体流程
 ===
 
-![日志复制整体流程](image/replication-1.svg)
+![日志复制整体流程](image/replication.png)
 
 具体实现
 ===
