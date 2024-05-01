@@ -18,6 +18,11 @@ Append Log Parallelly
 Asynchronous Apply
 ===
 
+raft sync
+===
+
+https://github.com/baidu/braft/issues?q=is%3Aissue+sync
+
 参考
 ===
 
