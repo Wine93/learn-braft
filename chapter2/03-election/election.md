@@ -6,6 +6,21 @@ TODO
 整体流程
 ===
 
+
+节点在收到 *Pre-Vote* 和 *Vote* 请求后，判断是否要投赞成票的逻辑是一样的，需要同时满足以下 2 个条件：
+
+* **Term**: `request.term >= currentTerm`
+* **Log**: `request.lastLogTerm > lastLogTerm` 或者 `request.lastLogTerm == lastLogTerm && request.lastLogIndex >= lastLogIndex`
+
+唯一的区别在于：
+
+* *Vote* 会记录当前任期，确保在同一个任期内只会给一个候选人投票，而 `Pre-Vote` 则可以同时投票给多个候选人，只要其满足以上 2 个条件
+* `step_down`
+
+从差异可以看出，*Pre-Vote* 更像是一次预检，检测其连通性和合法性，并没有实际的动作。
+
+
+*p*
 看代码画一张流程图，leader 和 follower 分别（上下）
 
 ![hello world](未命名文件-2.png)
