@@ -6,7 +6,7 @@ Batch
 Pipeline
 ===
 
-![串行与 Pipeline](image/pipeline.svg)
+![串行与 Pipeline](image/pipeline-2.svg)
 
 Append Log Parallelly
 ===
@@ -18,8 +18,15 @@ Append Log Parallelly
 Asynchronous Apply
 ===
 
-raft sync
+Others
 ===
+
+raft sync
+---
+
+braft 对于每次日志落盘都会进行 `sync`，如果业务对于数据丢失的容忍度比较高，可以选择将配置项 `raft_sync` 设置为 `Flase`，这将有助于。另外值得一提的是，影响日志可靠性
+
+控制日志，
 
 https://github.com/baidu/braft/issues?q=is%3Aissue+sync
 
