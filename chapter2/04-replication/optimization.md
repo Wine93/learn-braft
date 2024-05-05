@@ -24,14 +24,19 @@
 实现
 ---
 
-优化 2：并行 Append 日志
+优化 2：并行持久化日志
 ===
+
+介绍
+---
 
 ![](image/append_parallel.svg)
 
-在 Raft 的实现中，
+在 Raft 的实现中，Leader 需要先在本地持久化日志，再向所有的 Follower 复制日志，显然这样的实现具有较高的时延。特别地客户端的写都要经过 Leader，导致 Leader 的压力会变大，从而导致 IO 延迟变高成为慢节点，而本地持久化会阻塞后续的 Follower 复制。所以在 braft 中，Leader 本地持久化和 Follower 复制是并行的，即 Leader 会先将日志写入内存，同时异步地进行持久化和 Follower 复制。
 
-针对慢节点
+实现
+---
+
 
 
 优化 3：流水线复制
@@ -40,20 +45,29 @@
 ![串行与 Pipeline](image/pipeline-2.svg)
 
 
-Append Log Parallelly
+优化 4：raft sync
 ===
 
+简介
+---
+
+braft 在每次 Bacth Write 后都会进行一次 `sync`，显然这会增加时延，所以其提供了一些配置项来控制日志的落盘行为。用户可以根据业务数据丢失的容忍度高低，灵活调整这些配置以达到性能和可靠性之间的权衡。例如对于数据丢失容忍度较高的业务，可以选择将配置项 `raft_sync` 设置为 `flase`这将有助于提升性能。
+
+以下是控制日志 `sync` 的相关参数，前三项针对的是每次的 Batch Write，最后一项针对的是 `Segment`
+
+| 配置项                  | 说明                                                                                                         | 默认值                |
+|:------------------------|:-------------------------------------------------------------------------------------------------------------|:----------------------|
+| `raft_sync`             | 每次 Batch Write 后是否需要 `sync`                                                                           | `true`                |
+| `raft_sync_policy`      | 对于每次 Batch Write 的 sync 策略，有立即 sync （RAFT_SYNC_IMMEDIATELY）和按字节数 sync (RAFT_SYNC_BY_BYTES) | RAFT_SYNC_IMMEDIATELY |
+| `raft_sync_per_bytes`   | 在 RAFT_SYNC_BY_BYTES 的同步策略下，满足多少字节需要 sync 一次                                               |
+| `raft_sync_segments`    | 每当日志写满一个 `Segment` 需要切换时是否需要 `sync`，每个 Segment 默认存储 8MB 的日志                       | `false`               |
+| `raft_max_segment_size` | 单个日志 Segment 大小                                                                                        | 8MB                   |
 
 
-优化 4：异步 Apply
-===
+实现
+---
 
-优化 5：raft sync
-===
-
-braft 对于每次日志落盘都会进行 `sync`，如果业务对于数据丢失的容忍度比较高，可以选择将配置项 `raft_sync` 设置为 `Flase`，这将有助于。另外值得一提的是，影响日志可靠性
-
-控制日志，
+Batch Write 相关配置：
 
 ```cpp
 int Segment::sync(bool will_sync, bool has_conf) {
@@ -77,7 +91,22 @@ int Segment::sync(bool will_sync, bool has_conf) {
 }
 ```
 
-https://github.com/baidu/braft/issues?q=is%3Aissue+sync
+```cpp
+int Segment::close(bool will_sync) {
+    ...
+    if (_last_index > _first_index) {
+        if (FLAGS_raft_sync_segments && will_sync) {
+            ret = raft_fsync(_fd);
+        }
+    }
+    ...
+}
+```
+
+优化 5：异步 Apply
+===
+
+
 
 参考
 ===
@@ -86,3 +115,4 @@ https://github.com/baidu/braft/issues?q=is%3Aissue+sync
 * [braft docs: 复制模型](https://github.com/baidu/braft/blob/master/docs/cn/replication.md)
 * [TiKV 功能介绍 – Raft 的优化](https://cn.pingcap.com/blog/optimizing-raft-in-tikv/)
 * [Raft 必备的优化手段（二）：Log Replication & others](https://zhuanlan.zhihu.com/p/668511529)
+* [持久化策略](https://github.com/baidu/braft/issues?q=is%3Aissue+sync)
