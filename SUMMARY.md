@@ -19,7 +19,6 @@
     * [章节概览](chapter2/04-replication/overview.md)
     * [复制流程](chapter2/04-replication/replication.md)
     * [复制优化](chapter2/04-replication/optimization.md)
-    * [日志管理](chapter2/04-replication/log_manager.md)
     * [日志存储](chapter2/04-replication/log_storage.md)
 * [快照](chapter2/05-snapshot)
     * [章节概览](chapter2/05-snapshot/overview.md)

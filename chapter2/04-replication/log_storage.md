@@ -1,6 +1,64 @@
 日志的存储
 ===
 
+概览
+===
+
+`LogManager` 是日志管理的入口，
+
+`SegmentLogStorage` 是默认的日志存储引擎，其以 Segment 的方式存储日志，每一个 Segment 文件存储固定大小的日志，当单个文件大小达到上限后，braft 会将其关闭，并创建一个新的 Segment 文件用于写入。
+
+由于 raft 日志拥有顺序的特点，其 Batch 写入只需要一次顺序 IO，而对于日志的读取
+
+默认单个 Segment 文件存储 8MB 大小的日志，
+
+存储结构
+===
+
+`SegmentLogStorage` 管理的目录下将会拥有以下这些文件：
+
+* 一个 `log_meta`，用来记录每次打完快照后
+* 多个 `closed segment`：已经写满并关闭的 Segment
+* 一个 `open segment`：正在写入的 Segment
+
+
+
+
+```cpp
+// LogStorage use segmented append-only file, all data in disk, all index in memory.
+// append one log entry, only cause one disk write, every disk write will call fsync().
+//
+// SegmentLog layout:
+//      log_meta: record start_log
+//      log_000001-0001000: closed segment
+//      log_inprogress_0001001: open segment
+```
+
+Segment 文件组织
+===
+
+每个 Segment 文件保存一个日志段, Segment 文件的命名规则如下：
+
+* **closed segment**: 文件名的格式为 `log_{first_index}-{last_index}`，例如 `log_000001-0001000`，表示该文件保存的日志的索引范围为 [1, 1000]。
+* **open segment**: 文件名的格式为 `log_inprogress_{first_index}`，例如 `log_inprogress_0001001`，表示该文件保存的日志的索引范围为 [1001, ∞)。
+
+![Segment 文件](image/Segment.png)
+
+Header
+---
+
+| 字段            | 占用位 | 说明                                       |
+|:----------------|:-------|:-------------------------------------------|
+| term            | 64     | Log 的 Term                                |
+| entry-type      | 8      | Log 的类型：`no_op`/`data`/`configuration` |
+| checksum_type   | 8      | 校验类型：`CRC32`/`MurMurHash32`           |
+| reserved        | 16     | 保留字段                                   |
+| data len        | 32     | Log 实际数据的长度                           |
+| data_checksum   | 32     | Log 实际数据的校验值                       |
+| header checksum | 32     | Header（前 20 字节） 的校验值              |
+
+
+
 * [整体概览]()
 * [日志组成]()
 * [日志写入]()
@@ -8,6 +66,7 @@
 * [日志删除]()
 * [日志恢复]()
 * [总结]()
+
 
 整体概览
 ---
