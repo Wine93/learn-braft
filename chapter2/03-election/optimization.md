@@ -1,6 +1,3 @@
-选主优化
-===
-
 概览
 ===
 
@@ -26,11 +23,11 @@
 介绍
 ---
 
-如果多个成员在等待 `election_timeout` 后同时触发选举，可能会造成选票被瓜分，导致无法选出 Leader，从而需要再等待超时触发下一轮选举。为此，可以将 `election_timeout` 随机化，减少选票被瓜分的可能性。但是在极端情况下，多个成员可能拥有相同的 `election_timeout`，仍会造成选票被瓜分，为此 braft 将 `vote_timeout` 也进行了随机化。双层的随机化可以很大程度降低选票被瓜分的可能性。
+如果多个成员在等待 `election_timeout` 后同时触发选举，可能会造成选票被瓜分，导致无法选出 Leader，从而需要触发下一轮选举。为此，可以将 `election_timeout` 随机化，减少选票被瓜分的可能性。但是在极端情况下，多个成员可能拥有相同的 `election_timeout`，仍会造成选票被瓜分，为此 braft 将 `vote_timeout` 也进行了随机化。双层的随机化可以很大程度降低选票被瓜分的可能性。
 
 > **vote_timeout:**
 >
-> 如果成员在该超时时间内没有得到足够多的选票，将变为 Follower 并重新发起 `Pre-Vote`、`Vote` 的流程，无需等待 `election_timeout`
+> 如果成员在该超时时间内没有得到足够多的选票，将变为 Follower 并重新发起选举，无需等待 `election_timeout`
 
 ![极端情况：相同的 election timeout](image/random_timeout.png)
 
@@ -146,11 +143,14 @@ void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
 
 我们考虑上图中在网络分区中发生的一种现象：
 
-* **(a)**: 正常的集群
-* **(b)**: 发生网络分区后，由于有一个节点收不到 Leader 的心跳，在等待 `election_timeout` 后触发选举，进行选举时会将角色转变为 Candidate，并将自身的 Term 加一广播 `RequestVoteRequest`；然而由于收不到足够的选票，在 `vote_timeout`
-* **(c)**: 。特别需要注意的是，
+* **(a)**: 正常的集群：各节点都能收到 Leader 的心跳
+* **(b)**: 发生网络分区后，由于有一个节点收不到 Leader 的心跳，在等待 `election_timeout` 后触发选举，进行选举时会将角色转变为 Candidate，并将自身的 Term 加一广播 `RequestVoteRequest`；然而由于收不到足够的选票，在 `vote_timeout` 后宣布选举失败从而触发新一轮的选举；不断的选举致使该节点的 Term 不断增大
+* **(c)**: 当网络恢复后，Leader 得知该节点的 Term 比其大，将会自动降为 Follower，从而触发了重新选主。值得一提的是，Leader 有多种渠道得知该节点的 Term 比其大，因为节点之间所有的 RPC 请求与响应都会带上自身的 Term，所以可能是该节点选举发出的 `RequestVoteRequest`，也可能是其心跳的响应，这取决于第一个发往 Leader 的 RPC 包。
 
-为了解决这一问题，raft 在正式请求投票前引入了 `Pre-Vote` 阶段，节点需要在 `Pre-Vote` 获得足够多的选票才能正式进入 `Request-Vote` 阶段。
+从上面可以看到，当节点重新回归到集群时，由于其 Term 比 Leader 大，致使 Leader 降为 Follower，从而触发重新选主。而本质原因是，一个不可能赢得选举的节点不断增加了 Term，
+其实这次选举时没必要的，
+
+为了解决这一问题，raft 在正式请求投票前引入了 `Pre-Vote` 阶段，Term 不会增加，节点需要在 `Pre-Vote` 获得足够多的选票才能正式进入 `Vote` 阶段。
 
 节点在收到 *Pre-Vote* 和 *Vote* 请求后，判断是否要投赞成票的逻辑是一样的，需要同时满足以下 2 个条件：
 
