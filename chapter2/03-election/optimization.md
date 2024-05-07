@@ -17,7 +17,7 @@
 | leader lease   | 避免 leader 还是 leader |
 
 
-优化点 1：超时时间随机化
+优化 1：超时时间随机化
 ===
 
 介绍
@@ -88,7 +88,7 @@ void NodeImpl::handle_vote_timeout() {
 }
 ```
 
-优化点 2: Wakeup Candidate
+优化 2：Wakeup Candidate
 ===
 
 介绍
@@ -99,9 +99,15 @@ void NodeImpl::handle_vote_timeout() {
 实现
 ---
 
-Leader 正常退出：
+Leader 服务正常退出：
 
 ```cpp
+void NodeImpl::shutdown(Closure* done) {  // 服务正常退出会调用 shutdown
+    ...
+    step_down(_current_term, _state == STATE_LEADER, status);
+    ...
+}
+
 void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate,
                          const butil::Status& status) {
     ...
@@ -133,7 +139,7 @@ void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
 }
 ```
 
-优化点 3：Pre-Vote
+优化 3：Pre-Vote
 ===
 
 介绍
@@ -151,7 +157,7 @@ void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
 其实这次选举时没必要的，
 
 为了解决这一问题，raft 在正式请求投票前引入了 `Pre-Vote` 阶段，Term 不会增加，节点需要在 `Pre-Vote` 获得足够多的选票才能正式进入 `Vote` 阶段。
-
+e
 节点在收到 *Pre-Vote* 和 *Vote* 请求后，判断是否要投赞成票的逻辑是一样的，需要同时满足以下 2 个条件：
 
 * **Term**: `request.term >= currentTerm`
@@ -168,8 +174,16 @@ void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
 ---
 
 
-优化点 4：Check Quorum
+优化 4：Check Quorum
 ===
+
+介绍
+---
+
+![](image/check_quorum.png)
+
+实现
+---
 
 ```cpp
 void NodeImpl::become_leader() {
@@ -234,8 +248,35 @@ void NodeImpl::check_dead_nodes(const Configuration& conf, int64_t now_ms) {
 
 ```
 
-优化点 5：Leader Lease
+优化 5：Follower Lease
 ===
+
+介绍
+---
+
+![](image/follower_lease.png)
+
+实现
+---
+
+```cpp
+```
+
+优化 6：Leader Lease（Lease Read）
+===
+
+介绍
+---
+
+![](image/leader_lease.png)
+
+Leader Lease 的实现原理是基于一个共同承诺，超半数节点共同承诺在收到 Leader RPC 之后的 `election_timeout` 时间内不再参与投票，这保证了在这段时间内集群内不会产生新的 Leader。
+
+实现
+---
+
+```cpp
+```
 
 其他未实现优化点
 ===
@@ -243,59 +284,9 @@ void NodeImpl::check_dead_nodes(const Configuration& conf, int64_t now_ms) {
 优先级选举
 ---
 
-no-op
----
 
-no-op 的作用
-
-* https://github.com/baidu/braft/issues?q=is%3Aissue+noop
-* https://zhuanlan.zhihu.com/p/362679439
-* https://zhuanlan.zhihu.com/p/30706032
-
-幽灵复现
-
-* https://mp.weixin.qq.com/s?__biz=MzIzOTU0NTQ0MA==&mid=2247494453&idx=1&sn=17b8a97fe9490d94e14b6a0583222837&scene=21#wechat_redirect
-* https://zhuanlan.zhihu.com/p/652849109
-
-braft log recovery
-* https://github.com/baidu/braft/blob/master/docs/cn/raft_protocol.md#log-recovery
-
-
-心跳
----
-
-
-Check Quorum
+总结
 ===
-
-简介
----
-
-最后那个按照etcd的实现就是check quorum，可以再clear一点，解决的问题 1可以解决疑似脑裂问题，就是raft 以为自己是主，但是因为失联，其实主早就不是他了，这个时候check quorum 只是一种优化，因为正常情况下有新leader出现导致写不进去client会重试 2.其实最关键的是解决失联中非对称网络隔离，例如leader 可以一直发ae 给follower ，但是leader收不到ack ，这种极其严重，会导致raft 组一直不可用，所以必须自己检测自己
-
-当一个节点成为 *Leader* 时，会启动一个 `StepdownTimer`，该定时器会定期检查集群中的节点是否存活，如果发现集群中的节点不足以组成 *Quorum*，则会主动降级。
-
-实现
----
-
-```cpp
-void NodeImpl::become_leader() {
-    ...
-    _stepdown_timer.start();
-}
-```
-
-
-Follower Lease
-===
-
-
-leader lease
-===
-
-* 作用：解决 leader 还是 leader 的问题，防止 stale read
-* API 介绍，使用
-
 参考
 ===
 
@@ -308,3 +299,6 @@ leader lease
 * [raft: implement leader steps down #3866](https://github.com/etcd-io/etcd/issues/3866)
 
 * [共识协议优质资料汇总（paxos，raft）](https://zhuanlan.zhihu.com/p/628681520)
+
+* [关于leader_lease续租时机](https://github.com/baidu/braft/issues/202)
+* [TiKV 功能介绍 – Lease Read](https://cn.pingcap.com/blog//lease-read/)
