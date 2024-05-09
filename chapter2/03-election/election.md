@@ -125,7 +125,7 @@ void NodeImpl::handle_election_timeout() {
 }
 ```
 
-发送 `PreVote` 请求
+发送请求
 ---
 
 在 `pre_vote` 函数中会对所有节点发送 `PreVote` 请求，并设置 RPC 响应的回调函数为 `OnPreVoteRPCDone`， 最后 调用 `grant_slef` 给自己投一票，之后就进入等待：
@@ -156,7 +156,7 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
 }
 ```
 
-处理 `PreVote` 请求
+处理请求
 ---
 
 其他节点在收到 `PreVote` 请求后会调用 `handle_pre_vote_request` 处理请求：
@@ -195,7 +195,7 @@ int NodeImpl::handle_pre_vote_request(const RequestVoteRequest* request,
 
 ```
 
-处理 `PreVote` 响应
+处理响应
 ---
 
 在收到其他节点的 `PreVote` 响应后，会回调之前设置的 callback `OnPreVoteRPCDone->Run()`，在 callback 中会调用 `handle_pre_vote_response` 处理 `PreVote` 响应：
@@ -219,7 +219,7 @@ struct OnPreVoteRPCDone : public google::protobuf::Closure {
 
 ```
 
-`Pre-Vote` 阶段失败
+`PreVote` 失败
 ---
 
 
@@ -228,7 +228,7 @@ struct OnPreVoteRPCDone : public google::protobuf::Closure {
 
 ![alt text](image/vote.svg)
 
-发送 RequestVote 请求
+发送请求
 ---
 
 当 PreVote 阶段获得大多数节点的支持后，将调用 `elect_self` 正式进 *RequestVote* 阶段。在 `elect_self` 会将角色转变为 Candidte，并加自身的 Term + 1，向所有的节点发送 `RequestVote` 请求，最后给自己投一票后，等待其他节点的 `RequestVote` 响应：
@@ -261,10 +261,10 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
 }
 ```
 
-处理 RequestVote 请求
+处理请求
 ---
 
-处理 RequestVote 响应
+处理响应
 ---
 
 投票超时
