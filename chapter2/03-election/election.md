@@ -1,8 +1,3 @@
-
-TODO
-
-同一个节点在一个 term 内只能投票给一个人？ 会不会出现瓜分选票的情况？
-
 整体概览
 ===
 
@@ -12,7 +7,7 @@ TODO
 1. 节点在选举超时（`election_timeout`）时间内未收到任何心跳而触发选举
 2. 向所有节点广播 `PreVote` 请求，若收到大多数赞成票则进行正式选举，否则重新等待选举超时
 3. 将自身角色转变为 `Candidate`, 并将自身 `Term` 加一，向所有节点广播 `RequestVote` 请求
-4. 在投票超时（`vote_timeout`）时间内收到足够多的选票则成为 `Leader`，否则等待投票超时后转变为 `Follower` 并重复步骤 2
+4. 在投票超时（`vote_timeout`）时间内若收到足够多的选票则成为 `Leader`，若有收到更高 `Term` 的响应则转变为  `Follower` 并重复步骤 1；否则等待投票超时后转变为 `Follower` 并重复步骤 2
 5. 成为 Leader
     * 5.1 将自身角色转变为 `Leader`
     * 5.2 对所有 `Follower` 定期广播心跳
@@ -20,34 +15,66 @@ TODO
     * 5.4 回调用户状态机的 `on_leader_start`
 6. 至此，Leader 可以正式对外服务
 
-我们可以将上述流程分为 *PreVote (1-2)*、*RequestVote (3-4)*、成为 *Leader（5-6）* 这三个阶段
+上述流程可分为 PreVote (1-2)、RequestVote (3-4)、成为 Leader（5-6）这三个阶段
 
 投票规则
 ---
 
-节点在收到 *Pre-Vote* 和 *Vote* 请求后，判断是否要投赞成票的逻辑是一样的，需要同时满足以下 2 个条件：
+节点对于 `PreVote` 和 `RequestVote` 请求投赞成票的基础规则是一样的，需要同时满足以下 2 个条件：
 
-* **Term**: `request.term >= currentTerm`
-* **LastLog**: `request.lastLogTerm > lastLogTerm` 或者 `request.lastLogTerm == lastLogTerm && request.lastLogIndex >= lastLogIndex`
+* Term: 请求中的 `Term` 要大于或等于当前节点的 `Term`
+* LastLogId: 请求中的 `LastLogId` 要大于或等于当前节点的 `LastLogId`<sup>[1]</sup>
 
 唯一的区别在于：
 
-* *Vote* 会记录当前任期，确保在同一个任期内只会给一个候选人投票，而 `Pre-Vote` 则可以同时投票给多个候选人，只要其满足以上 2 个条件
-* `step_down`
+* `RequestVote` 会记录 `votedFor`，确保在同一个任期内只会给一个候选人投票，而 `PreVote` 则可以同时投票给多个候选人，只要其满足以上 2 个条件 // 补充不会投给其他人
+* `RequestVote` 若发现请求中的 `Term` 比自身的大，会 `step_down` 成 Follower，而 `PreVote` 则不会
 
-从差异可以看出，*Pre-Vote* 更像是一次预检，检测其连通性和合法性，并没有实际的动作。
+从以上差异可以看出，`PreVote` 更像是一次预检，检测其连通性和合法性，并没有实际的动作。
 
+> [1] LogId 的比较
+>
+> LogId 由 Log 的 Term 和 Index 组成，对于 2 个 LogId 来说：
+> * 若 `a.Term == b.Term`，则 `a == b`
+> * 若 `(a.Term > b.Term) || (a.Term == b.Term && a.Index > b.Index)`，则 `a > b`
 
-*p*
-看代码画一张流程图，leader 和 follower 分别（上下）
+一些关键点
+---
 
-![hello world](未命名文件-2.png)
+* `PreVote` 请求中的 Term
+* `<currentTerm, votedFor>` 会持久化，这是确保在同一个 Term 内只会产生一个 Leader 的关键
+* braft 中成为 Leader 后提交本任期内的第一条日志是配置日志，并非 `NO-OP`
+* `CommitIndex` 并不会持久化，Leader 在上述流程中的 5.3 中确认，Follower 则在之后的心跳中由 Leader 传递，只有确认了 `CommitIndex` 后才能开始回放日志
 
-在成为 *Leader* 后，主要做这几件事：
+相关 RPC
+---
 
-* 通过发送空的 *AppendEntries* 请求来确定各个 *Follower* 的 *next_index*；
-* 啥时候可以服务?
-* next_index 和 committed_index 是这么确认的？
+```proto
+message RequestVoteRequest {
+    required string group_id = 1;
+    required string server_id = 2;
+    required string peer_id = 3;
+    required int64 term = 4;
+    required int64 last_log_term = 5;
+    required int64 last_log_index = 6;
+    optional TermLeader disrupted_leader = 7;
+};
+
+message RequestVoteResponse {
+    required int64 term = 1;
+    required bool granted = 2;
+    optional bool disrupted = 3;
+    optional int64 previous_term = 4;
+    optional bool rejected_by_lease = 5;
+};
+
+service RaftService {
+    rpc pre_vote(RequestVoteRequest) returns (RequestVoteResponse);
+    rpc request_vote(RequestVoteRequest) returns (RequestVoteResponse);
+    ...
+}
+```
+
 
 阶段一：预投票
 ===

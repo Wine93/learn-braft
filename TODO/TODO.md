@@ -68,6 +68,12 @@ SnapshotStorage, 用来存放用户的Snapshot以及元信息.
 
 ```
 
+在成为 *Leader* 后，主要做这几件事：
+
+* 通过发送空的 *AppendEntries* 请求来确定各个 *Follower* 的 *next_index*；
+* 啥时候可以服务?
+* next_index 和 committed_index 是这么确认的？
+
 
 no-op
 ---
