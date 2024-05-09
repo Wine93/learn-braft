@@ -20,15 +20,20 @@
 投票规则
 ---
 
-节点对于 `PreVote` 和 `RequestVote` 请求投赞成票的基础规则是一样的，需要同时满足以下 2 个条件：
+在同一任期内，节点发出的 `PreVote` 和 `RequestVote` 的请求是一样的，区别在于`PreVote` 中的 `Term` 自身的 `Term+1`，而
+
+节点对于 `RequestVote` 请求投赞成票需要同时满足以下 3 个条件：
 
 * Term: 请求中的 `Term` 要大于或等于当前节点的 `Term`
 * LastLogId: 请求中的 `LastLogId` 要大于或等于当前节点的 `LastLogId`<sup>[1]</sup>
+* votedFor:
 
 唯一的区别在于：
 
+* 节点可以对多个
+
 * `RequestVote` 会记录 `votedFor`，确保在同一个任期内只会给一个候选人投票，而 `PreVote` 则可以同时投票给多个候选人，只要其满足以上 2 个条件 // 补充不会投给其他人
-* `RequestVote` 若发现请求中的 `Term` 比自身的大，会 `step_down` 成 Follower，而 `PreVote` 则不会
+* `RequestVote` 若发现请求中的 `Term` 比自身的大，会 `step_down` 成 Follower，而 `PreVote` 则不会，这点可以确保不会在 Pre-Vote 打断当前 Leader
 
 从以上差异可以看出，`PreVote` 更像是一次预检，检测其连通性和合法性，并没有实际的动作。
 
@@ -76,212 +81,199 @@ service RaftService {
 ```
 
 
-阶段一：预投票
+阶段一：PreVote
 ===
 
 ![Pre-Vote](image/pre_vote.svg)
 
-发起投票
+触发投票
 ---
 
-Follower
----
-
-处理响应
----
-
-阶段二：请求投票
-===
-
-当 *Pre-Vote* 阶段获得大多数节点的支持后，将调用 `elect_self` 正式进 *Vote* 阶段：
-* (1) 在 *elect_self* 函数中主要做以下几件事：
-    * (1.1): 将自己的状态设置为 *Candidate*；
-    * (1.2): 将当前的 *term* 加一；
-    * (1.3): 启动 *vote* 定时器：如果在指定时间内没有收到大多数节点的投票，则重新发起投票；
-    * (1.4): 对集群中的其他节点发送 *RPC* 请求 *RequestVoteRequest*
-    * (1.5): 这可以保证，确保每一个节点在一个 *term* 中只能投票给；
-
-> ***raft meta* 的持久化**
-> *raft meta* 主要用来保存 `voteFor` 等数据，作用：
->
->  * 重启后不会投票给其他候选人，确保在同一个任期内只有一个主
->
-> *Follower* 在
->
-
-![alt text](image/vote.svg)
-
-阶段三：成为 *Leader*
-===
-
-> **`is_leader` 与 `on_leader_start`**
->
-> 仅仅依靠 `on_leader_start` 并不能完全避免 *stale read*，详见 [选主优化：leader lease]()
-> applied_index
-
-
-> **关于 Replicator**
-> 作用有 2 个：
->
-> * 做为 RPC 客户端给所有的 follower 发送各类 RPC 请求，如 `AppendEntries`、`InstallSnapshot`
->
-> * 记录 *Follower* 的状态，如该 *Follower* 的 `next_index`、`last` 等
-
-阶段四：稳定的 *Leader*
-===
-
-心跳
-
-
-
-
-
-### 阶段三: 等待投票结果
-
-
-分辨
-===
-
-* https://zhuanlan.zhihu.com/p/366661148
-
-```
-原集群commit了更多的日志，或Term增加。A重新加入集群后，由于没有足够新的日志或Term较小，它的选举请求将会被绝大多数节点拒绝。A将会在Leader节点控制下，重新成为Follower。
-// 会成为 follower 吗？term 比它大？
-
-原集群没有commit更多的日志且Term没有增加。A重新加入集群后，将可能引发集群中新一轮的选举，并产生一个新的Leader。
-```
-
-## Leader Lease
+节点在初始化就会启动选举定时器：
 
 ```cpp
-int64_t NodeImpl::last_leader_active_timestamp(const Configuration& conf) {
+int NodeImpl::init(const NodeOptions& options) {
+    ...
+    // 只有当前节点的集群列表不为空，才会调用 step_down 启动选举定时器
+    if (!_conf.empty()) {
+        step_down(_current_term, false, butil::Status::OK());
+    }
+    ...
+}
 
+void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate,
+                         const butil::Status& status) {
+    ...
+    _election_timer.start();
 }
 ```
 
-> 关于 replicator
-> 1. 作为客户端
-> 2.
-
-
-TODO
----
-* lease 的作用? 如何利用其实现 follower 读？ // follower lease 吧?
-* leader lease 与 follower lease 的区别？
-// https://cn.pingcap.com/blog/lease-read/
-* raft_enable_leader_lease
-* https://github.com/baidu/braft/issues/154#issuecomment-517727551
-
-
-# prevote，怎么触发选举，leader 这么降为 follower?
-* leader 向心跳
-* 广播？
-
-# vote timeoout 作用
-
-`tradeoff`
-
-failure 的时间和
-
-https://infocenter.sybase.com/help/index.jsp?topic=/com.sybase.infocenter.dc31654.1570/html/sag1/sag1148.htm
-
-
+待定时器超时后就会调用 `pre_vote` 进行预投票：
 
 ```cpp
-int NodeImpl::init(const NodeOptions& options)
-    CHECK_EQ(0, _election_timer.init(this, options.election_timeout_ms * 2));
-    CHECK_EQ(0, _vote_timer.init(this, options.election_timeout_ms * 2 + options.max_clock_drift_ms));
-    CHECK_EQ(0, _stepdown_timer.init(this, options.election_timeout_ms));
-    CHECK_EQ(0, _snapshot_timer.init(this, options.snapshot_interval_s * 1000));
-```
-
-```cpp
-void ElectionTimer::run()
+// 定时器超时的 handler
+void ElectionTimer::run() {
     _node->handle_election_timeout();
-```
+}
 
-```cpp
-void NodeImpl::handle_election_timeout()
+void NodeImpl::handle_election_timeout() {
+    ...
+    reset_leader_id(empty_id, status);
+
     return pre_vote(&lck, triggered);
+    // Don't touch any thing of *this ever after
+}
 ```
 
+发送 `PreVote` 请求
+---
+
+在 `pre_vote` 函数中会对所有节点发送 `PreVote` 请求，并设置 RPC 响应的回调函数为 `OnPreVoteRPCDone`， 最后 调用 `grant_slef` 给自己投一票，之后就进入等待：
+
 ```cpp
-void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered)
-    for (std::set<PeerId>::const_iterator iter = peers.begin();
-         iter != peers.end(); ++iter) {
+void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
+
+    const LogId last_log_id = _log_manager->last_log_id(true);
+
+    _pre_vote_ctx.init(this, triggered);
+    std::set<PeerId> peers;
+    _conf.list_peers(&peers);
+
+    for (std::set<PeerId>::const_iterator
+            iter = peers.begin(); iter != peers.end(); ++iter) {
+        ...
+        OnPreVoteRPCDone* done = new OnPreVoteRPCDone(
+                *iter, _current_term, _pre_vote_ctx.version(), this);
+        ...
+        done->request.set_term(_current_term + 1); // next term
+        done->request.set_last_log_index(last_log_id.index);
+        done->request.set_last_log_term(last_log_id.term);
 
         RaftService_Stub stub(&channel);
         stub.pre_vote(&done->cntl, &done->request, &done->response, done);
     }
-
     grant_self(&_pre_vote_ctx, lck);
-```
-
-```cpp
-void NodeImpl::grant_self(VoteBallotCtx* vote_ctx, std::unique_lock<raft_mutex_t>* lck)
-        if (vote_ctx == &_pre_vote_ctx) {
-            elect_self(lck);
-        } else {
-            become_leader();
-        }
-```
-
-
-```cpp
-void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck, bool old_leader_stepped_down)
-
-    request_peers_to_vote(peers, _vote_ctx.disrupted_leader());
-
-```
-
-```cpp
-void NodeImpl::request_peers_to_vote(const std::set<PeerId>& peers,
-                                     const DisruptedLeader& disrupted_leader)
-    for (std::set<PeerId>::const_iterator
-        iter = peers.begin(); iter != peers.end(); ++iter) {
-
-        OnRequestVoteRPCDone* done =
-            new OnRequestVoteRPCDone(*iter, _current_term, _vote_ctx.version(), this);
-
-        RaftService_Stub stub(&channel);
-        stub.request_vote(&done->cntl, &done->request, &done->response, done);
-    }
-```
-
-```cpp
-struct OnRequestVoteRPCDone : public google::protobuf::Closure {
-    void Run() {
-        node->handle_request_vote_response(peer, term, ctx_version, response);
-    }
 }
 ```
 
+处理 `PreVote` 请求
+---
+
+其他节点在收到 `PreVote` 请求后会调用 `handle_pre_vote_request` 处理请求：
+
 ```cpp
-void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t term,
-                                            const int64_t ctx_version,
-                                            const RequestVoteResponse& response)
-    if (response.granted()) {
-        if (_vote_ctx.granted()) {
-            return become_leader();
+int NodeImpl::handle_pre_vote_request(const RequestVoteRequest* request,
+                                      RequestVoteResponse* response) {
+    ...
+    do {
+        // (1) 判断 Term
+        if (request->term() < _current_term) {
+            ...
+            break;
         }
-    }
+
+        // (2) 判断 LastLogId
+        ...
+        LogId last_log_id = _log_manager->last_log_id(true);
+        ...
+        bool grantable = (LogId(request->last_log_index(), request->last_log_term())
+                        >= last_log_id);
+        if (grantable) {
+            granted = (votable_time == 0);
+        }
+        ...
+    } while (0);
+
+    // (3) 设置响应
+    ...
+    response->set_term(_current_term);
+    response->set_granted(granted);  //
+    ...
+
+    return 0;
+}
+
 ```
 
+处理 `PreVote` 响应
+---
+
+在收到其他节点的 `PreVote` 响应后，会回调之前设置的 callback `OnPreVoteRPCDone->Run()`，在 callback 中会调用 `handle_pre_vote_response` 处理 `PreVote` 响应：
 
 ```cpp
-void NodeImpl::become_leader()
-
-    for (std::set<PeerId>::const_iterator iter = peers.begin();
-         iter != peers.end(); ++iter) {
-
-        _replicator_group.add_replicator(*iter);
+struct OnPreVoteRPCDone : public google::protobuf::Closure {
+    ...
+    void Run() {
+            if (cntl.ErrorCode() != 0) {
+                ...
+                break;
+            }
+            node->handle_pre_vote_response(peer, term, ctx_version, response);
     }
+    ...
+};
 ```
 
-```
-int ReplicatorGroup::add_replicator(const PeerId& peer)
-    Replicator::start(options, &rid);
+处理 `PreVote` 响应：
+```cpp
 
-    _rmap[peer] = { rid, options.replicator_status };
 ```
 
+`Pre-Vote` 阶段失败
+---
+
+
+阶段二：`RequestVote`
+===
+
+![alt text](image/vote.svg)
+
+发送 RequestVote 请求
+---
+
+当 PreVote 阶段获得大多数节点的支持后，将调用 `elect_self` 正式进 *RequestVote* 阶段。在 `elect_self` 会将角色转变为 Candidte，并加自身的 Term + 1，向所有的节点发送 `RequestVote` 请求，最后给自己投一票后，等待其他节点的 `RequestVote` 响应：
+
+```cpp
+void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
+                          bool old_leader_stepped_down) {
+    ...
+
+    _state = STATE_CANDIDATE;  //
+    _current_term++;           // 将自身的 Term+1
+    _voted_id = _server_id;    // 记录 votedFor 投给自己
+
+    ...
+    // 启动投票超时器：如果在 vote_timeout 未得到足够多的选票，则变为 Follower 重新进行 PreVote
+    _vote_timer.start();
+
+    const LogId last_log_id = _log_manager->last_log_id(true);
+
+    _vote_ctx.set_last_log_id(last_log_id);
+
+    std::set<PeerId> peers;
+    _conf.list_peers(&peers);
+    request_peers_to_vote(peers, _vote_ctx.disrupted_leader());
+
+    // 持久化 votedFor
+    status = _meta_storage->
+                    set_term_and_votedfor(_current_term, _server_id, _v_group_id);
+    grant_self(&_vote_ctx, lck);
+}
+```
+
+处理 RequestVote 请求
+---
+
+处理 RequestVote 响应
+---
+
+投票超时
+---
+
+如果在投票超时时间内，  ``
+
+```cpp
+```
+
+阶段三：成为 *Leader*
+===
