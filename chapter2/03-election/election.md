@@ -228,6 +228,27 @@ struct OnPreVoteRPCDone : public google::protobuf::Closure {
 投票失败
 ---
 
+```cpp
+void VoteTimer::run() {
+    _node->handle_vote_timeout();
+}
+
+int VoteTimer::adjust_timeout_ms(int timeout_ms) {
+    return random_timeout(timeout_ms);
+}
+```
+
+```cpp
+void NodeImpl::handle_vote_timeout() {
+    ...
+    butil::Status status;
+    status.set_error(ERAFTTIMEDOUT, "Fail to get quorum vote-granted");
+    step_down(_current_term, false, status);
+    pre_vote(&lck, false);
+    ...
+}
+```
+
 
 阶段二：`RequestVote`
 ===

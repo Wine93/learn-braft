@@ -1,7 +1,14 @@
-replication
-
-简介
+整体概览
 ===
+
+复制流程
+---
+
+1. 客户端向 Leader 提交 Task
+2. Leader 将 Task 对应的，并异步持久化
+3. 同时，Leader 向所有 Follower 复制日志
+4. 待收到
+5.
 
 介绍下 3 大队列，`ApplyTask`
 
