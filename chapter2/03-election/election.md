@@ -11,11 +11,23 @@
 5. 成为 Leader
     * 5.1 将自身角色转变为 `Leader`
     * 5.2 对所有 `Follower` 定期广播心跳
-    * 5.3 通过提交一条本任期的配置日志来提交上一任期的日志，并回放这些日志来恢复状态机
-    * 5.4 回调用户状态机的 `on_leader_start`
+    * 5.3 通过发送空的 `AppendEntries` 请求来确定各 Follower 的 `nextIndex`
+    * 5.4 将上一任期的日志全部复制给 Follower（**只复制不提交，不更新 CommitIndex**）
+    * 5.5 通过提交一条本任期的配置日志来提交上一任期的日志，并回放这些日志来恢复状态机
+    * 5.6 回调用户状态机的 `on_leader_start`
 6. 至此，Leader 可以正式对外服务
 
 上述流程可分为 PreVote (1-2)、RequestVote (3-4)、成为 Leader（5-6）这三个阶段
+
+流程注释
+---
+
+* `PreVote` 请求中的 Term
+* 二元组 `<currentTerm, votedFor>` 会持久化，即使重启也能确保一个任期能只给一个节点投票，这是确保在同一个 Term 内只会产生一个 Leader 的关键
+* 5.3 只有确定了各 Follower 的 `nextIndex` 才能发送日志，不然不知道从哪里开始发送日志
+* 5.4 对于上一任期的日志只复制不提交是为了防止幽灵日志问题，需通过 5.5 提交
+* 5.5 braft 中成为 Leader 后提交本任期内的第一条日志是配置日志，并非 `no-op`
+* 5.5 `CommitIndex` 并不会持久化，Leader 只有提交了配置日志才能确认，Follower 则在之后的心跳中由 Leader 传递，只有确认了 `CommitIndex` 后才能开始回放日志
 
 投票规则
 ---
@@ -43,13 +55,6 @@
 > * 若 `a.Term == b.Term`，则 `a == b`
 > * 若 `(a.Term > b.Term) || (a.Term == b.Term && a.Index > b.Index)`，则 `a > b`
 
-一些关键点
----
-
-* `PreVote` 请求中的 Term
-* `<currentTerm, votedFor>` 会持久化，这是确保在同一个 Term 内只会产生一个 Leader 的关键
-* braft 中成为 Leader 后提交本任期内的第一条日志是配置日志，并非 `NO-OP`
-* `CommitIndex` 并不会持久化，Leader 在上述流程中的 5.3 中确认，Follower 则在之后的心跳中由 Leader 传递，只有确认了 `CommitIndex` 后才能开始回放日志
 
 相关 RPC
 ---
@@ -452,6 +457,7 @@ void NodeImpl::become_leader() {
     }
 
     // init commit manager
+    // 设置最小可以提交的 LogIndex：这是实现不提交上一任期日志的关键，详见一下 [复制日志] 小节
     _ballot_box->reset_pending_index(_log_manager->last_log_index() + 1);
 
     // Register _conf_ctx to reject configuration changing before the first log
@@ -539,7 +545,7 @@ int Replicator::start(const ReplicatorOptions& options, ReplicatorId *id) {
 }
 ```
 
-发送心跳
+启动心跳定时器
 ---
 ```cpp
 static inline int heartbeat_timeout(int election_timeout) {
@@ -615,80 +621,44 @@ int Replicator::_on_error(bthread_id_t id, void* arg, int error_code) {
 }
 ```
 
-
-确定 next_index
+确定 nextIndex
 ---
+
+Leader 通过发送空的 `AppendEntries` 来探测 Follower 的 `nextIndex`
+只有确定了 `nextIndex` 才能正式向 Follower 发送日志。
+这里忽略了很多细节，详情我们将在下一章[复制流程][]中介绍。
+
+Leader 调用 `_send_empty_entries` 向 Follower 发送空的 `AppendEntries` 请求，
+并设置响应回调函数为 `_on_rpc_returned`：
 
 ```cpp
 void Replicator::_send_empty_entries(bool is_heartbeat) {
-    std::unique_ptr<brpc::Controller> cntl(new brpc::Controller);
-    std::unique_ptr<AppendEntriesRequest> request(new AppendEntriesRequest);
-    std::unique_ptr<AppendEntriesResponse> response(new AppendEntriesResponse);
+    ...
+    // (1) 填充请求中的字段
     if (_fill_common_fields(
                 request.get(), _next_index - 1, is_heartbeat) != 0) {
-        CHECK(!is_heartbeat);
-        // _id is unlock in _install_snapshot
-        return _install_snapshot();
-    }
-    if (is_heartbeat) {
-        _heartbeat_in_fly = cntl->call_id();
-        _heartbeat_counter++;
-        // set RPC timeout for heartbeat, how long should timeout be is waiting to be optimized.
-        cntl->set_timeout_ms(*_options.election_timeout_ms / 2);
-    } else {
-        _st.st = APPENDING_ENTRIES;
-        _st.first_log_index = _next_index;
-        _st.last_log_index = _next_index - 1;
-        CHECK(_append_entries_in_fly.empty());
-        CHECK_EQ(_flying_append_entries_size, 0);
-        _append_entries_in_fly.push_back(FlyingAppendEntriesRpc(_next_index, 0, cntl->call_id()));
-        _append_entries_counter++;
+        ...
     }
 
-    BRAFT_VLOG << "node " << _options.group_id << ":" << _options.server_id
-        << " send HeartbeatRequest to " << _options.peer_id
-        << " term " << _options.term
-        << " prev_log_index " << request->prev_log_index()
-        << " last_committed_index " << request->committed_index();
-
+    // (2) 设置响应回调函数为 _on_rpc_returned
     google::protobuf::Closure* done = brpc::NewCallback(
-                is_heartbeat ? _on_heartbeat_returned : _on_rpc_returned,
-                _id.value, cntl.get(), request.get(), response.get(),
-                butil::monotonic_time_ms());
-
+                is_heartbeat ? _on_heartbeat_returned : _on_rpc_returned, ...);
+    // (3) 发送空的 AppendEntries 请求
     RaftService_Stub stub(&_sending_channel);
     stub.append_entries(cntl.release(), request.release(),
                         response.release(), done);
-    CHECK_EQ(0, bthread_id_unlock(_id)) << "Fail to unlock " << _id;
 }
-```
 
-```cpp
 int Replicator::_fill_common_fields(AppendEntriesRequest* request,
-                                    int64_t prev_log_index,  // leader 中记录该 follower 的 next_log_id
+                                    int64_t prev_log_index,
                                     bool is_heartbeat) {
+    // 获取 Log 的 Term
     const int64_t prev_log_term = _options.log_manager->get_term(prev_log_index);
-    if (prev_log_term == 0 && prev_log_index != 0) {  // 查不到对应日志的 term，代表已经被快照压缩了
-        if (!is_heartbeat) {
-            CHECK_LT(prev_log_index, _options.log_manager->first_log_index());
-            BRAFT_VLOG << "Group " << _options.group_id
-                       << " log_index=" << prev_log_index << " was compacted";
-            return -1;
-        } else {
-            // The log at prev_log_index has been compacted, which indicates
-            // we are or are going to install snapshot to the follower. So we let
-            // both prev_log_index and prev_log_term be 0 in the heartbeat
-            // request so that follower would do nothing besides updating its
-            // leader timestamp.
-            prev_log_index = 0;
-        }
-    }
+    ...
     request->set_term(_options.term);
-    request->set_group_id(_options.group_id);
-    request->set_server_id(_options.server_id.to_string());
-    request->set_peer_id(_options.peer_id.to_string());
-    request->set_prev_log_index(prev_log_index);
-    request->set_prev_log_term(prev_log_term);
+    ...
+    request->set_prev_log_index(prev_log_index);  // 当前 leader 的 lastLogIndex
+    request->set_prev_log_term(prev_log_term);    // 当前 leader 的 lastLogTerm
     request->set_committed_index(_options.ballot_box->last_committed_index());
     return 0;
 }
@@ -870,196 +840,97 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                                              AppendEntriesResponse* response,
                                              google::protobuf::Closure* done,
                                              bool from_append_entries_cache) {
-    std::vector<LogEntry*> entries;
-    entries.reserve(request->entries_size());
-    brpc::ClosureGuard done_guard(done);
-    std::unique_lock<raft_mutex_t> lck(_mutex);
-
-    // pre set term, to avoid get term in lock
-    response->set_term(_current_term);
-
-    if (!is_active_state(_state)) {
-        const int64_t saved_current_term = _current_term;
-        const State saved_state = _state;
-        lck.unlock();
-        LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                     << " is not in active state " << "current_term " << saved_current_term
-                     << " state " << state2str(saved_state);
-        cntl->SetFailed(EINVAL, "node %s:%s is not in active state, state %s",
-                _group_id.c_str(), _server_id.to_string().c_str(), state2str(saved_state));
-        return;
-    }
-
-    PeerId server_id;
-    if (0 != server_id.parse(request->server_id())) {
-        lck.unlock();
-        LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                     << " received AppendEntries from " << request->server_id()
-                     << " server_id bad format";
-        cntl->SetFailed(brpc::EREQUEST,
-                        "Fail to parse server_id `%s'",
-                        request->server_id().c_str());
-        return;
-    }
-
-    // check stale term
-    if (request->term() < _current_term) {
-        const int64_t saved_current_term = _current_term;
-        lck.unlock();
-        LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                     << " ignore stale AppendEntries from " << request->server_id()
-                     << " in term " << request->term()
-                     << " current_term " << saved_current_term;
-        response->set_success(false);
-        response->set_term(saved_current_term);
-        return;
-    }
-
-    // check term and state to step down
-    check_step_down(request->term(), server_id);
-
-    if (server_id != _leader_id) {
-        LOG(ERROR) << "Another peer " << _group_id << ":" << server_id
-                   << " declares that it is the leader at term=" << _current_term
-                   << " which was occupied by leader=" << _leader_id;
-        // Increase the term by 1 and make both leaders step down to minimize the
-        // loss of split brain
-        butil::Status status;
-        status.set_error(ELEADERCONFLICT, "More than one leader in the same term.");
-        step_down(request->term() + 1, false, status);
-        response->set_success(false);
-        response->set_term(request->term() + 1);
-        return;
-    }
-
-    if (!from_append_entries_cache) {
-        // Requests from cache already updated timestamp
-        _follower_lease.renew(_leader_id);
-    }
-
-    if (request->entries_size() > 0 &&
-            (_snapshot_executor
-                && _snapshot_executor->is_installing_snapshot())) {
-        LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                     << " received append entries while installing snapshot";
-        cntl->SetFailed(EBUSY, "Is installing snapshot");
-        return;
-    }
-
-    const int64_t prev_log_index = request->prev_log_index();
-    const int64_t prev_log_term = request->prev_log_term();
-    const int64_t local_prev_log_term = _log_manager->get_term(prev_log_index);
-    if (local_prev_log_term != prev_log_term) {
-        int64_t last_index = _log_manager->last_log_index();
-        int64_t saved_term = request->term();
-        int     saved_entries_size = request->entries_size();
-        std::string rpc_server_id = request->server_id();
-        if (!from_append_entries_cache &&
-            handle_out_of_order_append_entries(
-                    cntl, request, response, done, last_index)) {
-            // It's not safe to touch cntl/request/response/done after this point,
-            // since the ownership is tranfered to the cache.
-            lck.unlock();
-            done_guard.release();
-            LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                         << " cache out-of-order AppendEntries from "
-                         << rpc_server_id
-                         << " in term " << saved_term
-                         << " prev_log_index " << prev_log_index
-                         << " prev_log_term " << prev_log_term
-                         << " local_prev_log_term " << local_prev_log_term
-                         << " last_log_index " << last_index
-                         << " entries_size " << saved_entries_size;
-            return;
-        }
-
-        response->set_success(false);
-        response->set_term(_current_term);
-        response->set_last_log_index(last_index);  // 响应当前 follower 的最后一条日志的 index
-        lck.unlock();
-        if (local_prev_log_term != 0) {
-            LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                         << " reject term_unmatched AppendEntries from "
-                         << request->server_id()
-                         << " in term " << request->term()
-                         << " prev_log_index " << request->prev_log_index()
-                         << " prev_log_term " << request->prev_log_term()
-                         << " local_prev_log_term " << local_prev_log_term
-                         << " last_log_index " << last_index
-                         << " entries_size " << request->entries_size()
-                         << " from_append_entries_cache: " << from_append_entries_cache;
-        }
-        return;
-    }
-
+    ...
     if (request->entries_size() == 0) {  // 响应 send_empty_entries 或心跳
         response->set_success(true);
         response->set_term(_current_term);
         response->set_last_log_index(_log_manager->last_log_index());
-        response->set_readonly(_node_readonly);
-        lck.unlock();
+        ...
         // see the comments at FollowerStableClosure::run()
         _ballot_box->set_last_committed_index(
                 std::min(request->committed_index(),
                          prev_log_index));
         return;
     }
-
-    // Parse request
-    butil::IOBuf data_buf;
-    data_buf.swap(cntl->request_attachment());
-    int64_t index = prev_log_index;
-    for (int i = 0; i < request->entries_size(); i++) {
-        index++;
-        const EntryMeta& entry = request->entries(i);
-        if (entry.type() != ENTRY_TYPE_UNKNOWN) {
-            LogEntry* log_entry = new LogEntry();
-            log_entry->AddRef();
-            log_entry->id.term = entry.term();
-            log_entry->id.index = index;
-            log_entry->type = (EntryType)entry.type();
-            if (entry.peers_size() > 0) {  // 配置日志，C{new}
-                log_entry->peers = new std::vector<PeerId>;
-                for (int i = 0; i < entry.peers_size(); i++) {
-                    log_entry->peers->push_back(entry.peers(i));
-                }
-                CHECK_EQ(log_entry->type, ENTRY_TYPE_CONFIGURATION);
-                if (entry.old_peers_size() > 0) {  // 配置变更的日志, C{old,new}
-                    log_entry->old_peers = new std::vector<PeerId>;
-                    for (int i = 0; i < entry.old_peers_size(); i++) {
-                        log_entry->old_peers->push_back(entry.old_peers(i));
-                    }
-                }
-            } else {
-                CHECK_NE(entry.type(), ENTRY_TYPE_CONFIGURATION);
-            }
-            if (entry.has_data_len()) {
-                int len = entry.data_len();
-                data_buf.cutn(&log_entry->data, len);
-            }
-            entries.push_back(log_entry);
-        }
-    }
-
-    // check out-of-order cache
-    check_append_entries_cache(index);
-
-    FollowerStableClosure* c = new FollowerStableClosure(
-            cntl, request, response, done_guard.release(),
-            this, _current_term);
-    _log_manager->append_entries(&entries, c);
-
-    // update configuration after _log_manager updated its memory status
-    _log_manager->check_and_set_configuration(&_conf);
+    ...
 }
 ```
 
+复制上一任期日志
+---
+
+只复制不提交，如果直接提交会出现幽灵日志问题
+
+```cpp
+
+// 当一个节点成为 leader 时，需要调用 reset_pending_index() 来重置 _pending_index:
+//   _ballot_box->reset_pending_index(_log_manager->last_log_index() + 1);
+int BallotBox::reset_pending_index(int64_t new_pending_index) {
+    BAIDU_SCOPED_LOCK(_mutex);
+    CHECK(_pending_index == 0 && _pending_meta_queue.empty())
+        << "pending_index " << _pending_index << " pending_meta_queue "
+        << _pending_meta_queue.size();
+    CHECK_GT(new_pending_index, _last_committed_index.load(
+                                    butil::memory_order_relaxed));
+    _pending_index = new_pending_index;
+    _closure_queue->reset_first_index(new_pending_index);
+    return 0;
+}
+
+// 将 index 在 [fist_log_index, last_log_index] 之间的日志的投票数加一
+int BallotBox::commit_at(
+        int64_t first_log_index, int64_t last_log_index, const PeerId& peer) {
+    // FIXME(chenzhangyi01): The cricital section is unacceptable because it
+    // blocks all the other Replicators and LogManagers
+    std::unique_lock<raft_mutex_t> lck(_mutex);
+    if (_pending_index == 0) {
+        return EINVAL;
+    }
+    if (last_log_index < _pending_index) {
+        return 0;
+    }
+    if (last_log_index >= _pending_index + (int64_t)_pending_meta_queue.size()) {
+        return ERANGE;
+    }
+
+    int64_t last_committed_index = 0;
+    const int64_t start_at = std::max(_pending_index, first_log_index);
+    Ballot::PosHint pos_hint;
+    for (int64_t log_index = start_at; log_index <= last_log_index; ++log_index) {
+        Ballot& bl = _pending_meta_queue[log_index - _pending_index];
+        pos_hint = bl.grant(peer, pos_hint);
+        if (bl.granted()) {
+            last_committed_index = log_index;
+        }
+    }
+
+    if (last_committed_index == 0) {
+        return 0;
+    }
+
+    // When removing a peer off the raft group which contains even number of
+    // peers, the quorum would decrease by 1, e.g. 3 of 4 changes to 2 of 3. In
+    // this case, the log after removal may be committed before some previous
+    // logs, since we use the new configuration to deal the quorum of the
+    // removal request, we think it's safe to commit all the uncommitted
+    // previous logs, which is not well proved right now
+    // TODO: add vlog when committing previous logs
+    for (int64_t index = _pending_index; index <= last_committed_index; ++index) {
+        _pending_meta_queue.pop_front();
+    }
+
+    _pending_index = last_committed_index + 1;
+    _last_committed_index.store(last_committed_index, butil::memory_order_relaxed);
+    lck.unlock();
+    // The order doesn't matter
+    _waiter->on_committed(last_committed_index);
+    return 0;
+}
+
+```
 
 
-
-
-
-发送 no-op
+提交 no-op 日志
 ---
 
 ```cpp

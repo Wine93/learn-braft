@@ -1,3 +1,5 @@
+优化 0：nextIndex 的探测
+
 优化 1：Batch
 ===
 
