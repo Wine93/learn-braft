@@ -4,13 +4,79 @@
 复制流程
 ---
 
-1. 客户端向 Leader 提交 Task
-2. Leader 将 Task 对应的，并异步持久化
-3. 同时，Leader 向所有 Follower 复制日志
-4. 待收到
-5.
+0. 前置：当节点成为 Leader 时会通过发送空的 `AppendEntries` 请求确认各 Follower 的 `nextIndex`
+1. 客户端通过 `apply` 接口向 Leader 提交操作日志
+2. Leader 向本地追加日志：
+   * 2.1 为日志分配 `Index`，并将其追加到内存存储中
+   * 2.2 异步将内存中的日志持久化到磁盘
+3. Leader 将内存中的日志通过 `AppendEntries` 请求并行地发送给所有 Follower
+4. Follower 收到 `AppenEntries` 请求，将日志持久化到本地后返回成功响应
+5. Leader 若收到大多数确定，则提交日志，更新 `CommitIndex`
+5. Leader 回调用户状态机的 `on_apply` 应用日志
+7. 待 `on_apply` 返回后，更新 `ApplyIndex`，并删除内存中的日志
 
-介绍下 3 大队列，`ApplyTask`
+流程注释
+---
+
+* 整个流程是流水线式的异步实现，非常高效，日志从 `apply` 提交到最后 `on_apply` 被应用，依次经过 `ApplyQueue`、`DiskQueue`、`ApplyTaskQueue` 这 3 个异步队列，详情见以下具体实现
+* 0：`nextIndex` 是下一条要发往 Follower 的日志 `Index`，只有确定了才能往 Follower 发送日志，不然不知道要往 Follower 发送哪些日志
+* 1：
+* 2.1 日志的 Term 在用户提交时指定
+* 2.1 日志在
+* 2.2 和 3 是并行进行的
+* 3：日志的发送由单独的 `bthread` 负责，和 Leader 处理其他逻辑
+* 4：Follower 端的日志持久化也是异步的
+
+相关 RPC
+---
+
+```proto
+enum EntryType {
+    ENTRY_TYPE_UNKNOWN = 0;
+    ENTRY_TYPE_NO_OP = 1;
+    ENTRY_TYPE_DATA = 2;
+    ENTRY_TYPE_CONFIGURATION= 3;
+};
+
+message EntryMeta {
+    required int64 term = 1;
+    required EntryType type = 2;
+    repeated string peers = 3;
+    optional int64 data_len = 4;
+    // Don't change field id of `old_peers' in the consideration of backward
+    // compatibility
+    repeated string old_peers = 5;
+};
+
+message AppendEntriesRequest {
+    required string group_id = 1;
+    required string server_id = 2;
+    required string peer_id = 3;
+    required int64 term = 4;
+    required int64 prev_log_term = 5;
+    required int64 prev_log_index = 6;
+    repeated EntryMeta entries = 7;
+    required int64 committed_index = 8;
+};
+
+message AppendEntriesResponse {
+    required int64 term = 1;
+    required bool success = 2;
+    optional int64 last_log_index = 3;
+    optional bool readonly = 4;
+};
+
+service RaftService {
+    rpc append_entries(AppendEntriesRequest) returns (AppendEntriesResponse);
+};
+```
+
+| 作用           | entries | committed_index |  |  |  |
+|:---------------|:--------|:----------------|:-|:-|:-|
+| 探测 `nextIndex` |
+| 心跳           |
+| 复制日志       |
+
 
 整体流程
 ===
