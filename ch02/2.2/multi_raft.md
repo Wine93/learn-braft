@@ -1,8 +1,7 @@
 Multi-Raft
 ===
 
-![alt text](image-1.png)
-*<center><sup>单 raft group 与 multi-raft</sup></center>*
+![图 1-2  单 Group 与 多 Group](image/multi_raft.png)
 
 考虑到单机的容量有限，一些追求扩展性的系统，往往会将数据进行分片（*sharding*），并将分片放置在不同的 *raft group*（复制组） 中，以达到高可用的目的。*sharding* + *multi-raft* 的架构比集中式数据存储 + 单 *raft group* 的架构在以下几个方面更具优势：
 
