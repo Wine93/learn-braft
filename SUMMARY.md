@@ -1,4 +1,6 @@
-* [braft 源码解析](gitbook/README.md)
+* [前言](gitbook/README.md)
+
+## braft 源码解析
 * [1. 简介](ch01/introduction.md)
 * [2. 初始化](ch02)
     * [2.1 章节概览](ch02//overview.md)
