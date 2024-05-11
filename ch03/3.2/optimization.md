@@ -290,7 +290,7 @@ void NodeImpl::check_dead_nodes(const Configuration& conf, int64_t now_ms) {
 Lease Read
 ---
 
-![](assets/leader_lease.png)
+![图 3.3.2  Leader Lease 的有效区间](image/leader_lease.png)
 
 Leader Lease 的实现原理是基于一个共同承诺，超半数节点共同承诺在收到 Leader RPC 之后的 `election_timeout` 时间内不再参与投票，这保证了在这段时间内集群内不会产生新的 Leader。
 

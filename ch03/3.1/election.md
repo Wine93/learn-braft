@@ -91,7 +91,7 @@ service RaftService {
 阶段一：PreVote
 ===
 
-![Pre-Vote](assets/pre_vote.svg)
+![Pre-Vote](image/pre_vote.svg)
 
 触发投票
 ---
