@@ -1,7 +1,7 @@
-整体概览
+流程详解
 ===
 
-复制流程
+流程概览
 ---
 
 0. 前置：当节点成为 Leader 时会通过发送空的 `AppendEntries` 请求确认各 Follower 的 `nextIndex`
@@ -15,17 +15,20 @@
 5. Leader 回调用户状态机的 `on_apply` 应用日志
 7. 待 `on_apply` 返回后，更新 `ApplyIndex`，并删除内存中的日志
 
-流程注释
+流程注解
 ---
 
 * 整个流程是流水线式的异步实现，非常高效，日志从 `apply` 提交到最后 `on_apply` 被应用，依次经过 `ApplyQueue`、`DiskQueue`、`ApplyTaskQueue` 这 3 个异步队列，详情见以下具体实现
 * 0：`nextIndex` 是下一条要发往 Follower 的日志 `Index`，只有确定了才能往 Follower 发送日志，不然不知道要往 Follower 发送哪些日志
 * 1：
-* 2.1 日志的 Term 在用户提交时指定
-* 2.1 日志在
+* 2.1 日志的 Term 在用户提交时指定；节点成为 Leader 时本身拥有的最后一条日志的 `Index` 作为 `LastLogIndex`，往后 Leader 每追加一条日志都将 `++LastLogIndex` 作为该日志的 `Index`
+* 2.2 日志的持久化是由管理磁盘的 `bthread` 负责，
 * 2.2 和 3 是并行进行的
-* 3：日志的发送由单独的 `bthread` 负责，和 Leader 处理其他逻辑
-* 4：Follower 端的日志持久化也是异步的
+* 3 日志的发送由单独的 `bthread` 负责，不会阻塞 Leader 处理其他事务
+* 4 Follower 端的日志持久化也是异步的
+* 5 Leader 的 `CommitIndex` 由 Quorum 机制决定，Follower 的 `CommitIndex` 由 Leader 在下一次的心跳或 `AppendEntries` 请求中携带的 `committed_index` 告知
+* 6 通常用户的状态机 `on_apply` 实现需要做 2 件事：(1) 将日志应用到状态机；(2) 将 RPC 响应返回给客户端
+* 6 braft 是以串行的方式回调 `on_apply`，所以为了性能，可以
 
 相关 RPC
 ---
