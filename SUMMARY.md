@@ -2,10 +2,9 @@
 
 ## braft 源码解析
 * [1. 简介](ch01/introduction.md)
-* [2. 初始化](ch02)
-    * [2.1 章节概览](ch02//overview.md)
-    * [2.2 节点初始化](ch02/initialization.md)
-    * [2.3 Multi-Raft](ch02/multi_raft.md)
+* [2. 初始化](ch02/overview.md)
+    * [2.1 节点初始化](ch02/initialization.md)
+    * [2.2 Multi-Raft](ch02/multi_raft.md)
 * [3. Leader 选举](ch03)
     * [3.1 章节概览](ch03/overview.md)
     * [3.2 选主流程](ch03/election.md)
