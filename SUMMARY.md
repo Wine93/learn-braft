@@ -1,4 +1,4 @@
-* [简介](gitbook/README.md)
+* [前言](gitbook/README.md)
 
 ## braft 源码解析
 * [1. 简介](ch01/introduction.md)
