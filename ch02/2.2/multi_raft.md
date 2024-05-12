@@ -1,23 +1,29 @@
-Multi-Raft
+关于 Multi-Raft
 ===
-
-![图 1-2  单 Group 与 多 Group](image/multi_raft.png)
 
 考虑到单机的容量有限，一些追求扩展性的系统，往往会将数据进行分片（*sharding*），并将分片放置在不同的 *raft group*（复制组） 中，以达到高可用的目的。*sharding* + *multi-raft* 的架构比集中式数据存储 + 单 *raft group* 的架构在以下几个方面更具优势：
 
 * **扩展性**：系统可以在需要的时候新增 *raft group*（每个 *group* 存放一定数量的分片），并将其运行在不同的磁盘或机器上，这样就具有很好的扩展性，理论上没有容量上限。
 * **性能**：系统可以将 *Leader* 打散到各个节点，从而充分利用各机器的资源，以提升系统整体的吞吐。
 
-> **关于性能**
->
-> *sharding+multi-raft* 的架构性能在某些系统中不一定会比集中式的性能要好，这取决于分片之间的数据相关性，
->
+![图 1-2  单 Group 与 多 Group](image/multi_raft.png)
 
 > **各架构相关系统**
 >
 > *single-raft*: [etcd][etcd], [consul][consul]
 >
 > *multi-raft*: [CockroachDB][cockroachdb], [TiKV][tikv], [Curve][curve]
+
+braft 中的 Multi-Raft
+===
+
+> 大概架构
+
+心跳
+--
+
+随机写
+---
 
 [cockroachdb]: www.
 [etcd]: www.
@@ -26,11 +32,7 @@ Multi-Raft
 [curve]: www.baidu.com
 
 具体实现
----
-
-![](image/multi-raft.png)
-
-*<center><sup>multi-raft: 单进程管理多个 group</sup></center>*
+===
 
 *braft* 允许一个进程内运行多个 *raft group*，多个 *group* 在逻辑上和物理上都是完全独立的。
 * 当用户创建 *raft node* 需要指定 `GroupId` 和 `PeerId`，
@@ -117,12 +119,7 @@ void RaftServiceImpl::append_entries(google::protobuf::RpcController* cntl_base,
 }
 ```
 
-
-* 每个 Node 有用独立的配置，包括 Log 等等, 会产生随机写
-* RPC, 心跳未合并
-
-
 参考
----
+===
 * [Scaling Raft](https://www.cockroachlabs.com/blog/scaling-raft/)
 * [基于 Raft 构建弹性伸缩的存储系统的一些实践](https://cn.pingcap.com/blog/building-distributed-db-with-raft/)

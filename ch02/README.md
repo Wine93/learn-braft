@@ -3,8 +3,5 @@
 
 本章主要介绍 *Raft* 节点在启动时的初始化流程以及 `Multi-Raft` 相关的实现：
 
-*
-* [Multi-Raft](chapter2/):
-
-[multi-raft]: multi_raft.md
-
+* [节点初始化](2.1/initialization.md):
+* [Multi-Raft](2.2/multi_raft.md):

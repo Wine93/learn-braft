@@ -6,7 +6,7 @@
 介绍
 ---
 
-![batch 优化](image/batch.png)
+![图 4.1  Batch 优化](image/batch.png)
 
 从客户端调用 `apply` 接口提交 Task 到日志成功复制，并回调用户状态机的 `on_apply` 接口，日志依次经过了 `Apply Queue`、`Disk Queue`、`Apply Task Queue` 这 3 个队列。这些队列都是 brpc 的 [ExecutionQueue][ExecutionQueue] 实现，其消费函数都做了 `batch` 优化：
 
@@ -29,28 +29,33 @@
 优化 2：并行持久化日志
 ===
 
-介绍
+日志的持久化与复制
 ---
 
-![](image/append_parallel.svg)
+![图 4.2  持久化日志的串行与并行](image/append_parallel.svg)
 
 在 Raft 的实现中，Leader 需要先在本地持久化日志，再向所有的 Follower 复制日志，显然这样的实现具有较高的时延。特别地客户端的写都要经过 Leader，导致 Leader 的压力会变大，从而导致 IO 延迟变高成为慢节点，而本地持久化会阻塞后续的 Follower 复制。所以在 braft 中，Leader 本地持久化和 Follower 复制是并行的，即 Leader 会先将日志写入内存，同时异步地进行持久化和 Follower 复制。
 
-实现
+具体实现
 ---
-
 
 
 优化 3：流水线复制
 ===
 
-![串行与 Pipeline](image/pipeline-2.svg)
+复制的串行与并行
+---
+
+![图 4.3  复制的串行与 Pipeline](image/pipeline.svg)
+
+具体实现
+---
 
 
 优化 4：raft sync
 ===
 
-简介
+控制日志的落盘行为
 ---
 
 braft 在每次 Bacth Write 后都会进行一次 `sync`，显然这会增加时延，所以其提供了一些配置项来控制日志的落盘行为。用户可以根据业务数据丢失的容忍度高低，灵活调整这些配置以达到性能和可靠性之间的权衡。例如对于数据丢失容忍度较高的业务，可以选择将配置项 `raft_sync` 设置为 `flase`这将有助于提升性能。
@@ -66,7 +71,7 @@ braft 在每次 Bacth Write 后都会进行一次 `sync`，显然这会增加时
 | `raft_max_segment_size` | 单个日志 Segment 大小                                                                                        | 8MB                   |
 
 
-实现
+具体实现
 ---
 
 Batch Write 相关配置：

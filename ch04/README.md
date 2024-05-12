@@ -1,6 +1,6 @@
 章节概览
 ===
 
-* [4.1 复制流程](ch04/4.1_replicate.md)：
-* [4.2 复制优化](ch04/4.2_optimize.md)：
-* [4.3 日志存储](ch04/4.3_log_storage.md)：
+* [4.1 复制流程](4.1/replicate.md)：
+* [4.2 复制优化](4.2/optimization.md)：
+* [4.3 日志存储](4.3/log_storage.md)：

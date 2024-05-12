@@ -1,47 +1,86 @@
-
-
 流程详解
 ===
+
+前置流程：用户创建 BRPC Server，并调用 `braft::add_service` 将 Raft 相关的 Service 加入到 BRPC Server 中，并启动 BRPC Server
+
+1. 用户创建 `braft::node`，并调用 `node->init` 接口
+2. 遍历一遍日志，读取每条日志的 `Header` (24 字节)：
+    * 2.1 读取最新的配置日志
+    * 2.2 构建索引（`LogIndex` 到文件 `offset`），便于读取时快速定位
+    * 2.3 获得日志的 `FirstIndex` 与 `LastIndex`
+3. 回调用户状态机的 `on_snapshot_load` 来加载快照，等待快照加载完成
+4. 从日志（包含快照）或用户指定配置初始化集群列表
+5. 加载 Raft Meta，即 `currentTerm` 与 `votedFor`
+6. 启动快照定时器
+7. 将自身角色变为 `Follower`，并启动选举定时器
+8. 将节点加入 Raft Group
+9. 至此，初始化完成，节点将等待选举超时后发起选举
 
 流程概览
 ---
 
-流程注解
+* 2：日志并未回放，因为不知道节点的 `CommitIndex`；
+* 2.3: 作用是啥？
+
+持久化存储
 ---
 
-简介
----
+Raft 拥有以下 3 个持久化存储，这些都需要在节点重启时进行重建：
 
-这里设计到节点的初始化，同时也是节点重启的入口（包括快照的加载，日志的回放）。
+* RaftMetaStorage: 保存 Raft 算法自身的状态信息，即 `(Term, votedFor)` 这个二元组
+* LogStorage: 存储用户日志以及元数据
+* SnapshotStorage: 存储用户快照以及元数据
 
-整体流程
----
+Raft 元数据：
+```proto
+message StablePBMeta {
+    required int64 term = 1;
+    required string votedfor = 2;
+};
+```
 
-![alt text](image-3.png)
+Log 元数据：
+```proto
+message LogPBMeta {
+    required int64 first_log_index = 1;
+};
+```
 
-主要做以下几件事：
-* 各类 timer 的初始化
-* 日志存储的初始化
-* 状态的初始化
+Snapshot 元数据：
+```proto
+message SnapshotMeta {
+    required int64 last_included_index = 1;
+    required int64 last_included_term = 2;
+    repeated string peers = 3;
+    repeated string old_peers = 4;
+}
 
-*Raft* 初始化流程主要为以下 6 个步骤：
-* (1)
-* (2)
+message LocalFileMeta {
+    optional bytes user_meta   = 1;
+    optional FileSource source = 2;
+    optional string checksum   = 3;
+}
 
-> **日志回放**
->
-> 并没有看到日志回放的逻辑，
->
+message LocalSnapshotPbMeta {
+    message File {
+        required string name = 1;
+        optional LocalFileMeta meta = 2;
+    };
+    optional SnapshotMeta meta = 1;
+    repeated File files = 2;
+}
+```
 
 具体实现
----
+===
 
-### 步骤二：增加 *Raft* 相关的 *Service* 至 *BRPC Server*
+增加 Raft Service
+---
 
 `braft::add_service` 会增加以下 4 个 *Service*：
 * `FileService`：用于 *Follower* 安装快照时，向 *Leader* 下载对应文件
 * `RaftService`：核心服务，处理 *Raft* 的核心逻辑
-* `RaftStat`: 客观性的一部分
+* `RaftStat`: 可观测行的一部分
 * `CliService`：控制节点，如配置变更、重置节点列表、转移 *Leader*
 
 ```cpp
@@ -79,7 +118,8 @@ int NodeManager::add_service(brpc::Server* server, const butil::EndPoint& listen
 }
 ```
 
-### 步骤三：初始化 *Raft Node*，并加入 *Raft Group*
+node::init()
+---
 
 `NodeImpl::init` 主要完成以下几项工作（详情见以下代码注释）：
 * (1) 初始化各类
@@ -244,46 +284,3 @@ int NodeImpl::init(const NodeOptions& options) {
     return 0;
 }
 ```
-
-```cpp
-int NodeImpl::init(const NodeOptions& options)
-    ...
-
-    // (1) 初始化以下 4 个定时器
-    //    `_election_timer`：选举定时器
-    //    `_vote_timer`：投票定时器
-    //    `_stepdown_timer`：降级定时器
-    //    `_snapshot_timer`：快照定时器
-    CHECK_EQ(0, _election_timer.init(this, options.election_timeout_ms));
-        CHECK_EQ(0, _vote_timer.init(this, options.election_timeout_ms + options.max_clock_drift_ms));
-    CHECK_EQ(0, _stepdown_timer.init(this, options.election_timeout_ms));
-    CHECK_EQ(0, _snapshot_timer.init(this, options.snapshot_interval_s * 1000));
-
-    // RaftMetaStorage, 用来存放一些RAFT算法自身的状态数据， 比如term, vote_for等信息.
-    // LogStorage, 用来存放用户提交的WAL
-    // SnapshotStorage, 用来存放用户的Snapshot以及元信息.
-
-    _conf.id = LogId();
-    // if have log using conf in log, else using conf in options
-    if (_log_manager->last_log_index() > 0) {
-        _log_manager->check_and_set_configuration(&_conf);
-    } else {
-        _conf.conf = _options.initial_conf;
-    }
-
-    if (!global_node_manager->add(this)) {
-        ...
-        return -1;
-    }
-
-    init_fsm_caller(LogId(0, 0));
-
-    ...
-```
-
-```cpp
-typedef std::string GroupId;  // 表示复制组的 ID
-typedef std::multimap<GroupId, NodeImpl* > GroupMap;
-```
-
-* vote timeout 啥作用啊？

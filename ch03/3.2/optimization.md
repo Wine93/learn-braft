@@ -29,7 +29,7 @@
 >
 > 如果成员在该超时时间内没有得到足够多的选票，将变为 Follower 并重新发起选举，无需等待 `election_timeout`
 
-![图 3.3   相同的选举超时时间](assets/random_timeout.png)
+![图 3.4  相同的选举超时时间](image/random_timeout.png)
 
 具体实现
 ---
@@ -145,7 +145,7 @@ void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
 Follower 位于对称网络分区
 ---
 
-![图 3.4  对称网路分区](assets/pre_vote.png)
+![图 3.5  Follower 位于对称网路分区](image/pre_vote.png)
 
 我们考虑上图中在网络分区中发生的一种现象：
 
@@ -185,9 +185,9 @@ Follower 位于非对称网络分区
 
 这里讲一下 3 种情况
 
-![](assets/follower_lease.png)
+![图 3.6  Follower 位于非对称网络分区](image/follower_partition.png)
 
-![](assets/follower_lease_valid.png)
+![图 3.7  Follower Leader 的有效时间区间](image/follower_lease_valid.png)
 
 实现
 ---
@@ -201,7 +201,7 @@ Follower 位于非对称网络分区
 Leader 位于网络分区
 ---
 
-![](assets/check_quorum.png)
+![图 3.8  Leader 位于网路分区](image/check_quorum.png)
 
 具体实现
 ---
@@ -272,12 +272,19 @@ void NodeImpl::check_dead_nodes(const Configuration& conf, int64_t now_ms) {
 优化 6：Leader Lease
 ===
 
+网络分区
+---
+
+![图 3.9 ]()
+
 线性一致性读
 ---
 
-![](assets/linear_read.png)
+![图 3.10  线性一致性读的几种实现](image/linear_read.png)
 
 为了实现线性一致性读，
+
+为什么直接读不行？
 
 | 方案 | 时延 | 优点 | braft 是否实现 |
 | :--- | :--- | :--- | :--- |
@@ -290,7 +297,7 @@ void NodeImpl::check_dead_nodes(const Configuration& conf, int64_t now_ms) {
 Lease Read
 ---
 
-![图 3.3.2  Leader Lease 的有效区间](image/leader_lease.png)
+![图 3.10  Leader Lease 的有效时间区间](image/leader_lease.png)
 
 Leader Lease 的实现原理是基于一个共同承诺，超半数节点共同承诺在收到 Leader RPC 之后的 `election_timeout` 时间内不再参与投票，这保证了在这段时间内集群内不会产生新的 Leader。
 

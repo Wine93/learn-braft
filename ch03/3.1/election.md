@@ -91,7 +91,7 @@ service RaftService {
 阶段一：PreVote
 ===
 
-![Pre-Vote](image/pre_vote.svg)
+![图 3.1  PreVote 整体实现](image/pre_vote.svg)
 
 触发投票
 ---
@@ -254,7 +254,7 @@ void NodeImpl::handle_vote_timeout() {
 阶段二：`RequestVote`
 ===
 
-![alt text](assets/vote.svg)
+![图 3.2  RequestVote 整体实现](image/vote.svg)
 
 发送请求
 ---
@@ -456,7 +456,7 @@ void NodeImpl::handle_vote_timeout() {
 阶段三：成为 *Leader*
 ===
 
-![become_leader](assets/become_leader.svg)
+![图 3.3  become_leader 整体实现](image/become_leader.svg)
 
 ```cpp
 // in lock

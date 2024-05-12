@@ -38,7 +38,7 @@ Segment 文件
 * **closed segment**: 文件名的格式为 `log_{first_index}-{last_index}`，例如 `log_000001-0001000`，表示该文件保存的日志的索引范围为 [1, 1000]。
 * **open segment**: 文件名的格式为 `log_inprogress_{first_index}`，例如 `log_inprogress_0001001`，表示该文件保存的日志的索引范围为 [1001, ∞)。
 
-![Segment 文件](image/Segment.png)
+![图 4.4  segment 文件的组成](image/segment.png)
 
 `Header` 字段：
 
@@ -80,8 +80,6 @@ message ConfigurationPBMeta {
     repeated string old_peers = 2;
 };
 ```
-
-![alt text](image.png)
 
 ```cpp
 // LogStorage use segmented append-only file, all data in disk, all index in memory.
