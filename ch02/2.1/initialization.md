@@ -4,23 +4,44 @@
 前置流程：用户创建 BRPC Server，并调用 `braft::add_service` 将 Raft 相关的 Service 加入到 BRPC Server 中，并启动 BRPC Server
 
 1. 用户创建 `braft::node`，并调用 `node->init` 接口
-2. 遍历一遍日志，读取每条日志的 `Header` (24 字节)：
+2. 启动任务队列 `ApplyTaskQueue`
+3. 遍历一遍日志，读取每条日志的 `Header` (24 字节)：
     * 2.1 读取最新的配置日志
     * 2.2 构建索引（`LogIndex` 到文件 `offset`），便于读取时快速定位
     * 2.3 获得日志的 `FirstIndex` 与 `LastIndex`
-3. 回调用户状态机的 `on_snapshot_load` 来加载快照，等待快照加载完成
-4. 从日志（包含快照）或用户指定配置初始化集群列表
-5. 加载 Raft Meta，即 `currentTerm` 与 `votedFor`
-6. 启动快照定时器
-7. 将自身角色变为 `Follower`，并启动选举定时器
-8. 将节点加入 Raft Group
-9. 至此，初始化完成，节点将等待选举超时后发起选举
+4. 回调用户状态机的 `on_snapshot_load` 来加载快照，等待快照加载完成
+5. 从日志（包含快照）或用户指定配置初始化集群列表
+6. 加载 Raft Meta，即 `currentTerm` 与 `votedFor`
+7. 启动快照定时器
+8. 将自身角色变为 `Follower`，并启动选举定时器
+9. 将节点加入 Raft Group
+10. 至此，初始化完成，节点将等待选举超时后发起选举
+
+从以上可以
 
 流程概览
 ---
 
 * 2：日志并未回放，因为不知道节点的 `CommitIndex`；
 * 2.3: 作用是啥？
+
+ApplyTaskQueue
+---
+
+这是一个串行执行的任务队列，所有回调给用户状态机的任务都需进入该队列，
+
+* `SNAPSHOT_SAVE`
+
+| 任务类型        | 说明                   |                                 |
+|:----------------|:-----------------------|:--------------------------------|
+| COMMITTED       | 日志被提交             | 若日志类型为配置文件，则回调 `` |
+| SNAPSHOT_SAVE   | 创建快照               |                                 |
+| SNAPSHOT_LOAD   | 加载快照               |                                 |
+| LEADER_STOP     | Leader 转换为 Follower | on_leader_start                 |
+| LEADER_START    |                        |                                 |
+| START_FOLLOWING |                        |                                 |
+| STOP_FOLLOWING  |                        |                                 |
+| ERROR           |                        |                                 |
 
 持久化存储
 ---
