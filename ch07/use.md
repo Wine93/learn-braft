@@ -76,3 +76,8 @@ on_snapshot_load
 
 * apply 不一定成功
 * 快照的异步
+
+参考
+===
+
+[使用 braft 构建应用，应该关注哪些指标？](https://steinslab.io/archives/2605)

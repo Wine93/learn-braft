@@ -4,10 +4,38 @@
 流程概览
 ---
 
+1. 用户通过 `add_peer`/`remove_peer`/`change_peer` 接口触发配置变更
+2. 若当前有配置变更正在进行，则返回 `EBUSY`；若新老配置相等，则直接返回成功
+3. 进入日志追赶（`CaughtUp`）阶段：
+   * 3.1 将新老配置做 `diff` 获得新加入的节点列表；若列表为空，则直接进入下一阶段
+   * 3.2 为每个新节点创建 `Replicator`，并启动心跳定时器
+   * 3.3 为新节点安装最新的快照
+   * 3.4 向新节点同步日志；每成功同步一部分日志，判断一下 Leader 与新节点的日志差距，若差距小于一定值，则进入下一阶段
+   * 3.5 若追赶阶段任意节点失败，则本次配置变更标记为失败
+4. 进入联合共识（`Joint-Consensus`）阶段：
+   * 4.1 在该阶段，选举和日志同步需要**同时**在新老集群都达到 `Qourum`
+   * 4.2 Leader 将新老集群配置日志（即 C<sub>old,new</sub>）同时复制给新老集群
+   * 4.3 等待该日志在新老集群都达到 `Qourum` 则提交该日志并进入下一阶段
+5. 进入同步新配置（`Stable`）阶段：
+    * 5.1 在该阶段，日志会同时复制给新老集群，但只需在新集群中达到 `Quorum` 即可提交
+    * 5.2 Leader 将新集群配置日志（即 `C{new}`）复制给新老集群
+    * 5.3 Leader 立即应用新集群配置，不必等待其日志被提交
+    * 5.4 等待日志 `C{new}` 在新集群达到 `Quorum` 即被提交，至此配置变更已完成
+6. 进行清理工作：
+    * 6.1 Leader 移除不在集群中的 `Replicator`，不再向它们发送心跳和日志
+    * 6.2 若 Leader 不在新集群中，则降为 `Follower` 并向拥有最长日志的节点发送 `TimeoutNow` 请求让你立马进行选举
+
+![图 6.1  配置变更流程](image/configuration_change.png)
 流程注解
+
 ---
 
-新节点的配置
+故障恢复
+---
+
+如果执行变更的 Leader 挂掉了，或者被 `step_down` 成 Follower，
+
+新节点配置
 ---
 
 新节点启动的时候需要为空节点，否则可能需要脑裂
@@ -60,7 +88,7 @@ service CliService {
 };
 ```
 
-阶段一：CaughtUp
+阶段一：追赶日志
 ===
 
 ```cpp
@@ -521,10 +549,16 @@ void NodeImpl::become_leader() {
 }
 ```
 
-故障恢复
+阶段三：同步新配置
+===
+
+阶段四：清理工作
+===
+
+其他：故障恢复
 ---
 
-```
+```cpp
 void NodeImpl::ConfigurationCtx::flush(const Configuration& conf,
                                        const Configuration& old_conf) {
     CHECK(!is_busy());
