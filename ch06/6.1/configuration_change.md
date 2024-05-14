@@ -1,66 +1,23 @@
-# 配置变更
-
-* 简介下各个变更的简略流程
-* 快照启动时这么读取配置，集群配置会打到快照里面吗？
-
-整体流程
+流程详解
 ===
 
-阶段一：ca
+流程概览
+---
 
+流程注解
+---
 
-
-配置变更
-===
+新节点的配置
+---
 
 新节点启动的时候需要为空节点，否则可能需要脑裂
 参考 https://github.com/baidu/braft/issues/303
 
-TODO
+分布式事务
 ---
 
-* 讲一下 replicator 的作用
-* 讲一下 replicator 的启动流程
-* 每条日志会带一个 bollot 还是 boolt box?
-* 什么时候往 new_
-
-* 新节点以什么配置生效，会不会成为主？
-
-```cpp
-{1,2,3} => {1,4,5} 2 是主?
-```
-
-有 leader 的心跳，不会选主？
-
-* 2PC 怎么保证原子性, 负责变更的 leader 挂掉了?
-
-* 假如新节点错误，会不会阻塞后续的变更？不会，在 catchup 阶段就行不通了
-
-```cpp
-// Add a new peer into the replicating group which consists of |conf|.
-// Returns OK on success, error information otherwise.
-butil::Status add_peer(const GroupId& group_id, const Configuration& conf,
-                       const PeerId& peer_id, const CliOptions& options);
-
-// Remove a peer from the replicating group which consists of |conf|.
-// Returns OK on success, error information otherwise.
-butil::Status remove_peer(const GroupId& group_id, const Configuration& conf,
-                          const PeerId& peer_id, const CliOptions& options);
-
-// Gracefully change the peers of the replication group.
-butil::Status change_peers(const GroupId& group_id, const Configuration& conf,
-                           const Configuration& new_peers,
-                           const CliOptions& options);
-
-// Transfer the leader of the replication group to the target peer
-butil::Status transfer_leader(const GroupId& group_id, const Configuration& conf,
-                              const PeerId& peer, const CliOptions& options);
-
-// Reset the peer set of the target peer
-butil::Status reset_peer(const GroupId& group_id, const PeerId& peer_id,
-                         const Configuration& new_conf,
-                         const CliOptions& options);
-```
+相关 RPC
+---
 
 ```proto
 message AddPeerRequest {
@@ -73,13 +30,38 @@ message AddPeerResponse {
     repeated string old_peers = 1;
     repeated string new_peers = 2;
 }
+
+message RemovePeerRequest {
+    required string group_id = 1;
+    required string leader_id = 2;
+    required string peer_id = 3;
+}
+
+message RemovePeerResponse {
+    repeated string old_peers = 1;
+    repeated string new_peers = 2;
+}
+
+message ChangePeersRequest {
+    required string group_id = 1;
+    required string leader_id = 2;
+    repeated string new_peers = 3;
+}
+
+message ChangePeersResponse {
+    repeated string old_peers = 1;
+    repeated string new_peers = 2;
+}
+
+service CliService {
+    rpc add_peer(AddPeerRequest) returns (AddPeerResponse);
+    rpc remove_peer(RemovePeerRequest) returns (RemovePeerResponse);
+    rpc change_peers(ChangePeersRequest) returns (ChangePeersResponse);
+};
 ```
 
-```cpp
-add_pper
-remove_peer
-reset_peer
-```
+阶段一：CaughtUp
+===
 
 ```cpp
 void NodeImpl::add_peer(const PeerId& peer, Closure* done) {
@@ -88,15 +70,26 @@ void NodeImpl::add_peer(const PeerId& peer, Closure* done) {
     new_conf.add_peer(peer);
     return unsafe_register_conf_change(_conf.conf, new_conf, done);
 }
-```
 
+void NodeImpl::remove_peer(const PeerId& peer, Closure* done) {
+    BAIDU_SCOPED_LOCK(_mutex);
+    Configuration new_conf = _conf.conf;
+    new_conf.remove_peer(peer);
+    return unsafe_register_conf_change(_conf.conf, new_conf, done);
+}
+
+void NodeImpl::change_peers(const Configuration& new_peers, Closure* done) {
+    BAIDU_SCOPED_LOCK(_mutex);
+    return unsafe_register_conf_change(_conf.conf, new_peers, done);
+}
+```
 
 ```cpp
 void NodeImpl::unsafe_register_conf_change(const Configuration& old_conf,
                                            const Configuration& new_conf,
                                            Closure* done) {
     ...
-    if (_conf_ctx.is_busy()) {
+    if (_conf_ctx.is_busy()) {  // 已经有配置变更在进行了
         ...
         return;
     }
@@ -104,6 +97,8 @@ void NodeImpl::unsafe_register_conf_change(const Configuration& old_conf,
     return _conf_ctx.start(old_conf, new_conf, done);
 }
 ```
+
+将新老配置做 diff 获得新加入的节点列表：
 
 ```cpp
 void NodeImpl::ConfigurationCtx::start(const Configuration& old_conf,
@@ -139,9 +134,6 @@ void NodeImpl::ConfigurationCtx::start(const Configuration& old_conf,
 
 ```
 
-
-
-
 ```cpp
 int ReplicatorGroup::wait_caughtup(const PeerId& peer,
                                    int64_t max_margin, const timespec* due_time,
@@ -172,6 +164,174 @@ public:
 ```
 
 每次 send_entries 后都会 notify
+
+```cpp
+void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
+                     AppendEntriesRequest* request,
+                     AppendEntriesResponse* response,
+                     int64_t rpc_send_time) {
+    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
+    std::unique_ptr<AppendEntriesRequest>  req_guard(request);
+    std::unique_ptr<AppendEntriesResponse> res_guard(response);
+    Replicator *r = NULL;
+    bthread_id_t dummy_id = { id };
+    const long start_time_us = butil::gettimeofday_us();
+    if (bthread_id_lock(dummy_id, (void**)&r) != 0) {
+        return;
+    }
+
+    std::stringstream ss;
+    ss << "node " << r->_options.group_id << ":" << r->_options.server_id
+       << " received AppendEntriesResponse from "
+       << r->_options.peer_id << " prev_log_index " << request->prev_log_index()
+       << " prev_log_term " << request->prev_log_term() << " count " << request->entries_size();
+
+    bool valid_rpc = false;
+    int64_t rpc_first_index = request->prev_log_index() + 1;
+    int64_t min_flying_index = r->_min_flying_index();  // _next_index - _flying_append_entries_size
+    CHECK_GT(min_flying_index, 0);
+
+    for (std::deque<FlyingAppendEntriesRpc>::iterator rpc_it = r->_append_entries_in_fly.begin();
+        rpc_it != r->_append_entries_in_fly.end(); ++rpc_it) {
+        if (rpc_it->log_index > rpc_first_index) {
+            break;
+        }
+        if (rpc_it->call_id == cntl->call_id()) {
+            valid_rpc = true;
+        }
+    }
+    if (!valid_rpc) {
+        ss << " ignore invalid rpc";
+        BRAFT_VLOG << ss.str();
+        CHECK_EQ(0, bthread_id_unlock(r->_id)) << "Fail to unlock " << r->_id;
+        return;
+    }
+
+    if (cntl->Failed()) {
+        ss << " fail, sleep.";
+        BRAFT_VLOG << ss.str();
+
+        // TODO: Should it be VLOG?
+        LOG_IF(WARNING, (r->_consecutive_error_times++) % 10 == 0)
+                        << "Group " << r->_options.group_id
+                        << " fail to issue RPC to " << r->_options.peer_id
+                        << " _consecutive_error_times=" << r->_consecutive_error_times
+                        << ", " << cntl->ErrorText();
+        // If the follower crashes, any RPC to the follower fails immediately,
+        // so we need to block the follower for a while instead of looping until
+        // it comes back or be removed
+        // dummy_id is unlock in block
+        r->_reset_next_index();
+        return r->_block(start_time_us, cntl->ErrorCode());
+    }
+    r->_consecutive_error_times = 0;
+    if (!response->success()) {
+        if (response->term() > r->_options.term) {
+            BRAFT_VLOG << " fail, greater term " << response->term()
+                       << " expect term " << r->_options.term;
+            r->_reset_next_index();
+
+            NodeImpl *node_impl = r->_options.node;
+            // Acquire a reference of Node here in case that Node is destroyed
+            // after _notify_on_caught_up.
+            node_impl->AddRef();
+            r->_notify_on_caught_up(EPERM, true);
+            butil::Status status;
+            status.set_error(EHIGHERTERMRESPONSE, "Leader receives higher term "
+                    "%s from peer:%s", response->GetTypeName().c_str(), r->_options.peer_id.to_string().c_str());
+            r->_destroy();
+            node_impl->increase_term_to(response->term(), status);
+            node_impl->Release();
+            return;
+        }
+        ss << " fail, find next_index remote last_log_index " << response->last_log_index()
+           << " local next_index " << r->_next_index
+           << " rpc prev_log_index " << request->prev_log_index();
+        BRAFT_VLOG << ss.str();
+        r->_update_last_rpc_send_timestamp(rpc_send_time);
+        // prev_log_index and prev_log_term doesn't match
+        r->_reset_next_index();
+        if (response->last_log_index() + 1 < r->_next_index) {
+            BRAFT_VLOG << "Group " << r->_options.group_id
+                       << " last_log_index at peer=" << r->_options.peer_id
+                       << " is " << response->last_log_index();
+            // The peer contains less logs than leader
+            r->_next_index = response->last_log_index() + 1;
+        } else {
+            // The peer contains logs from old term which should be truncated,
+            // decrease _last_log_at_peer by one to test the right index to keep
+            if (BAIDU_LIKELY(r->_next_index > 1)) {
+                BRAFT_VLOG << "Group " << r->_options.group_id
+                           << " log_index=" << r->_next_index << " mismatch";
+                --r->_next_index;
+            } else {
+                LOG(ERROR) << "Group " << r->_options.group_id
+                           << " peer=" << r->_options.peer_id
+                           << " declares that log at index=0 doesn't match,"
+                              " which is not supposed to happen";
+            }
+        }
+        // dummy_id is unlock in _send_heartbeat
+        r->_send_empty_entries(false);
+        return;
+    }
+
+    ss << " success";
+    BRAFT_VLOG << ss.str();
+
+    if (response->term() != r->_options.term) {
+        LOG(ERROR) << "Group " << r->_options.group_id
+                   << " fail, response term " << response->term()
+                   << " mismatch, expect term " << r->_options.term;
+        r->_reset_next_index();
+        CHECK_EQ(0, bthread_id_unlock(r->_id)) << "Fail to unlock " << r->_id;
+        return;
+    }
+    r->_update_last_rpc_send_timestamp(rpc_send_time);
+    const int entries_size = request->entries_size();
+    const int64_t rpc_last_log_index = request->prev_log_index() + entries_size;
+    BRAFT_VLOG_IF(entries_size > 0) << "Group " << r->_options.group_id
+                                    << " replicated logs in ["
+                                    << min_flying_index << ", "
+                                    << rpc_last_log_index
+                                    << "] to peer " << r->_options.peer_id;
+    if (entries_size > 0) {
+        r->_options.ballot_box->commit_at(
+                min_flying_index, rpc_last_log_index,
+                r->_options.peer_id);
+        int64_t rpc_latency_us = cntl->latency_us();
+        if (FLAGS_raft_trace_append_entry_latency &&
+            rpc_latency_us > FLAGS_raft_append_entry_high_lat_us) {
+            LOG(WARNING) << "append entry rpc latency us " << rpc_latency_us
+                         << " greater than "
+                         << FLAGS_raft_append_entry_high_lat_us
+                         << " Group " << r->_options.group_id
+                         << " to peer  " << r->_options.peer_id
+                         << " request entry size " << entries_size
+                         << " request data size "
+                         <<  cntl->request_attachment().size();
+        }
+        g_send_entries_latency << cntl->latency_us();
+        if (cntl->request_attachment().size() > 0) {
+            g_normalized_send_entries_latency <<
+                cntl->latency_us() * 1024 / cntl->request_attachment().size();
+        }
+    }
+    // A rpc is marked as success, means all request before it are success,
+    // erase them sequentially.
+    while (!r->_append_entries_in_fly.empty() &&
+           r->_append_entries_in_fly.front().log_index <= rpc_first_index) {
+        r->_flying_append_entries_size -= r->_append_entries_in_fly.front().entries_size;
+        r->_append_entries_in_fly.pop_front();
+    }
+    r->_has_succeeded = true;
+    r->_notify_on_caught_up(0, false);
+    ...
+    r->_send_entries();
+    return;
+}
+```
+
 ```cpp
 void Replicator::_notify_on_caught_up(int error_code, bool before_destroy) {
     ...
@@ -210,7 +370,7 @@ void NodeImpl::ConfigurationCtx::on_caughtup(
 ```
 
 阶段二：联合共识
----
+===
 
 ```cpp
 void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
@@ -315,7 +475,7 @@ bool LogManager::check_and_set_configuration(ConfigurationEntry* current) {
 
 
 follower 接收到 append_entries
-===
+---
 
 ```cpp
 void NodeImpl::become_leader() {
@@ -381,3 +541,25 @@ void NodeImpl::ConfigurationCtx::flush(const Configuration& conf,
 
 }
 ```
+
+TODO
+---
+
+* 重复下发有什么问题？
+
+* 讲一下 replicator 的作用
+* 讲一下 replicator 的启动流程
+* 每条日志会带一个 bollot 还是 boolt box?
+* 什么时候往 new_
+
+* 新节点以什么配置生效，会不会成为主？
+
+```cpp
+{1,2,3} => {1,4,5} 2 是主?
+```
+
+有 leader 的心跳，不会选主？
+
+* 2PC 怎么保证原子性, 负责变更的 leader 挂掉了?
+
+* 假如新节点错误，会不会阻塞后续的变更？不会，在 catchup 阶段就行不通了
