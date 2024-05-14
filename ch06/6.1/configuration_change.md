@@ -556,7 +556,7 @@ void NodeImpl::become_leader() {
 ===
 
 其他：故障恢复
----
+===
 
 ```cpp
 void NodeImpl::ConfigurationCtx::flush(const Configuration& conf,
