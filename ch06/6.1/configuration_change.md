@@ -26,8 +26,8 @@
     * 6.2 若 Leader 不在新集群中，则降为 `Follower` 并向拥有最长日志的节点发送 `TimeoutNow` 请求让你立马进行选举
 
 ![图 6.1  配置变更流程](image/configuration_change.png)
-流程注解
 
+流程注解
 ---
 
 故障恢复
