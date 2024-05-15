@@ -41,51 +41,22 @@
 新节点启动的时候需要为空节点，否则可能需要脑裂
 参考 https://github.com/baidu/braft/issues/303
 
-分布式事务
+相关 API
 ---
 
-相关 RPC
----
+```cpp
+// Add a new peer to the raft group. done->Run() would be invoked after this
+// operation finishes, describing the detailed result.
+void add_peer(const PeerId& peer, Closure* done);
 
-```proto
-message AddPeerRequest {
-    required string group_id = 1;
-    required string leader_id = 2;
-    required string peer_id = 3;
-}
+// Remove the peer from the raft group. done->Run() would be invoked after
+// this operation finishes, describing the detailed result.
+void remove_peer(const PeerId& peer, Closure* done);
 
-message AddPeerResponse {
-    repeated string old_peers = 1;
-    repeated string new_peers = 2;
-}
-
-message RemovePeerRequest {
-    required string group_id = 1;
-    required string leader_id = 2;
-    required string peer_id = 3;
-}
-
-message RemovePeerResponse {
-    repeated string old_peers = 1;
-    repeated string new_peers = 2;
-}
-
-message ChangePeersRequest {
-    required string group_id = 1;
-    required string leader_id = 2;
-    repeated string new_peers = 3;
-}
-
-message ChangePeersResponse {
-    repeated string old_peers = 1;
-    repeated string new_peers = 2;
-}
-
-service CliService {
-    rpc add_peer(AddPeerRequest) returns (AddPeerResponse);
-    rpc remove_peer(RemovePeerRequest) returns (RemovePeerResponse);
-    rpc change_peers(ChangePeersRequest) returns (ChangePeersResponse);
-};
+// Change the configuration of the raft group to |new_peers| , done->Run()
+// would be invoked after this operation finishes, describing the detailed
+// result.
+void change_peers(const Configuration& new_peers, Closure* done);
 ```
 
 阶段一：追赶日志
@@ -575,6 +546,9 @@ void NodeImpl::ConfigurationCtx::flush(const Configuration& conf,
 
 }
 ```
+
+其他：变更失败
+===
 
 TODO
 ---

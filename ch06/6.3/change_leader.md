@@ -38,7 +38,18 @@ service RaftService {
 };
 ```
 
-具体实现
+相关 API
+---
+
+```cpp
+// Try transferring leadership to |peer|.
+// If peer is ANY_PEER, a proper follower will be chosen as the leader for
+// the next term.
+// Returns 0 on success, -1 otherwise.
+int transfer_leadership_to(const PeerId& peer);
+```
+
+阶段一：开始转移 Leader
 ===
 
 ```cpp
@@ -145,8 +156,6 @@ int ReplicatorGroup::transfer_leadership_to(
 
 ```
 
-发送 `TimeoutNow` 请求
----
 
 ```cpp
 int Replicator::transfer_leadership(ReplicatorId id, int64_t log_index) {
@@ -187,7 +196,18 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
     r->_send_entries();
     return;
 }
+```
 
+阶段二：同步日志
+===
+
+阶段三：重新选举
+===
+
+发送 `TimeoutNow` 请求
+---
+
+```cpp
 void Replicator::_send_timeout_now(bool unlock_id, bool old_leader_stepped_down,
                                    int timeout_ms) {
     TimeoutNowRequest* request = new TimeoutNowRequest;
@@ -283,6 +303,7 @@ void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
 }
 ```
 
+
 Leader 收到 `TimeoutNow` 响应
 ---
 
@@ -355,8 +376,8 @@ int NodeImpl::increase_term_to(int64_t new_term, const butil::Status& status) {
 }
 ```
 
-转移超时
----
+其他：转移 Leader 超时
+===
 
 ```cpp
 void on_transfer_timeout(void* arg) {

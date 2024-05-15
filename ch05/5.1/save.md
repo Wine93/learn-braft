@@ -21,6 +21,8 @@
 
 流程整体分为以下 3 个阶段：创建临时快照（1-2），用户写入数据（3-4），转换为正式快照（5-6）
 
+![图 5.1  创建快照整体流程](image/snapshot_save.svg)
+
 流程注解
 ---
 
@@ -65,13 +67,13 @@ message LocalSnapshotPbMeta {
 }
 ```
 
+相关 API
+---
 
-具体实现
-===
+```cpp
+void NodeImpl::snapshot(Closure* done)
+```
 
-![图 5.1  创建快照整体流程](image/snapshot_save.svg)
-
-创建快照主要分为以下 3 个阶段：
 
 阶段一：创建临时快照
 ===
@@ -137,8 +139,14 @@ void SnapshotExecutor::do_snapshot(Closure* done) {
 
 用户需要确保在调用 `done->Run` 前，用户需要调用 `sync` 确保数据已经落盘，否则可能会导致数据丢失。
 
-阶段三：收尾工作
+阶段三：转为正式快照
 ===
+
+写入元数据
+---
+
+删除上一个快照
+---
 
 `on_snapshot_save_done` 主要做以下几件事情：
 
