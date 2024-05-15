@@ -493,7 +493,7 @@ void NodeImpl::become_leader() {
 }
 ```
 
-创建 Replicator
+3.1 创建 Replicator
 ---
 
 节点在成为 Leader 后会为每个 Follower 创建对应 `Replicator`，每个 `Replicator` 都是单独的 `bthread`，它主要有以下 3 个作用：
@@ -570,7 +570,7 @@ int Replicator::start(const ReplicatorOptions& options, ReplicatorId *id) {
 }
 ```
 
-启动心跳定时器
+3.2 启动心跳定时器
 ---
 ```cpp
 static inline int heartbeat_timeout(int election_timeout) {
@@ -646,7 +646,7 @@ int Replicator::_on_error(bthread_id_t id, void* arg, int error_code) {
 }
 ```
 
-确定 nextIndex
+3.3 确定 nextIndex
 ---
 
 Leader 通过发送空的 `AppendEntries` 来探测 Follower 的 `nextIndex`
@@ -881,7 +881,7 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
 }
 ```
 
-复制上一任期日志
+3.4 复制上一任期日志
 ---
 
 只复制不提交，如果直接提交会出现幽灵日志问题
@@ -955,7 +955,7 @@ int BallotBox::commit_at(
 ```
 
 
-提交 no-op 日志
+3.5 提交 no-op 日志
 ---
 
 ```cpp
@@ -1118,7 +1118,7 @@ void FSMCaller::do_committed(int64_t committed_index) {
 }
 ```
 
-回调 on_leader_start
+3.6 回调 on_leader_start
 ---
 
 ```cpp
