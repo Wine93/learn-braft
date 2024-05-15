@@ -21,6 +21,8 @@
 7. Leader 收到成功响应后更新 Follower 的 `nextIndex` 为快照的 `lastIncludedIndex` + 1
 8. Leader 从 `nextIndex` 开始继续向 Follower 发送日志
 
+![图 5.2  安装快照 RPC 交互](image/install.png)
+
 流程注解
 ---
 
@@ -64,7 +66,6 @@ service RaftService {
 
 下载文件：
 ```proto
-
 message GetFileRequest {
     required int64 reader_id = 1;
     required string filename = 2;
