@@ -938,10 +938,10 @@ void Replicator::_on_install_snapshot_returned(
 其他：安装快照失败
 ===
 
-增量更新
 
 
 
+<!--
 TODO
 ===
 
@@ -957,3 +957,5 @@ TODO
 > 安装快照时，不再复制日志吗？
 > nextIndex 怎么更新
 > 快照对应的日志会不会重放？ // 应该没有被删除? 应该是被删除了？
+
+-->
