@@ -22,7 +22,57 @@
 
 由于快照中对应的是已经 committed 的日志，所以只要有快照，都可以直接加载
 
-触发加载快照
+相关接口
+---
+
+```cpp
+class StateMachine {
+public:
+    // user defined snapshot load function
+    // get and load snapshot
+    // success return 0, fail return errno
+    // Default: Load nothing and returns error.
+    virtual int on_snapshot_load(::braft::SnapshotReader* reader);
+
+    // Invoked when a configuration has been committed to the group
+    virtual void on_configuration_committed(const ::braft::Configuration& conf);
+    virtual void on_configuration_committed(const ::braft::Configuration& conf, int64_t index);
+};
+```
+
+```cpp
+class SnapshotReader : public Snapshot {
+public:
+    // Load meta from
+    virtual int load_meta(SnapshotMeta* meta) = 0;
+
+    // Generate uri for other peers to copy this snapshot.
+    // Return an empty string if some error has occcured
+    virtual std::string generate_uri_for_copy() = 0;
+};
+
+class Snapshot : public butil::Status {
+public:
+    // Get the path of the Snapshot
+    virtual std::string get_path() = 0;
+
+    // List all the existing files in the Snapshot currently
+    virtual void list_files(std::vector<std::string> *files) = 0;
+
+    // Get the implementation-defined file_meta
+    virtual int get_file_meta(const std::string& filename,
+                              ::google::protobuf::Message* file_meta) {
+        (void)filename;
+        if (file_meta != NULL) {
+            file_meta->Clear();
+        }
+        return 0;
+    }
+};
+```
+
+
+阶段一：触发加载快照
 ===
 
 节点重启需要遍历用户指定的快照目录，获取最新的快照目录
@@ -429,8 +479,9 @@ void SnapshotExecutor::load_downloading_snapshot(DownloadingSnapshot* ds,
 }
 ```
 
-加载快照
+阶段二：用户加载快照
 ===
+
 ```cpp
 int FSMCaller::on_snapshot_load(LoadSnapshotClosure* done) {
     ApplyTask task;
@@ -505,7 +556,7 @@ void FSMCaller::do_snapshot_load(LoadSnapshotClosure* done) {
 ```
 
 
-完成快照加载
+阶段三：完成快照加载
 ===
 
 ```cpp
@@ -565,3 +616,6 @@ void SnapshotExecutor::on_snapshot_load_done(const butil::Status& st) {
     _running_jobs.signal();
 }
 ```
+
+其他：加载失败
+===

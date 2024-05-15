@@ -85,11 +85,52 @@ service RaftService {
 | 心跳     | 空      | 当前 Leader 的 `CommitIndex` |
 | 复制日志 | 日志    | 当前 Leader 的 `CommitIndex` |
 
+相关接口
+---
+
+```cpp
+class Node {
+public:
+    // [Thread-safe and wait-free]
+    // apply task to the replicated-state-machine
+    //
+    // About the ownership:
+    // |task.data|: for the performance consideration, we will take away the
+    //              content. If you want keep the content, copy it before call
+    //              this function
+    // |task.done|: If the data is successfully committed to the raft group. We
+    //              will pass the ownership to StateMachine::on_apply.
+    //              Otherwise we will specify the error and call it.
+    //
+    void apply(const Task& task);
+};
+```
+
+```cpp
+class StateMachine {
+public:
+    // Update the StateMachine with a batch a tasks that can be accessed
+    // through |iterator|.
+    //
+    // Invoked when one or more tasks that were passed to Node::apply have been
+    // committed to the raft group (quorum of the group peers have received
+    // those tasks and stored them on the backing storage).
+    //
+    // Once this function returns to the caller, we will regard all the iterated
+    // tasks through |iter| have been successfully applied. And if you didn't
+    // apply all the the given tasks, we would regard this as a critical error
+    // and report a error whose type is ERROR_TYPE_STATE_MACHINE.
+    virtual void on_apply(::braft::Iterator& iter) = 0;
+};
+```
+
 前置步骤：确定 nextIndex
 ===
 
+阶段一：
 
-步骤一：用户提交任务
+
+阶段一：追加日志
 ===
 ```cpp
 #include <braft/raft.h>
@@ -185,8 +226,11 @@ void NodeImpl::apply(LogEntryAndClosure tasks[], size_t size) {
 }
 ```
 
-步骤二: Leader 追加日志
+阶段二：持久化日志
 ===
+
+Leader 追加日志
+---
 
 *LogManager* 是 *braft* 管理日志的入口，
 
@@ -246,8 +290,11 @@ int LogManager::disk_thread(void* meta,
 }
 ```
 
-步骤三: Leader 发送 AE
+阶段三：复制日志
 ===
+
+Leader 发送 AE
+---
 
 唤醒 Replicator
 ---
@@ -318,8 +365,8 @@ int Replicator::_fill_common_fields(AppendEntriesRequest* request,
 }
 ```
 
-步骤四: Follower 处理 AE
-===
+Follower 处理 AE
+---
 
 * 当日志被成功持久化后，会调用 `FollowerStableClosure`
 
@@ -415,10 +462,10 @@ int BallotBox::set_last_committed_index(int64_t last_committed_index) {
 }
 ```
 
-步骤五: Leader 处理 AE 响应
-===
+Leader 处理 AE 响应
+---
 
-*Leader* 针对不同的响应
+Leader 针对不同的响应
 
 * **RPC 失败**：调用 `_block` 阻塞当前 *Replicator* 一段时间（默认 100 毫秒），超时后调用 `_continue_sending` 重新发送当前 *AppendEntries* 请求。出现这种情况一般是对应的 *Follower* crash 了，需要不断重试直到其恢复正常或被剔除集群。
 * **响应失败**：这里又细分为 2 种情况
@@ -450,6 +497,9 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
 }
 ```
 
+阶段四：提交日志
+===
+
 提交日志
 ---
 
@@ -465,7 +515,7 @@ int BallotBox::commit_at(
 }
 ```
 
-步骤六: 应用日志
+步骤五：应用日志
 ===
 
 回调 on_apply

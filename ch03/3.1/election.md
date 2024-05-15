@@ -83,17 +83,21 @@ message RequestVoteResponse {
 service RaftService {
     rpc pre_vote(RequestVoteRequest) returns (RequestVoteResponse);
     rpc request_vote(RequestVoteRequest) returns (RequestVoteResponse);
-    ...
 }
 ```
 
+相关接口
+---
+
+```cpp
+```
 
 阶段一：PreVote
 ===
 
 ![图 3.1  PreVote 整体实现](image/pre_vote.svg)
 
-1.1 触发投票
+触发投票
 ---
 
 节点在初始化就会启动选举定时器：
@@ -132,7 +136,7 @@ void NodeImpl::handle_election_timeout() {
 }
 ```
 
-1.2 发送请求
+发送请求
 ---
 
 在 `pre_vote` 函数中会对所有节点发送 `PreVote` 请求，并设置 RPC 响应的回调函数为 `OnPreVoteRPCDone`， 最后 调用 `grant_slef` 给自己投一票，之后就进入等待：
@@ -163,7 +167,7 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
 }
 ```
 
-1.3 处理请求
+处理请求
 ---
 
 其他节点在收到 `PreVote` 请求后会调用 `handle_pre_vote_request` 处理请求：
@@ -202,7 +206,7 @@ int NodeImpl::handle_pre_vote_request(const RequestVoteRequest* request,
 
 ```
 
-1.4 处理响应
+处理响应
 ---
 
 在收到其他节点的 `PreVote` 响应后，会回调之前设置的 callback `OnPreVoteRPCDone->Run()`，在 callback 中会调用 `handle_pre_vote_response` 处理 `PreVote` 响应：
@@ -226,7 +230,7 @@ struct OnPreVoteRPCDone : public google::protobuf::Closure {
 
 ```
 
-1.5 投票失败
+投票失败
 ---
 
 ```cpp
@@ -251,12 +255,12 @@ void NodeImpl::handle_vote_timeout() {
 ```
 
 
-阶段二：`RequestVote`
+阶段二：RequestVote
 ===
 
 ![图 3.2  RequestVote 整体实现](image/vote.svg)
 
-2.1 发送请求
+发送请求
 ---
 
 当 PreVote 阶段获得大多数节点的支持后，将调用 `elect_self` 正式进 *RequestVote* 阶段。在 `elect_self` 会将角色转变为 Candidte，并加自身的 Term + 1，向所有的节点发送 `RequestVote` 请求，最后给自己投一票后，等待其他节点的 `RequestVote` 响应：
@@ -308,7 +312,7 @@ void NodeImpl::request_peers_to_vote(const std::set<PeerId>& peers,
 }
 ```
 
-2.2 处理请求
+处理请求
 ---
 
 节点在收到 `RequestVote` 请求后，会调用 `handle_request_vote_request`
@@ -384,7 +388,7 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
 }
 ```
 
-2.3 处理响应
+处理响应
 ---
 
 ```cpp
@@ -437,7 +441,7 @@ void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t
 ```
 
 
-2.4 投票超时
+投票超时
 ---
 
 ```cpp
@@ -453,7 +457,7 @@ void NodeImpl::handle_vote_timeout() {
 }
 ```
 
-阶段三：成为 *Leader*
+阶段三：成为 Leader
 ===
 
 ![图 3.3  become_leader 整体实现](image/become_leader.svg)
@@ -493,7 +497,7 @@ void NodeImpl::become_leader() {
 }
 ```
 
-3.1 创建 Replicator
+创建 Replicator
 ---
 
 节点在成为 Leader 后会为每个 Follower 创建对应 `Replicator`，每个 `Replicator` 都是单独的 `bthread`，它主要有以下 3 个作用：
@@ -570,7 +574,7 @@ int Replicator::start(const ReplicatorOptions& options, ReplicatorId *id) {
 }
 ```
 
-3.2 启动心跳定时器
+启动心跳定时器
 ---
 ```cpp
 static inline int heartbeat_timeout(int election_timeout) {
@@ -646,7 +650,7 @@ int Replicator::_on_error(bthread_id_t id, void* arg, int error_code) {
 }
 ```
 
-3.3 确定 nextIndex
+确定 nextIndex
 ---
 
 Leader 通过发送空的 `AppendEntries` 来探测 Follower 的 `nextIndex`
@@ -881,7 +885,7 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
 }
 ```
 
-3.4 复制上一任期日志
+复制上一任期日志
 ---
 
 只复制不提交，如果直接提交会出现幽灵日志问题
@@ -955,7 +959,7 @@ int BallotBox::commit_at(
 ```
 
 
-3.5 提交 no-op 日志
+提交 no-op 日志
 ---
 
 ```cpp
@@ -1118,7 +1122,7 @@ void FSMCaller::do_committed(int64_t committed_index) {
 }
 ```
 
-3.6 回调 on_leader_start
+回调 on_leader_start
 ---
 
 ```cpp
