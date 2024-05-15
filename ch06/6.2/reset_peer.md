@@ -23,18 +23,21 @@
 **不建议使用reset_peers**，reset_peers会破坏raft对数据一致性的保证，而且可能会造成脑裂。例如，{A B C D E}组成的复制组G，其中{C D E}故障，将{A B} set_peer成功恢复复制组G'，{C D E}又重新启动它们也会形成一个复制组G''，这样复制组G中会存在两个Leader，且{A B}这两个复制组中都存在，其中的follower会接收两个leader的AppendEntries，当前只检测term和index，可能会导致其上数据错乱。
 
 
-相关 API
+相关接口
 ---
 
 ```cpp
-// Reset the configuration of this node individually, without any repliation
-// to other peers before this node beomes the leader. This function is
-// supposed to be inovoked when the majority of the replication group are
-// dead and you'd like to revive the service in the consideration of
-// availability.
-// Notice that neither consistency nor consensus are guaranteed in this
-// case, BE CAREFULE when dealing with this method.
-butil::Status reset_peers(const Configuration& new_peers);
+class Node {
+public:
+    // Reset the configuration of this node individually, without any repliation
+    // to other peers before this node beomes the leader. This function is
+    // supposed to be inovoked when the majority of the replication group are
+    // dead and you'd like to revive the service in the consideration of
+    // availability.
+    // Notice that neither consistency nor consensus are guaranteed in this
+    // case, BE CAREFULE when dealing with this method.
+    butil::Status reset_peers(const Configuration& new_peers);
+};
 ```
 
 阶段一：重置节点列表

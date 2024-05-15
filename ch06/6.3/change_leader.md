@@ -38,15 +38,18 @@ service RaftService {
 };
 ```
 
-相关 API
+相关接口
 ---
 
 ```cpp
-// Try transferring leadership to |peer|.
-// If peer is ANY_PEER, a proper follower will be chosen as the leader for
-// the next term.
-// Returns 0 on success, -1 otherwise.
-int transfer_leadership_to(const PeerId& peer);
+class Node {
+public:
+    // Try transferring leadership to |peer|.
+    // If peer is ANY_PEER, a proper follower will be chosen as the leader for
+    // the next term.
+    // Returns 0 on success, -1 otherwise.
+    int transfer_leadership_to(const PeerId& peer);
+};
 ```
 
 阶段一：开始转移 Leader

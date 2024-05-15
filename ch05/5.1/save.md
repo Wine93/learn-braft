@@ -67,13 +67,48 @@ message LocalSnapshotPbMeta {
 }
 ```
 
-相关 API
+相关接口
 ---
 
 ```cpp
-void NodeImpl::snapshot(Closure* done)
+class Node {
+public:
+    // Start a snapshot immediately if possible. done->Run() would be invoked
+    // when the snapshot finishes, describing the detailed result.
+    void snapshot(Closure* done);
+};
 ```
 
+```cpp
+class StateMachine {
+public:
+    // user defined snapshot generate function, this method will block on_apply.
+    // user can make snapshot async when fsm can be cow(copy-on-write).
+    // call done->Run() when snapshot finished.
+    // success return 0, fail return errno
+    // Default: Save nothing and returns error.
+    virtual void on_snapshot_save(::braft::SnapshotWriter* writer,
+                                  ::braft::Closure* done);
+};
+```
+
+```cpp
+class SnapshotWriter : public Snapshot {
+public:
+    // Add a file to the snapshot.
+    // |file_meta| is an implmentation-defined protobuf message
+    // All the implementation must handle the case that |file_meta| is NULL and
+    // no error can be raised.
+    // Note that whether the file will be created onto the backing storage is
+    // implementation-defined.
+    virtual int add_file(const std::string& filename);
+
+    // Remove a file from the snapshot
+    // Note that whether the file will be removed from the backing storage is
+    // implementation-defined.
+    virtual int remove_file(const std::string& filename) = 0;
+};
+```
 
 阶段一：创建临时快照
 ===
@@ -211,3 +246,8 @@ int SnapshotExecutor::on_snapshot_save_done(
 
 > **快照的命名**
 >
+
+其他：创建快照失败
+===
+
+用户可以在 `on_snapshot_save` 中返回失败

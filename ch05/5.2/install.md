@@ -26,7 +26,7 @@
 
 1. 正常情况下不会触发快照，例如节点故障下线后重启
 
-复杂的快照目录
+增量下载
 ---
 
 
@@ -84,12 +84,18 @@ service FileService {
 }
 ```
 
+相关接口
+---
+
+```cpp
+```
+
 
 
 ```cpp
 ```
 
-阶段一：Leader 触发任务
+阶段一：Leader 下发命令
 ===
 
 Follower 处理 `InstallSnapshot`
@@ -131,7 +137,7 @@ void SnapshotExecutor::install_snapshot(brpc::Controller* cntl,
 }
 ```
 
-阶段二：Follower 下载日志
+阶段二：Follower 下载快照
 ===
 
 
@@ -886,6 +892,12 @@ void Replicator::_on_install_snapshot_returned(
     return r->_send_entries();
 }
 ```
+
+其他：安装快照失败
+===
+
+增量更新
+
 
 
 TODO

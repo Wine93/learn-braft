@@ -93,7 +93,7 @@ service RaftService {
 
 ![图 3.1  PreVote 整体实现](image/pre_vote.svg)
 
-触发投票
+1.1 触发投票
 ---
 
 节点在初始化就会启动选举定时器：
@@ -132,7 +132,7 @@ void NodeImpl::handle_election_timeout() {
 }
 ```
 
-发送请求
+1.2 发送请求
 ---
 
 在 `pre_vote` 函数中会对所有节点发送 `PreVote` 请求，并设置 RPC 响应的回调函数为 `OnPreVoteRPCDone`， 最后 调用 `grant_slef` 给自己投一票，之后就进入等待：
@@ -163,7 +163,7 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
 }
 ```
 
-处理请求
+1.3 处理请求
 ---
 
 其他节点在收到 `PreVote` 请求后会调用 `handle_pre_vote_request` 处理请求：
@@ -202,7 +202,7 @@ int NodeImpl::handle_pre_vote_request(const RequestVoteRequest* request,
 
 ```
 
-处理响应
+1.4 处理响应
 ---
 
 在收到其他节点的 `PreVote` 响应后，会回调之前设置的 callback `OnPreVoteRPCDone->Run()`，在 callback 中会调用 `handle_pre_vote_response` 处理 `PreVote` 响应：
@@ -226,7 +226,7 @@ struct OnPreVoteRPCDone : public google::protobuf::Closure {
 
 ```
 
-投票失败
+1.5 投票失败
 ---
 
 ```cpp
@@ -256,7 +256,7 @@ void NodeImpl::handle_vote_timeout() {
 
 ![图 3.2  RequestVote 整体实现](image/vote.svg)
 
-发送请求
+2.1 发送请求
 ---
 
 当 PreVote 阶段获得大多数节点的支持后，将调用 `elect_self` 正式进 *RequestVote* 阶段。在 `elect_self` 会将角色转变为 Candidte，并加自身的 Term + 1，向所有的节点发送 `RequestVote` 请求，最后给自己投一票后，等待其他节点的 `RequestVote` 响应：
@@ -308,7 +308,7 @@ void NodeImpl::request_peers_to_vote(const std::set<PeerId>& peers,
 }
 ```
 
-处理请求
+2.2 处理请求
 ---
 
 节点在收到 `RequestVote` 请求后，会调用 `handle_request_vote_request`
@@ -384,7 +384,7 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
 }
 ```
 
-处理响应
+2.3 处理响应
 ---
 
 ```cpp
@@ -437,7 +437,7 @@ void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t
 ```
 
 
-投票超时
+2.4 投票超时
 ---
 
 ```cpp

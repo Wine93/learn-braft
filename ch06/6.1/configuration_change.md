@@ -41,22 +41,25 @@
 新节点启动的时候需要为空节点，否则可能需要脑裂
 参考 https://github.com/baidu/braft/issues/303
 
-相关 API
+相关接口
 ---
 
 ```cpp
-// Add a new peer to the raft group. done->Run() would be invoked after this
-// operation finishes, describing the detailed result.
-void add_peer(const PeerId& peer, Closure* done);
+class Node {
+public:
+    // Add a new peer to the raft group. done->Run() would be invoked after this
+    // operation finishes, describing the detailed result.
+    void add_peer(const PeerId& peer, Closure* done);
 
-// Remove the peer from the raft group. done->Run() would be invoked after
-// this operation finishes, describing the detailed result.
-void remove_peer(const PeerId& peer, Closure* done);
+    // Remove the peer from the raft group. done->Run() would be invoked after
+    // this operation finishes, describing the detailed result.
+    void remove_peer(const PeerId& peer, Closure* done);
 
-// Change the configuration of the raft group to |new_peers| , done->Run()
-// would be invoked after this operation finishes, describing the detailed
-// result.
-void change_peers(const Configuration& new_peers, Closure* done);
+    // Change the configuration of the raft group to |new_peers| , done->Run()
+    // would be invoked after this operation finishes, describing the detailed
+    // result.
+    void change_peers(const Configuration& new_peers, Closure* done);
+};
 ```
 
 阶段一：追赶日志
