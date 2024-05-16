@@ -33,7 +33,16 @@
 Replicator
 ---
 
-讲一下作用
+节点刚成为 Leader 时会为每个 Follower 创建一个 `Replicator`，其运行在单独的 `bthread` 上，其主要有以下几个作用：
+
+* 记录 Follower 的一些状态，如 `nextIndex`
+* 任何发往 Follower 的指令都将通过 `Replicator` 发送，如 `InstallSnapshot`
+* 同步日志：`Replicator` 会不断地向 Follower 同步日志，直到 Follower 成功复制了 Leader 的所有日志后，其将在后台等待新日志的到来。
+
+nextIndex
+---
+
+`nextIndex` 是 Leader 记录下一个要发往每个 Follower 的日志 `Index`
 
 相关 RPC
 ---
@@ -79,11 +88,15 @@ service RaftService {
 };
 ```
 
-| 作用     | entries | committed_index              |
-|:---------|:--------|:-----------------------------|
-| 探测     | 空      | 0                            |
-| 心跳     | 空      | 当前 Leader 的 `CommitIndex` |
-| 复制日志 | 日志    | 当前 Leader 的 `CommitIndex` |
+需要注意的是，探测 `nextIndex`、心跳、复制日志都是用的 `append_entries`，区别在于其请求中携带的参数不同：
+
+| 作用     | entries  | committed_index              |
+|:---------|:---------|:-----------------------------|
+| 探测     | 空       | 0                            |
+| 心跳     | 空       | 当前 Leader 的 `CommitIndex` |
+| 复制日志 | 携带日志 | 当前 Leader 的 `CommitIndex` |
+
+> 除以上 2 个参数不同外，其余的参数都是一样的
 
 相关接口
 ---

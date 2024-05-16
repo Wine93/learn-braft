@@ -34,7 +34,7 @@
 投票规则
 ---
 
-在同一任期内，节点发出的 `PreVote` 和 `RequestVote` 的请求是一样的，区别在于`PreVote` 中的 `Term` 自身的 `Term+1`，而
+在同一任期内，节点发出的 `PreVote` 和 `RequestVote` 的请求是一样的，区别在于`PreVote` 请求中的 `Term` 为自身的 `Term`+1，而发送 `RequestVote` 请求前会先将自身的 `Term`+1。
 
 节点对于 `RequestVote` 请求投赞成票需要同时满足以下 3 个条件：
 
@@ -90,6 +90,41 @@ service RaftService {
 ---
 
 ```cpp
+class StateMachine {
+public:
+    // Invoked when the belonging node becomes the leader of the group at |term|
+    // Default: Do nothing
+    virtual void on_leader_start(int64_t term);
+
+    // Invoked when this node steps down from the leader of the replication
+    // group and |status| describes detailed information
+    virtual void on_leader_stop(const butil::Status& status);
+
+    // Invoked when a configuration has been committed to the group
+    virtual void on_configuration_committed(const ::braft::Configuration& conf);
+    virtual void on_configuration_committed(const ::braft::Configuration& conf, int64_t index);
+
+    // this method is called when a follower stops following a leader and its leader_id becomes NULL,
+    // situations including:
+    // 1. handle election_timeout and start pre_vote
+    // 2. receive requests with higher term such as vote_request from a candidate
+    // or append_entries_request from a new leader
+    // 3. receive timeout_now_request from current leader and start request_vote
+    // the parameter ctx gives the information(leader_id, term and status) about
+    // the very leader whom the follower followed before.
+    // User can reset the node's information as it stops following some leader.
+    virtual void on_stop_following(const ::braft::LeaderChangeContext& ctx);
+
+    // this method is called when a follower or candidate starts following a leader and its leader_id
+    // (should be NULL before the method is called) is set to the leader's id,
+    // situations including:
+    // 1. a candidate receives append_entries from a leader
+    // 2. a follower(without leader) receives append_entries from a leader
+    // the parameter ctx gives the information(leader_id, term and status) about
+    // the very leader whom the follower starts to follow.
+    // User can reset the node's information as it starts to follow some leader.
+    virtual void on_start_following(const ::braft::LeaderChangeContext& ctx);
+};
 ```
 
 阶段一：PreVote

@@ -33,7 +33,7 @@
 故障恢复
 ---
 
-如果执行变更的 Leader 挂掉了，或者被 `step_down` 成 Follower，
+如果执行变更的 Leader 挂掉了，或者被 `step_down` 成 Follower， `C{old,new}`
 
 新节点配置
 ---

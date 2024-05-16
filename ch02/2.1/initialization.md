@@ -28,20 +28,18 @@
 ApplyTaskQueue
 ---
 
-这是一个串行执行的任务队列，所有回调给用户状态机的任务都需进入该队列，
+这是一个串行执行的任务队列，所有回调给用户状态机的任务都需进入该队列，并且串行执行：
 
-* `SNAPSHOT_SAVE`
-
-| 任务类型        | 说明                   |                                 |
-|:----------------|:-----------------------|:--------------------------------|
-| COMMITTED       | 日志被提交             | 若日志类型为配置文件，则回调 `` |
-| SNAPSHOT_SAVE   | 创建快照               |                                 |
-| SNAPSHOT_LOAD   | 加载快照               |                                 |
-| LEADER_STOP     | Leader 转换为 Follower | on_leader_start                 |
-| LEADER_START    |                        |                                 |
-| START_FOLLOWING |                        |                                 |
-| STOP_FOLLOWING  |                        |                                 |
-| ERROR           |                        |                                 |
+| 任务类型        | 说明                                               |                                                                                |
+|:----------------|:---------------------------------------------------|:-------------------------------------------------------------------------------|
+| COMMITTED       | 已被提交的日志，需被应用到状态机                                         | 若日志类型为节点配置，则回调 `on_configuration_committed`，否则回调 `on_apply` |
+| SNAPSHOT_SAVE   | 创建快照                                           | `on_snapshot_save`                                                             |
+| SNAPSHOT_LOAD   | 加载快照                                           | `on_apply`                                                                     |
+| LEADER_STOP     | Leader 转换为 Follower                             | `on_leader_stop`                                                               |
+| LEADER_START    | 当节点成为 Leader                                | `on_leader_start`                                                              |
+| START_FOLLOWING |  当 Follower 或 Candidate 开始跟随 Leader 时，并且其 `leader_id` 为 Leader PeerId  | `on_start_following`                                                           |
+| STOP_FOLLOWING  |   当节点不再跟随 Leader，并且其 `leader_id` 将变为空| `on_stop_following`                                                                                |
+| ERROR           | 当节点出现出错，此时任何 `apply` 任务都将失败                                                    | `on_error`                                                                                |
 
 持久化存储
 ---
@@ -52,7 +50,7 @@ Raft 拥有以下 3 个持久化存储，这些都需要在节点重启时进行
 * LogStorage: 存储用户日志以及元数据
 * SnapshotStorage: 存储用户快照以及元数据
 
-Raft 元数据：
+Raft 算法相关元数据：
 ```proto
 message StablePBMeta {
     required int64 term = 1;
@@ -60,14 +58,14 @@ message StablePBMeta {
 };
 ```
 
-Log 元数据：
+日志元数据：
 ```proto
 message LogPBMeta {
     required int64 first_log_index = 1;
 };
 ```
 
-Snapshot 元数据：
+快照元数据 `LocalSnapshotPbMeta`：
 ```proto
 message SnapshotMeta {
     required int64 last_included_index = 1;

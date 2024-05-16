@@ -20,8 +20,17 @@
 
 脑裂问题
 ---
-**不建议使用reset_peers**，reset_peers会破坏raft对数据一致性的保证，而且可能会造成脑裂。例如，{A B C D E}组成的复制组G，其中{C D E}故障，将{A B} set_peer成功恢复复制组G'，{C D E}又重新启动它们也会形成一个复制组G''，这样复制组G中会存在两个Leader，且{A B}这两个复制组中都存在，其中的follower会接收两个leader的AppendEntries，当前只检测term和index，可能会导致其上数据错乱。
 
+不建议使用 `reset_peers`，因为其会破坏数据的一致性，而且可能会造成脑裂，下面这个列子将会说明这个问题。
+
+![图 6.3  脑裂场景](image/split_brain.png)
+
+* T1：由 `ABCDE` 5 个节点组成的集群中，`CDE` 宕机导致集群没有 Leader
+* T2：将 A 节点通过 `reset_peer` 重置为 `AB`，其成功选举成 Leader，并将配置同步给 B
+* T3：节点 `CDE` 重新上线
+* T4：由于不再收到 Leader A 的心跳，`CDE` 重新选举并选出 Leader C，此时集群中将同时存在 2 个 Leader
+
+此时 Leader A 和 C 的 `Term` 是一样的，其中的 B 节点会接收到这 2 个 Leader 的日志复制请求，而当前只检测 `Term` 和 `Index`，可能会导致数据错乱，也就是说 B 中的连续日志可能一部分来自 A，一部分来自 C。
 
 相关接口
 ---
