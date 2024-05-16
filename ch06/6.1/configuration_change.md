@@ -33,13 +33,37 @@
 故障恢复
 ---
 
-如果执行变更的 Leader 挂掉了，或者被 `step_down` 成 Follower， `C{old,new}`
+当执行变更的 Leader Crash 了，新的 Leader 可能会继续推进变更直至变更成功，也可能恢复至变更前的状态，也就是说配置变更是具有原子性的，原有集群要么拥有新配置，要么仍旧是老配置，不存在中间状态。
 
+当 Leader Crash 后，首先会重新进行选举；新 Leader 可能处于以下中的一种状态：
+
+* 若先前配置还停留在日志追赶阶段，则所有集群仍旧使用老配置
+* 若进入了联合共识阶段，则取决于 `C{old,new}` 是否已复制达到 `Quorum`
+    * 如果是，则新 Leader 必定拥有 `C{old,new}`，当成为 Leader 后会立马继续推进后使用新配置
+    * 如果不是，新 Leader 可能拥有 `C{old,new}`，也可能没有，如果拥有则如以上，如果没有则依旧使用来配置
+* 若进入同步新配置阶段，则新 Leader 必定拥有 `C{old,new}`，此时继续推进变更，直至使用新集群配置
+
+从上面可以看出，一旦 `C{old,new}` 已达到 `Quorum` 被提交，则可以立马应用 `C{new}`，因为即使此时 Leader 此时挂掉，新 Leader 也将继续推进变更从而使用  `C{new}`，等同于处于事务的隐式提交（implicit commit）一样。详见以下[故障恢复](#其他故障恢复)。
+
+<!---
+TODO:
+* https://github.com/baidu/braft/issues/204
+--->
+
+<!--
 新节点配置
 ---
 
+新加入集群节点的配置必须为空，否则可能会导致脑裂；新节点的配置应由 Leader 同步给它。考虑下图中的场景：
+
+
+```cpp
+{1,2,3} => {1,4,5} 2 是主?
+```
+
 新节点启动的时候需要为空节点，否则可能需要脑裂
 参考 https://github.com/baidu/braft/issues/303
+-->
 
 相关接口
 ---
@@ -47,6 +71,11 @@
 ```cpp
 class Node {
 public:
+    // list peers of this raft group, only leader retruns ok
+    // [NOTE] when list_peers concurrency with add_peer/remove_peer, maybe return peers is staled.
+    // because add_peer/remove_peer immediately modify configuration in memory
+    butil::Status list_peers(std::vector<PeerId>* peers);
+
     // Add a new peer to the raft group. done->Run() would be invoked after this
     // operation finishes, describing the detailed result.
     void add_peer(const PeerId& peer, Closure* done);
