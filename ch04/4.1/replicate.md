@@ -35,14 +35,30 @@ Replicator
 
 节点刚成为 Leader 时会为每个 Follower 创建一个 `Replicator`，其运行在单独的 `bthread` 上，其主要有以下几个作用：
 
-* 记录 Follower 的一些状态，如 `nextIndex`
+* 记录 Follower 的一些状态，如 `nextIndex`、`lastRPCTimestamp`
 * 任何发往 Follower 的指令都将通过 `Replicator` 发送，如 `InstallSnapshot`
 * 同步日志：`Replicator` 会不断地向 Follower 同步日志，直到 Follower 成功复制了 Leader 的所有日志后，其将在后台等待新日志的到来。
 
 nextIndex
 ---
 
-`nextIndex` 是 Leader 记录下一个要发往每个 Follower 的日志 `Index`
+`nextIndex` 是 Leader 记录下一个要发往 Follower 的日志 `Index`，只有确认了 `nextIndex` 才能给 Follower 发送日志，不然不知道要给 Follower 发送哪些日志。
+
+节点刚成为 Leader 时是不知道每个 Follower 的 `nextIndex` 的，需要通过发送一次或多次探测信息来确认，其探测算法如下：
+
+* (1) `matchIndex` 为最后一条 Leader 与 Follower 匹配的日志，而 `nextIndex=matchIndex+1`
+* (2) 初始化 `matchIndex` 为当前 Leader 的最后一条日志的 `Index`
+* (3) Leader 发送探测请求，携带 `matchIndex` 以及 `matchIndex` 对应的 `Term`
+* (4) Follower 接收请求后，根据自身日志获取 `matchIndex` 对应的 `Term`：
+  * 若和请求中的 `Term` 相等，则代表日志匹配，返回成功响应；
+  * 若日志不存在或者 `Term` 不匹配，则返回失败响应；
+  * 不管成功失败，响应中都携带 `lastLogIndex`
+* (5) Leader 接收到成功响应，则表示探测成功；否则回退 `matchIndex` 并重复步骤 2：
+    * 若 Follower 的 `lastLogIndex<matchIndex`，则回退 `matchIndex` 为 `lastLogIndex`
+    * 否则回退 `matchIndex` 为 `matchIndex-1`
+
+![图 4.1  探测 nextIndex](image/next_index.png)
+
 
 相关 RPC
 ---
@@ -70,8 +86,8 @@ message AppendEntriesRequest {
     required string server_id = 2;
     required string peer_id = 3;
     required int64 term = 4;
-    required int64 prev_log_term = 5;
-    required int64 prev_log_index = 6;
+    required int64 prev_log_term = 5;   // matchIndex
+    required int64 prev_log_index = 6;  // matchIndex
     repeated EntryMeta entries = 7;
     required int64 committed_index = 8;
 };
