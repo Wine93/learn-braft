@@ -1,12 +1,10 @@
 关于 Multi-Raft
 ===
 
-考虑到单机的容量有限，一些追求扩展性的系统，往往会将数据进行分片（*sharding*），并将分片放置在不同的 *raft group*（复制组） 中，以达到高可用的目的。*sharding* + *multi-raft* 的架构比集中式数据存储 + 单 *raft group* 的架构在以下几个方面更具优势：
+考虑到单机的容量有限，一些追求扩展性的系统，往往会将数据进行分片（Sharding），并将分片放置在不同的 Raft Group（复制组） 中，以达到每个分片都高可用的目的。Sharding + Multi-Raft 的架构比 Single-Raft 的架构在以下几个方面更具优势：
 
-* **扩展性**：系统可以在需要的时候新增 *raft group*（每个 *group* 存放一定数量的分片），并将其运行在不同的磁盘或机器上，这样就具有很好的扩展性，理论上没有容量上限。
-* **性能**：系统可以将 *Leader* 打散到各个节点，从而充分利用各机器的资源，以提升系统整体的吞吐。
-
-![图 1-2  单 Group 与 多 Group](image/multi_raft.png)
+* 扩展性：系统可以在需要的时候新增 Raft Group 用来存放分片，并将其运行在不同的磁盘或机器上，这样就具有很好的扩展性，理论上没有容量上限。
+* 性能：系统可以将 Leader 打散到各个节点，从而充分利用各机器的资源，以提升系统整体的吞吐。
 
 > **各架构相关系统**
 >
@@ -14,41 +12,91 @@
 >
 > *multi-raft*: [CockroachDB][cockroachdb], [TiKV][tikv], [Curve][curve]
 
+![图 2.2 single-raft 与 multi-raft](image/multi_raft.png)
+
+[cockroachdb]: https://github.com/cockroachdb/cockroach
+[etcd]: https://github.com/etcd-io/etcd
+[consul]: https://github.com/hashicorp/consul
+[tikv]: https://github.com/tikv/tikv
+[curve]: https://github.com/opencurve/curve
+
 braft 中的 Multi-Raft
 ===
 
-> 大概架构
+braft 允许一个进程管理多个 Raft Group， 多个 Group 在逻辑上和物理上都是完全独立的，其实现如下：
+
+* 用户创建 `braft::Node` 时需要指定 Node 的 `GroupId` 和 `PeerId`
+* 在调用 `Node::init` 进行初始化时会将该 `Node` 加到全局的 Node Manager 中
+* 所有的 RPC 请求中都会携带目标 Node 的 `GroupId` 和 `PeerId`
+* Node Manager 根据请求 `GroupId` 和 `PeerId` 找到对应的 Node，然后再调用 Node 的相关方法处理请求。
+
+![](image/braft_multi_raft.png)
 
 心跳
 --
 
+由于每个 Group 的 Leader 都需要给其 Follower 发送心跳，而心跳间隔一般都都比较小（默认 100 毫秒），所以如果单台机器上运行大量的 Group，会产生大量的心跳请求。
+
+我们计算 3 副本构成的个 Group 在 1 秒内产生的心跳数：
+
+```cpp
+2  * 1 * (1000 / 100) = 20
+```
+
+随着 Group 和副本数的增加，心跳数会呈指倍数增长，比如运行 1 万个 Group，1 秒内将会产生 20 万个心跳。为此，像 [CockroachDB][cockroachdb] 中 MultiRaft 实现会将每个节点之间的心跳进行合并，详见[Scaling Raft][scaling-raft]：
+
+![图 4.3  CockroachDB 的 MultiRaft 实现](image/cockroachdb.png)
+
+> 需要注意的是，braft 开源版本还未实现心跳合并以及文档中提到的[静默模式](https://github.com/baidu/braft/blob/master/docs/cn/raft_protocol.md#%E5%8A%9F%E8%83%BD%E5%AE%8C%E5%96%84)。
+
+[scaling-raft]: https://www.cockroachlabs.com/blog/scaling-raft/
+
 随机写
 ---
-
-[cockroachdb]: www.
-[etcd]: www.
-[consul]: www.
-[tikv]: www
-[curve]: www.baidu.com
+虽然每个 Node 的日志都是顺序追加写，但是其都是独立的存储目录，所以当一块盘上跑着多个 Node 时，对该盘来说就相当于随机写。当然，braft 允许用户接管日志存储，用户可以自己实现顺序写的逻辑。
 
 具体实现
 ===
 
-*braft* 允许一个进程内运行多个 *raft group*，多个 *group* 在逻辑上和物理上都是完全独立的。
-* 当用户创建 *raft node* 需要指定 `GroupId` 和 `PeerId`，
-* 并在调用 `node->init(...)` 时会加入到
-* *raft node* 之间的所有 *RPC* 请求都会带上目标 `raft node` 的 `GroupId` 和 `PeerId`，*raft* 相关的 *service* 在收到这些请求会，会根据 `GroupId` 和 `PeerId` 找到对应的 *Node*，然后再调用 *Node* 的相关方法。
+用户指定节点信息
+---
 
-### (1) 指定
 ```cpp
 Node(const GroupId& group_id, const PeerId& peer_id);
 ```
 
-peerId 和 GroupId
-如果要将三副本放在同一个进程内，需要将 index 作为 PeerId 的一部分，这样才能保证每个副本的唯一性。
-
-### (2) 指定
 ```cpp
+typedef std::string GroupId;
+
+struct PeerId {
+    butil::EndPoint addr; // ip+port.
+    int idx; // idx in same addr, default 0
+    Role role = REPLICA;
+    ...
+    explicit PeerId(butil::EndPoint addr_) : addr(addr_), idx(0), role(REPLICA)  {}
+    PeerId(butil::EndPoint addr_, int idx_) : addr(addr_), idx(idx_), role(REPLICA) {}
+    ...
+}
+```
+
+* GroupId: 一个字符串, 表示这个复制组的 `ID`；
+* PeerId：结构是一个 [EndPoint][EndPoint]，表示对外服务的端口, 外加一个 Index (默认为 0)；
+
+> PeerId 中 Index 的作用是让同一 Raft Group 中不同的副本能运行在同一个进程内。通常我们出于故障域考虑是会将不同的副本运行在不同的机器上，所以不用考虑这个 Index，使用默认值 0 即可。但是如果特别场景下需要运行在一个进程下，由于各副本的 `GroupId` 和 `Endpoint` 都相同，所以需要通过 Index 来区分。 // 存疑：https://github.com/baidu/braft/issues/205
+
+[EndPoint]: https://github.com/brpc/brpc/blob/master/src/butil/endpoint.h
+
+添加至 NodeManager
+---
+
+用户在调用 `Node::init` 初始化节点时，会将该节点加入全局的 NodeManager 中。
+
+```cpp
+int Node::init(const NodeOptions& options) {
+    return _impl->init(options);
+}
+
+#define global_node_manager NodeManager::GetInstance()
 int NodeImpl::init(const NodeOptions& options)
     ...
     if (!global_node_manager->add(this)) {
@@ -59,53 +107,77 @@ int NodeImpl::init(const NodeOptions& options)
 }
 
 bool NodeManager::add(NodeImpl* node) {
+    // butil::DoublyBufferedData<Maps> _nodes;
+    // 将 node 将入到 _nodes 的 map 中
 }
 ```
 
-### (3) *RPC* 请求
+RPC 指定路由信息
+---
 
-例子：追加日志请求
+braft 中的 RPC 请求中都会携带目标 Node 的 `GroupId` 和 `PeerId`：
 
-*proto*:
 ```proto
+//  PreVote、RequestVote
+message RequestVoteRequest {
+    required string group_id = 1;
+    required string server_id = 2;
+    required string peer_id = 3;
+    ...
+};
+
+// 探测 nextIndex、心跳、复制日志
 message AppendEntriesRequest {
     required string group_id = 1;  // GroupId
     required string server_id = 2;  // 源 node 的 PeerId
     required string peer_id = 3;  // 目标 node 的 PeerId
-    required int64 term = 4;
-    required int64 prev_log_term = 5;
-    required int64 prev_log_index = 6;
-    repeated EntryMeta entries = 7;
-    required int64 committed_index = 8;
+    ...
 };
 
-message AppendEntriesResponse {
-    required int64 term = 1;
-    required bool success = 2;
-    optional int64 last_log_index = 3;
-    optional bool readonly = 4;
+// 安装快照
+message InstallSnapshotRequest {
+    required string group_id = 1;
+    required string server_id = 2;
+    required string peer_id = 3;
+    ...
 };
+
+// 唤醒节点进行立马选举：转移 Leader
+message TimeoutNowRequest {
+    required string group_id = 1;
+    required string server_id = 2;
+    required string peer_id = 3;
+    ...
+}
 
 service RaftService {
-    ...
+    rpc pre_vote(RequestVoteRequest) returns (RequestVoteResponse);
+    rpc request_vote(RequestVoteRequest) returns (RequestVoteResponse);
     rpc append_entries(AppendEntriesRequest) returns (AppendEntriesResponse);
-    ...
+    rpc install_snapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+    rpc timeout_now(TimeoutNowRequest) returns (TimeoutNowResponse);
 };
-
 ```
-*handler*:
+
+路由请求
+---
+
+NodeManager 根据请求 `GroupId` 和 `PeerId` 找到对应的 Node，然后再调用 Node 的相关方法处理请求。
+
 ```cpp
 void RaftServiceImpl::append_entries(google::protobuf::RpcController* cntl_base,
                             const AppendEntriesRequest* request,
                             AppendEntriesResponse* response,
                             google::protobuf::Closure* done) {
     ...
+    // (1) 校验 PeerId 是否合法
     PeerId peer_id;
     if (0 != peer_id.parse(request->peer_id())) {
         cntl->SetFailed(EINVAL, "peer_id invalid");
         return;
     }
 
+    // (2) 根据请求中的 GroupId 和 PeerId 找到对应的 Node
     scoped_refptr<NodeImpl> node_ptr =
                         global_node_manager->get(request->group_id(), peer_id);
     NodeImpl* node = node_ptr.get();
@@ -114,6 +186,7 @@ void RaftServiceImpl::append_entries(google::protobuf::RpcController* cntl_base,
         return;
     }
 
+    // (3) 调用 Node 的相关方法
     return node->handle_append_entries_request(cntl, request, response,
                                                done_guard.release());
 }
@@ -122,4 +195,5 @@ void RaftServiceImpl::append_entries(google::protobuf::RpcController* cntl_base,
 参考
 ===
 * [Scaling Raft](https://www.cockroachlabs.com/blog/scaling-raft/)
+* [TiKV 源码解析系列 – multi-raft 设计与实现](https://cn.pingcap.com/blog/the-design-and-implementation-of-multi-raft/)
 * [基于 Raft 构建弹性伸缩的存储系统的一些实践](https://cn.pingcap.com/blog/building-distributed-db-with-raft/)
