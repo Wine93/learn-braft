@@ -337,7 +337,32 @@ int Segment::close(bool will_sync) {
 优化 5：异步 Apply
 ===
 
+```cpp
+void on_apply(braft::Iterator& iter) {
+    // A batch of tasks are committed, which must be processed through
+    // |iter|
+    for (; iter.valid(); iter.next()) {
+        // This guard helps invoke iter.done()->Run() asynchronously to
+        // avoid that callback blocks the StateMachine.
+        braft::AsyncClosureGuard closure_guard(iter.done());
+        // Parse operation from iter.data() and execute this operation
+        // op = parse(iter.data());
+        // result = process(op)
 
+        // The purpose of following logs is to help you understand the way
+        // this StateMachine works.
+        // Remove these logs in performance-sensitive servers.
+        LOG_IF(INFO, FLAGS_log_applied_task)
+                << "Exeucted operation " << op
+                << " and the result is " << result
+                << " at log_index=" << iter.index();
+    }
+}
+```
+
+当日志被提交时，braft 会串行回调用户状态机的 `on_apply`，虽然这里做了 [Batch](#优化-1batch) 优化，但是对于那些不支持批量更新的状态机来说，仍然是低效的。为此，用户可以将那些没有依赖的 `on_apply` 操作做异步操作，使其并行化。
+
+特别需要注意的是，当刚成为 Leader 时，需要回放之前任期的日志，这时候需要将这些日志全部 Apply 完才能处理读取操作，不然可能会违背线性一致性。因为这些日志在之前的任期可能被提交了，客户端能读取到，而在新任期回放的时候，由于这些日志是异步执行的（on_apply 返回了，但是还在异步执行中），可能还没应用到状态机，这时候客户端去读取可能是读取不到的。
 
 参考
 ===
