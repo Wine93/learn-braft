@@ -1,13 +1,14 @@
 概览
 ===
 
-`LogManager` 是日志管理的入口，
+braft 默认以 Segment 的方式存储日志，每一个 Segment 文件存储一段连续的日志，当单个文件大小达到上限后，会将其关闭，并创建一个新的 Segment 文件用于写入；默认单个 Segment 文件存储 8MB 大小的日志。
 
-`SegmentLogStorage` 是默认的日志存储引擎，其以 Segment 的方式存储日志，每一个 Segment 文件存储固定大小的日志，当单个文件大小达到上限后，braft 会将其关闭，并创建一个新的 Segment 文件用于写入。
+由于日志的顺序特性以及在内存中构建索引的方式，其具有较好的读写性能：
 
-由于 raft 日志拥有顺序的特点，其 Batch 写入只需要一次顺序 IO，而对于日志的读取
+* 写入：追加写；一批日志先写入 Page Cache，再调用一次 `sync` 落盘；
+* 读取：在内存中构建了 `Log Index` 到文件 Offset 的索引，读取一条日志只需一次 IO；
 
-默认单个 Segment 文件存储 8MB 大小的日志，
+此外，为了保证日志的完整性，写入的时候会在 `Header` 写入 CRC 值，读取的时候校验 CRC。
 
 组织形式
 ===
@@ -16,9 +17,9 @@
 ---
 `SegmentLogStorage` 管理的目录下将会拥有以下这些文件：
 
-* 一个 `log_meta`，用来记录每次打完快照后
-* 多个 `closed segment`：已经写满并关闭的 Segment
-* 一个 `open segment`：正在写入的 Segment
+* 一个 `log_meta`，用来记录每次打完快照后需要丢弃的日志的索引；
+* 多个 `closed segment`：已经写满并关闭的 Segment； 文件名的格式为 `log_{first_index}-{last_index}`，例如 `log_000001-0001000`，表示该文件保存的日志的索引范围为 [1, 1000]。
+* 一个 `open segment`：正在写入的 Segment；文件名的格式为 `log_inprogress_{first_index}`，例如 `log_inprogress_0001001`，表示该文件保存的日志的索引范围为 [1001, ∞)。
 
 ```cpp
 // LogStorage use segmented append-only file, all data in disk, all index in memory.
@@ -30,15 +31,14 @@
 //      log_inprogress_0001001: open segment
 ```
 
+![图 4.5 Segment Log Storage](image/segment_log.png)
+
 Segment 文件
 ---
 
-每个 Segment 文件保存一个日志段, Segment 文件的命名规则如下：
+![图 4.5  segment 文件的组成](image/segment.png)
 
-* **closed segment**: 文件名的格式为 `log_{first_index}-{last_index}`，例如 `log_000001-0001000`，表示该文件保存的日志的索引范围为 [1, 1000]。
-* **open segment**: 文件名的格式为 `log_inprogress_{first_index}`，例如 `log_inprogress_0001001`，表示该文件保存的日志的索引范围为 [1001, ∞)。
-
-![图 4.4  segment 文件的组成](image/segment.png)
+每个 Segment 文件保存一段连续的日志项，而个日志项由 24 字节的 Header 和实际的数据组成。
 
 `Header` 字段：
 
@@ -52,74 +52,38 @@ Segment 文件
 | data_checksum   | 32     | Log 实际数据的校验值                       |
 | header checksum | 32     | Header（前 20 字节） 的校验值              |
 
+内存索引
+---
+
+内存索引有 2 层：
+
+**文件索引**
+
+根据文件名构建 `first_index` 到 Segment 文件的映射；由于每个 `Segment` 文件保存的是一个区间的日志，根据 `LogIndex` 可以判断其属于哪个区间（文件）。
+
+例如：
+
+| first_index | Segment 类      |
+|:------------|:----------------|
+| 1           | {fd = 10, ... } |
+| 1001        | {fd = 10, ... } |
+| 2001        | {fd = 11, ... } |
+| 3001        | {fd = 12, ... } |
+
+**日志索引**
+
+找到指定的 `Segment` 文件后，需要知道日志在该文件具体的 `offset` 和 `length`，才可以一次性读取出来。 为次为每个 `Segment` 构建了 `LogIndex` 到 offset 的映射，而 length 可以通过 `LogIndex+1` 日志的 offset 减去当前的 offset 算出来。
+
+例如：
+| LogIndex | offset |
+|:---------|:-------|
+| 1001     | 1100   |
+| 1002     | 1200   |
+
+LogIndex(1001) 这条日志的 offset 是 1001，lengh 为 (1200-1100=100)
+
 具体实现
 ===
-
-```cpp
-struct LogId {
-    int64_t index;
-    int64_t term;
-};
-
-// term start from 1, log index start from 1
-struct LogEntry : public butil::RefCountedThreadSafe<LogEntry> {
-public:
-    EntryType type; // log type
-    LogId id;
-    std::vector<PeerId>* peers; // peers
-    std::vector<PeerId>* old_peers; // peers
-    butil::IOBuf data;
-...
-}
-
-```
-
-```proto
-message ConfigurationPBMeta {
-    repeated string peers = 1;
-    repeated string old_peers = 2;
-};
-```
-
-```cpp
-// LogStorage use segmented append-only file, all data in disk, all index in memory.
-// append one log entry, only cause one disk write, every disk write will call fsync().
-//
-// SegmentLog layout:
-//      log_meta: record start_log
-//      log_000001-0001000: closed segment
-//      log_inprogress_0001001: open segment
-class SegmentLogStorage : public LogStorage {
-    ...
-};
-```
-
-```cpp
-std::vector<std::pair<int64_t/*offset*/, int64_t/*term*/> > _offset_and_term;
-
-```cpp
-// Format of Header, all fields are in network order
-// | -------------------- term (64bits) -------------------------  |
-// | entry-type (8bits) | checksum_type (8bits) | reserved(16bits) |
-// | ------------------ data len (32bits) -----------------------  |
-// | data_checksum (32bits) | header checksum (32bits)             |
-
-const static size_t ENTRY_HEADER_SIZE = 24;
-
-struct Segment::EntryHeader {
-    int64_t term;
-    int type;
-    int checksum_type;
-    uint32_t data_len;
-    uint32_t data_checksum;
-};
-
-```
-
-```cpp
-typedef std::map<int64_t, scoped_refptr<Segment> > SegmentMap;
-```
-
 
 日志写入
 ---
@@ -206,14 +170,9 @@ int SegmentLogStorage::truncate_prefix(const int64_t first_index_kept)
 int SegmentLogStorage::truncate_suffix(const int64_t last_index_kept)
 ```
 
-这么快速索引？
 
 日志恢复
 ---
-
-日志
-*
-*
 
 ```cpp
 int SegmentLogStorage::init(ConfigurationManager* configuration_manager) {
@@ -234,12 +193,9 @@ int SegmentLogStorage::init(ConfigurationManager* configuration_manager) {
 }
 ```
 
-// meta 的作用是啥？
-
-// 打完快照后，
-// 在snapshot之后，last_idx小于这个值的log file都可以被丢弃了。而包含这个index的log file，index前面的数据都是多余的，LogManager只处理index之后的
 
 ```cpp
+// 在snapshot之后，last_idx小于这个值的log file都可以被丢弃了。而包含这个index的log file，index前面的数据都是多余的，LogManager只处理index之后的
 int SegmentLogStorage::load_meta() {
     std::string meta_path(_path);
     meta_path.append("/" BRAFT_SEGMENT_META_FILE);  // "/log_meta"
@@ -257,7 +213,7 @@ int SegmentLogStorage::load_meta() {
 }
 ```
 
-这一步主要是构建索引
+这一步主要是构建索引：
 
 ```cpp
 int SegmentLogStorage::list_segments(bool is_empty) {
@@ -318,7 +274,6 @@ int SegmentLogStorage::load_segments(ConfigurationManager* configuration_manager
 * offset: 记录在 _offset_and_term
 * length: 拿下一个 `LogEntry` 减去当前的 offset 就是长度
 
-
 ```cpp
 int Segment::load(ConfigurationManager* configuration_manager) {
     _fd = ::open(path.c_str(), O_RDWR);  // 打开 segment 对应的文件
@@ -345,15 +300,6 @@ int Segment::load(ConfigurationManager* configuration_manager) {
 
 }
 ```
-
-
-* 重构索引
-* 判断日志是否有损坏
-
-总结
----
-* 读写都只需要一次 IO，写是顺序 IO，读可能是随机 IO
-* 可靠性保证: 读取的时候校验，
 
 参考
 ===
