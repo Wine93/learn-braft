@@ -6,46 +6,59 @@
 
 前置流程：用户创建 BRPC Server，并调用 `braft::add_service` 将 Raft 相关的 Service 加入到 BRPC Server 中，并启动 BRPC Server
 
-1. 用户创建 `braft::node`，并调用 `node::init` 接口进行初始化
+1. 用户创建 `braft::Node`，并调用 `Node::init` 接口进行初始化
 2. braft 启动任务队列 `ApplyTaskQueue`
 3. 遍历一遍日志，读取每条日志的 `Header` (24 字节)：
-    * 3.1 若 Header 中的 Type 显示其为配置日志，则读取完整日志
+    * 3.1 若 Header 中的类型显示其为配置日志，则读取完整日志
     * 3.2 构建索引（`LogIndex` 到文件 `offset`），便于读取时快速定位
     * 3.3 获得当前日志的 `FirstIndex` 与 `LastIndex`
 4. 加载快照：
     * 4.1 打开本地快照，并返回 `SnapshotReader`
     * 4.2 以 `SnapshotReader` 作为参数回调用户状态机 `on_snapshot_load` 来加载快照
-    * 4.3 等待快照加载完成
-5. 从日志（步骤 3.1）或快照（步骤 4）或用户指定配置（`initial_conf`）初始化集群列表
-6. 读取 Raft 元数据文件，即 `currentTerm` 与 `votedFor`
-7. 启动快照定时器
-8. 将自身角色变为 `Follower`，并启动选举定时器
-9. 将节点加入 Raft Group
-10. 至此，初始化完成，节点将等待选举超时后发起选举
+    * 4.3 等待快照加载完成，将快照元数据中的节点配置设为当前节点配置
+5. 从日志（步骤 3.1）或用户指定配置（`initial_conf`）初始化集群列表
+6. 检查日志是否有丢失，若 `LastIncludedIndex < FirstLogIndex`
+7. 读取 Raft 元数据文件，恢复 `(term, votedFor)` 这个二元组
+8. 启动快照定时器
+9. 将自身角色变为 `Follower`，并启动选举定时器
+10. 将节点加入 Raft Group
+11. 至此，初始化完成，节点将等待选举超时后发起选举
 
 从以上可以初始化过程主要工作分为以下 3 类：恢复持久化存储，启动算法
 
 流程注解
 ---
 
-* 2：日志并未回放，因为不知道节点的 `CommitIndex`；
-* 2.3: 作用是啥？
+* 2 日志并未回放，因为不知道节点的 `CommitIndex`；
+* 3 只需要读取，详见[日志存储](/ch04/4.3/log_storage.md)
+* 5 节点配置依照优先级从高到底从以下：日志 > 快照 > 用户指定
+
+RPC Service
+---
+
+`braft::add_service` 会增加以下 4 个 Service：
+* `FileService`：用于 Follower 安装快照时，向 Leader 下载对应文件
+* `RaftService`：核心服务，处理 Raft 算法的核心逻辑
+* `RaftStat`: 可观测性的一部分，用户可通过访问 `http://${your_server_endpoint}/raft_stat` 查看当前这个进程上 Node 的列表，以及每个 Node 的内部状态，详见[查看节点状态][节点状态]
+* `CliService`：允许用户通过发送 RPC 请求来控制节点，如配置变更、重置节点列表、转移 Leader。当然
+
+[节点状态]: https://github.com/baidu/braft/blob/master/docs/cn/server.md#%E6%9F%A5%E7%9C%8B%E8%8A%82%E7%82%B9%E7%8A%B6%E6%80%81
 
 ApplyTaskQueue
 ---
 
 这是一个串行执行的任务队列，所有回调给用户状态机的任务都需进入该队列，并且串行执行：
 
-| 任务类型        | 说明                                                                             |                                                                                |
-|:----------------|:---------------------------------------------------------------------------------|:-------------------------------------------------------------------------------|
-| COMMITTED&nbsp;&nbsp;&nbsp;       | 已被提交的日志，需被应用到状态机                                                 | 若日志类型为节点配置，则回调 `on_configuration_committed`，否则回调 `on_apply` |
-| SNAPSHOT_SAVE   | 创建快照                                                                         | `on_snapshot_save`                                                             |
-| SNAPSHOT_LOAD   | 加载快照                                                                         | `on_snapshot_load`                                                                     |
-| LEADER_STOP     | Leader 转换为 Follower                                                           | `on_leader_stop`                                                               |
-| LEADER_START    | 当节点成为 Leader                                                                | `on_leader_start`                                                              |
-| START_FOLLOWING | 当 Follower 或 Candidate 开始跟随 Leader 时，并且其 `leader_id` 为 Leader PeerId | `on_start_following`                                                           |
-| STOP_FOLLOWING  | 当节点不再跟随 Leader，并且其 `leader_id` 将变为空                               | `on_stop_following`                                                            |
-| ERROR           | 当节点出现出错，此时任何 `apply` 任务都将失败                                    | `on_error`                                                                     |
+| 任务类型&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | 说明                                                                             |                                                                                |
+|:---------------------------------------------|:---------------------------------------------------------------------------------|:-------------------------------------------------------------------------------|
+| COMMITTED                                    | 已被提交的日志，需被应用到状态机                                                 | 若日志类型为节点配置，则回调 `on_configuration_committed`，否则回调 `on_apply` |
+| SNAPSHOT_SAVE                                | 创建快照                                                                         | `on_snapshot_save`                                                             |
+| SNAPSHOT_LOAD                                | 加载快照                                                                         | `on_snapshot_load`                                                             |
+| LEADER_STOP                                  | Leader 转换为 Follower                                                           | `on_leader_stop`                                                               |
+| LEADER_START                                 | 当节点成为 Leader                                                                | `on_leader_start`                                                              |
+| START_FOLLOWING                              | 当 Follower 或 Candidate 开始跟随 Leader 时，并且其 `leader_id` 为 Leader PeerId | `on_start_following`                                                           |
+| STOP_FOLLOWING                               | 当节点不再跟随 Leader，并且其 `leader_id` 将变为空                               | `on_stop_following`                                                            |
+| ERROR                                        | 当节点出现出错，此时任何 `apply` 任务都将失败                                    | `on_error`                                                                     |
 
 持久化存储
 ---
@@ -53,11 +66,10 @@ ApplyTaskQueue
 Raft 拥有以下 3 个持久化存储，这些都需要在节点重启时进行重建：
 
 * RaftMetaStorage: 保存 Raft 算法自身的状态信息，即 `(Term, votedFor)` 这个二元组
-* LogStorage: 存储用户日志以及日志元数据
+* LogStorage: 存储用户日志以及日志元数据（即 `FirstLogIndex`）
 * SnapshotStorage: 存储用户快照以及元数据
 
 特别需要注意的是，节点的配置也是
-
 
 Raft 算法相关元数据：
 ```proto
@@ -99,6 +111,9 @@ message LocalSnapshotPbMeta {
 }
 ```
 
+快照与日志回放
+---
+
 具体实现
 ===
 
@@ -108,7 +123,7 @@ message LocalSnapshotPbMeta {
 `braft::add_service` 会增加以下 4 个 *Service*：
 * `FileService`：用于 *Follower* 安装快照时，向 *Leader* 下载对应文件
 * `RaftService`：核心服务，处理 *Raft* 的核心逻辑
-* `RaftStat`: 可观测行的一部分
+* `RaftStat`: 可观测性的一部分
 * `CliService`：控制节点，如配置变更、重置节点列表、转移 *Leader*
 
 ```cpp
