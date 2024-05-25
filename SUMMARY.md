@@ -1,4 +1,4 @@
-* [前言](gitbook/README.md)
+* [前言](introduction.md)
 
 ## braft 源码解析
 * [1. 简介](ch01/introduction.md)
@@ -27,3 +27,4 @@
     * [7.2 性能分析](ch07/perf.md)
     * [7.3 可观测性](ch07/trace.md)
     * [7.4 超时时间](ch07/timeout.md)
+* [附录](appendix.md)
