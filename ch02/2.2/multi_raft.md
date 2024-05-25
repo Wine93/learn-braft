@@ -8,9 +8,9 @@
 
 > **各架构相关系统**
 >
-> *single-raft*: [etcd][etcd], [consul][consul]
+> single-raft: [etcd][etcd], [consul][consul]
 >
-> *multi-raft*: [CockroachDB][cockroachdb], [TiKV][tikv], [Curve][curve]
+> multi-raft: [CockroachDB][cockroachdb], [TiKV][tikv], [Curve][curve]
 
 ![图 2.2 single-raft 与 multi-raft](image/2.2.png)
 
@@ -45,7 +45,7 @@ braft 允许一个进程管理多个 Raft Group， 多个 Group 在逻辑上和�
 
 随着 Group 和副本数的增加，心跳数会呈指倍数增长，比如运行 1 万个 Group，1 秒内将会产生 20 万个心跳。为此，像 [CockroachDB][cockroachdb] 中 MultiRaft 实现会将每个节点之间的心跳进行合并，详见 [Scaling Raft][scaling-raft]。
 
-需要注意的是，braft 开源版本还未实现心跳合并以及文档中提到的[静默模式](https://github.com/baidu/braft/blob/master/docs/cn/raft_protocol.md#%E5%8A%9F%E8%83%BD%E5%AE%8C%E5%96%84)。
+> 需要注意的是，braft 开源版本还未实现心跳合并以及文档中提到的[静默模式](https://github.com/baidu/braft/blob/master/docs/cn/raft_protocol.md#%E5%8A%9F%E8%83%BD%E5%AE%8C%E5%96%84)。
 
 ![图 2.4  CockroachDB 的 Multi-Raft 实现](image/2.4.png)
 
@@ -54,9 +54,9 @@ braft 允许一个进程管理多个 Raft Group， 多个 Group 在逻辑上和�
 
 随机写
 ---
-虽然每个 Node 的日志都是顺序追加写，但是其都是独立的存储目录，所以当多个 Node 配置的存储目录位于同一块盘时，其对于该盘来说就相当于随机写。当然，braft 允许用户接管日志存储，用户可以自己实现顺序写逻辑。
+虽然每个 Node 的日志都是顺序追加写，但是由于其都是独立的存储目录，所以当多个 Node 配置的存储目录位于同一块盘时，其对于该盘来说就相当于随机写。当然，braft 允许用户接管日志存储，用户可以自己实现顺序写逻辑。
 
-![图 2.5  随机写](image/2.5.png)
+![图 2.5  Multi-Raft 的随机写](image/2.5.png)
 
 具体实现
 ===
@@ -92,7 +92,7 @@ struct PeerId {
 添加至 NodeManager
 ---
 
-用户在调用 `Node::init` 初始化节点时，会将该节点加入全局的 NodeManager 中。
+用户在调用 `Node::init` 初始化节点时，会将该节点加入全局的 NodeManager 中：
 
 ```cpp
 int Node::init(const NodeOptions& options) {
@@ -165,7 +165,7 @@ service RaftService {
 路由请求
 ---
 
-NodeManager 根据请求 `GroupId` 和 `PeerId` 找到对应的 Node，然后再调用 Node 的相关方法处理请求。
+NodeManager 根据请求 `GroupId` 和 `PeerId` 找到对应的 Node，然后再调用 Node 的相关方法处理请求：
 
 ```cpp
 void RaftServiceImpl::append_entries(google::protobuf::RpcController* cntl_base,
