@@ -12,7 +12,7 @@
 >
 > *multi-raft*: [CockroachDB][cockroachdb], [TiKV][tikv], [Curve][curve]
 
-![图 2.2 single-raft 与 multi-raft](image/multi_raft.png)
+![图 2.2 single-raft 与 multi-raft](image/2.2.png)
 
 [cockroachdb]: https://github.com/cockroachdb/cockroach
 [etcd]: https://github.com/etcd-io/etcd
@@ -30,12 +30,12 @@ braft 允许一个进程管理多个 Raft Group， 多个 Group 在逻辑上和�
 * 所有的 RPC 请求中都会携带目标 Node 的 `GroupId` 和 `PeerId`
 * Node Manager 根据请求 `GroupId` 和 `PeerId` 找到对应的 Node，然后再调用 Node 的相关方法处理请求。
 
-![](image/braft_multi_raft.png)
+![图 2.3  braft Multi-Raft 实现](image/2.3.png)
 
 心跳
 --
 
-由于每个 Group 的 Leader 都需要给其 Follower 发送心跳，而心跳间隔一般都都比较小（默认 100 毫秒），所以如果单台机器上运行大量的 Group，会产生大量的心跳请求，可能会导致超时的。
+由于每个 Group 的 Leader 都需要给其 Follower 发送心跳，而心跳间隔一般都都比较小（默认 100 毫秒），所以如果单台机器上运行大量的 Group，会产生大量的心跳请求。
 
 我们计算 3 副本构成的个 Group 在 1 秒内产生的心跳数：
 
@@ -47,7 +47,7 @@ braft 允许一个进程管理多个 Raft Group， 多个 Group 在逻辑上和�
 
 需要注意的是，braft 开源版本还未实现心跳合并以及文档中提到的[静默模式](https://github.com/baidu/braft/blob/master/docs/cn/raft_protocol.md#%E5%8A%9F%E8%83%BD%E5%AE%8C%E5%96%84)。
 
-![图 4.3  CockroachDB 的 MultiRaft 实现](image/cockroachdb.png)
+![图 2.4  CockroachDB 的 Multi-Raft 实现](image/2.4.png)
 
 
 [scaling-raft]: https://www.cockroachlabs.com/blog/scaling-raft/
@@ -56,6 +56,7 @@ braft 允许一个进程管理多个 Raft Group， 多个 Group 在逻辑上和�
 ---
 虽然每个 Node 的日志都是顺序追加写，但是其都是独立的存储目录，所以当多个 Node 配置的存储目录位于同一块盘时，其对于该盘来说就相当于随机写。当然，braft 允许用户接管日志存储，用户可以自己实现顺序写逻辑。
 
+![图 2.5  随机写](image/2.5.png)
 
 具体实现
 ===
@@ -122,17 +123,17 @@ braft 中的 RPC 请求中都会携带目标 Node 的 `GroupId` 和 `PeerId`：
 ```proto
 //  PreVote、RequestVote
 message RequestVoteRequest {
-    required string group_id = 1;
-    required string server_id = 2;
-    required string peer_id = 3;
+    required string group_id = 1;   // GroupId
+    required string server_id = 2;  // 源 node 的 PeerId
+    required string peer_id = 3;    // 目标 node 的 PeerId
     ...
 };
 
 // 探测 nextIndex、心跳、复制日志
 message AppendEntriesRequest {
-    required string group_id = 1;  // GroupId
-    required string server_id = 2;  // 源 node 的 PeerId
-    required string peer_id = 3;  // 目标 node 的 PeerId
+    required string group_id = 1;
+    required string server_id = 2;
+    required string peer_id = 3;
     ...
 };
 
@@ -144,7 +145,7 @@ message InstallSnapshotRequest {
     ...
 };
 
-// 唤醒节点进行立马选举：转移 Leader
+// 唤醒节点进行立马选举，用于转移 Leader
 message TimeoutNowRequest {
     required string group_id = 1;
     required string server_id = 2;
