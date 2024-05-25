@@ -4,7 +4,7 @@
 考虑到单机的容量有限，一些追求扩展性的系统，往往会将数据进行分片（Sharding），并将分片放置在不同的 Raft Group（复制组） 中，以达到每个分片都高可用的目的。Sharding + Multi-Raft 的架构比 Single-Raft 的架构在以下几个方面更具优势：
 
 * 扩展性：系统可以在需要的时候新增 Raft Group 用来存放分片，并将其运行在不同的磁盘或机器上，这样就具有很好的扩展性，理论上没有容量上限。
-* 性能：系统可以将 Leader 打散到各个节点，从而充分利用各机器的资源，以提升系统整体的吞吐。
+* 性能：由于日志在 Leader 上都是被串行 `Apply`，而 Multi-Raft 提供多个 Leader，可以提升整体的并发度；此外，系统可以将 Leader 打散到各个节点，充分利用各机器的资源，提升整体吞吐。
 
 > **各架构相关系统**
 >
@@ -35,7 +35,7 @@ braft 允许一个进程管理多个 Raft Group， 多个 Group 在逻辑上和�
 心跳
 --
 
-由于每个 Group 的 Leader 都需要给其 Follower 发送心跳，而心跳间隔一般都都比较小（默认 100 毫秒），所以如果单台机器上运行大量的 Group，会产生大量的心跳请求。
+由于每个 Group 的 Leader 都需要给其 Follower 发送心跳，而心跳间隔一般都都比较小（默认 100 毫秒），所以如果单台机器上运行大量的 Group，会产生大量的心跳请求，可能会导致超时的。
 
 我们计算 3 副本构成的个 Group 在 1 秒内产生的心跳数：
 
@@ -43,17 +43,19 @@ braft 允许一个进程管理多个 Raft Group， 多个 Group 在逻辑上和�
 2  * 1 * (1000 / 100) = 20
 ```
 
-随着 Group 和副本数的增加，心跳数会呈指倍数增长，比如运行 1 万个 Group，1 秒内将会产生 20 万个心跳。为此，像 [CockroachDB][cockroachdb] 中 MultiRaft 实现会将每个节点之间的心跳进行合并，详见[Scaling Raft][scaling-raft]：
+随着 Group 和副本数的增加，心跳数会呈指倍数增长，比如运行 1 万个 Group，1 秒内将会产生 20 万个心跳。为此，像 [CockroachDB][cockroachdb] 中 MultiRaft 实现会将每个节点之间的心跳进行合并，详见 [Scaling Raft][scaling-raft]。
+
+需要注意的是，braft 开源版本还未实现心跳合并以及文档中提到的[静默模式](https://github.com/baidu/braft/blob/master/docs/cn/raft_protocol.md#%E5%8A%9F%E8%83%BD%E5%AE%8C%E5%96%84)。
 
 ![图 4.3  CockroachDB 的 MultiRaft 实现](image/cockroachdb.png)
 
-> 需要注意的是，braft 开源版本还未实现心跳合并以及文档中提到的[静默模式](https://github.com/baidu/braft/blob/master/docs/cn/raft_protocol.md#%E5%8A%9F%E8%83%BD%E5%AE%8C%E5%96%84)。
 
 [scaling-raft]: https://www.cockroachlabs.com/blog/scaling-raft/
 
 随机写
 ---
-虽然每个 Node 的日志都是顺序追加写，但是其都是独立的存储目录，所以当一块盘上跑着多个 Node 时，对该盘来说就相当于随机写。当然，braft 允许用户接管日志存储，用户可以自己实现顺序写的逻辑。
+虽然每个 Node 的日志都是顺序追加写，但是其都是独立的存储目录，所以当多个 Node 配置的存储目录位于同一块盘时，其对于该盘来说就相当于随机写。当然，braft 允许用户接管日志存储，用户可以自己实现顺序写逻辑。
+
 
 具体实现
 ===

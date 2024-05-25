@@ -4,61 +4,54 @@
 流程概览
 ---
 
-前置流程：用户创建 BRPC Server，并调用 `braft::add_service` 将 Raft 相关的 Service 加入到 BRPC Server 中，并启动 BRPC Server
+1. 在初始化节点前，用户需要创建 BRPC Server，并调用 `braft::add_service` 将 Raft 相关的 Service 加入到 BRPC Server 中，以及启动 BRPC Server
+2. 用户创建 `braft::Node`，并调用 `Node::init` 接口进行初始化，此后流程将由 braft 接管
+3. 启动任务队列 `ApplyTaskQueue`
+4. 遍历一遍日志，读取每条日志的 `Header` (24 字节)：
+    * 4.1 若 `Header` 中的类型显示其为配置，则读取完整日志以获取配置
+    * 4.2 构建索引（`LogIndex` 到文件 `offset`），便于读取时快速定位
+    * 4.3 获得当前节点的 `FirstLogIndex` 和 `LastLogIndex`
+5. 加载快照：
+    * 5.1 打开本地快照，并返回 `SnapshotReader`
+    * 5.2 以 `SnapshotReader` 作为参数回调用户状态机 `on_snapshot_load` 来加载快照
+    * 5.3 等待快照加载完成，将快照元数据中的节点配置设为当前节点配置
+6. 将日志中的配置（步骤 4.1）或用户指定配置（`initial_conf`）设为当前节点配置
+7. 检查日志是否有丢失，若快照元数据中的 `LastIncludedIndex` 小于日志的 `FirstLogIndex`
+8. 读取 Raft 元数据文件，恢复 `(term, votedFor)` 这个投票状态
+9. 启动快照定时器
+10. 将自身角色变为 `Follower`，并启动选举定时器
+11. 将节点加入 Raft Group
+12. 至此，初始化完成，节点将等待选举超时后发起选举
 
-1. 用户创建 `braft::Node`，并调用 `Node::init` 接口进行初始化
-2. braft 启动任务队列 `ApplyTaskQueue`
-3. 遍历一遍日志，读取每条日志的 `Header` (24 字节)：
-    * 3.1 若 Header 中的类型显示其为配置日志，则读取完整日志
-    * 3.2 构建索引（`LogIndex` 到文件 `offset`），便于读取时快速定位
-    * 3.3 获得当前日志的 `FirstIndex` 与 `LastIndex`
-4. 加载快照：
-    * 4.1 打开本地快照，并返回 `SnapshotReader`
-    * 4.2 以 `SnapshotReader` 作为参数回调用户状态机 `on_snapshot_load` 来加载快照
-    * 4.3 等待快照加载完成，将快照元数据中的节点配置设为当前节点配置
-5. 从日志（步骤 3.1）或用户指定配置（`initial_conf`）初始化集群列表
-6. 检查日志是否有丢失，若 `LastIncludedIndex < FirstLogIndex`
-7. 读取 Raft 元数据文件，恢复 `(term, votedFor)` 这个二元组
-8. 启动快照定时器
-9. 将自身角色变为 `Follower`，并启动选举定时器
-10. 将节点加入 Raft Group
-11. 至此，初始化完成，节点将等待选举超时后发起选举
-
-从以上可以初始化过程主要工作分为以下 3 类：恢复持久化存储，启动算法
-
-流程注解
----
-
-* 2 日志并未回放，因为不知道节点的 `CommitIndex`；
-* 3 只需要读取，详见[日志存储](/ch04/4.3/log_storage.md)
-* 5 节点配置依照优先级从高到底从以下：日志 > 快照 > 用户指定
+从以上可以初始化过程主要工作分为以下 3 类：持久化存储来恢复 Raft 算法状态，启动算法
 
 RPC Service
 ---
 
-`braft::add_service` 会增加以下 4 个 Service：
-* `FileService`：用于 Follower 安装快照时，向 Leader 下载对应文件
-* `RaftService`：核心服务，处理 Raft 算法的核心逻辑
-* `RaftStat`: 可观测性的一部分，用户可通过访问 `http://${your_server_endpoint}/raft_stat` 查看当前这个进程上 Node 的列表，以及每个 Node 的内部状态，详见[查看节点状态][节点状态]
-* `CliService`：允许用户通过发送 RPC 请求来控制节点，如配置变更、重置节点列表、转移 Leader。当然
+当用户调用 `braft::add_service` 时，braft 会增加以下 4 个 Raft 相关的 Service 至 BRPC Server：
+
+* `FileService`：用于 Follower 安装快照时，向 Leader 下载快照中的文件。
+* `RaftService`：核心服务，处理 Raft 算法，如选举投票、复制日志、安装快照等。
+* `RaftStat`: 可观测性的一部分，用户可通过访问 `http://${your_server_endpoint}/raft_stat` 查看当前这个进程上 Node 的列表，以及每个 Node 的内部状态，详见[查看节点状态][节点状态]。
+* `CliService`：允许用户通过发送 RPC 请求来控制节点，如配置变更、重置节点列表、转移 Leader；当然用户也可以通过 API 来控制节点。
 
 [节点状态]: https://github.com/baidu/braft/blob/master/docs/cn/server.md#%E6%9F%A5%E7%9C%8B%E8%8A%82%E7%82%B9%E7%8A%B6%E6%80%81
 
 ApplyTaskQueue
 ---
 
-这是一个串行执行的任务队列，所有回调给用户状态机的任务都需进入该队列，并且串行执行：
+这是一个串行执行的任务队列，所有需要回调用户状态机的任务都会进入该队列，并被依次串行回调：
 
-| 任务类型&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | 说明                                                                             |                                                                                |
-|:---------------------------------------------|:---------------------------------------------------------------------------------|:-------------------------------------------------------------------------------|
-| COMMITTED                                    | 已被提交的日志，需被应用到状态机                                                 | 若日志类型为节点配置，则回调 `on_configuration_committed`，否则回调 `on_apply` |
-| SNAPSHOT_SAVE                                | 创建快照                                                                         | `on_snapshot_save`                                                             |
-| SNAPSHOT_LOAD                                | 加载快照                                                                         | `on_snapshot_load`                                                             |
-| LEADER_STOP                                  | Leader 转换为 Follower                                                           | `on_leader_stop`                                                               |
-| LEADER_START                                 | 当节点成为 Leader                                                                | `on_leader_start`                                                              |
-| START_FOLLOWING                              | 当 Follower 或 Candidate 开始跟随 Leader 时，并且其 `leader_id` 为 Leader PeerId | `on_start_following`                                                           |
-| STOP_FOLLOWING                               | 当节点不再跟随 Leader，并且其 `leader_id` 将变为空                               | `on_stop_following`                                                            |
-| ERROR                                        | 当节点出现出错，此时任何 `apply` 任务都将失败                                    | `on_error`                                                                     |
+| 任务类型          | 说 明                                                                              | 回调函数                                                                       |
+|:------------------|:-----------------------------------------------------------------------------------|:-------------------------------------------------------------------------------|
+| `COMMITTED`       | 已被提交的日志，需被应用到状态机                                                   | 若日志类型为节点配置，则回调 `on_configuration_committed`，否则回调 `on_apply` |
+| `SNAPSHOT_SAVE`   | 创建快照                                                                           | `on_snapshot_save`                                                             |
+| `SNAPSHOT_LOAD`   | 加载快照                                                                           | `on_snapshot_load`                                                             |
+| `LEADER_STOP`     | Leader 转换为 Follower                                                             | `on_leader_stop`                                                               |
+| `LEADER_START`    | 当节点成为 Leader                                                                  | `on_leader_start`                                                              |
+| `START_FOLLOWING` | 当 Follower 或 Candidate 开始跟随 Leader 时；此时其 `leader_id` 为 Leader `PeerId` | `on_start_following`                                                           |
+| `STOP_FOLLOWING`  | 当节点不再跟随 Leader；此时其 `leader_id` 将变为空                                 | `on_stop_following`                                                            |
+| `ERROR`           | 当节点出现出错，此时任何 `apply` 任务都将失败                                      | `on_error`                                                                     |
 
 持久化存储
 ---
@@ -69,29 +62,29 @@ Raft 拥有以下 3 个持久化存储，这些都需要在节点重启时进行
 * LogStorage: 存储用户日志以及日志元数据（即 `FirstLogIndex`）
 * SnapshotStorage: 存储用户快照以及元数据
 
-特别需要注意的是，节点的配置也是
+特别需要注意的是，其实节点的配置也是持久化的，其会保存在快照元数据（`SnapshotStorage`）和日志（`LogStorage`）中。
 
-Raft 算法相关元数据：
+Raft Meta：
 ```proto
 message StablePBMeta {
-    required int64 term = 1;
-    required string votedfor = 2;
+    required int64 term = 1;       // 当前 Term
+    required string votedfor = 2;  //
 };
 ```
 
 日志元数据：
 ```proto
 message LogPBMeta {
-    required int64 first_log_index = 1;
+    required int64 first_log_index = 1;  //
 };
 ```
 
 快照元数据 `LocalSnapshotPbMeta`：
 ```proto
 message SnapshotMeta {
-    required int64 last_included_index = 1;
+    required int64 last_included_index = 1;  // 快照对应的 LastApplyIndex
     required int64 last_included_term = 2;
-    repeated string peers = 3;
+    repeated string peers = 3;             // 节点配置
     repeated string old_peers = 4;
 }
 
@@ -111,21 +104,42 @@ message LocalSnapshotPbMeta {
 }
 ```
 
-快照与日志回放
+日志回放与快照
 ---
+
+当节点刚启动时，其不会回放日志，因为 `CommitIndex` 并没有持久化，所以节点在启动时并不知道自己的 `CommitIndex`，也就不知道该 `Apply` 哪些日志。只有当集群产生 Leader 后集群中的节点才开始回放日志，Leader 的 `CommitIndex` 由其当选 Leader 后，提交一条本任期 `no-op` 日志后确定，其 `CommitIndex` 就等于该 `no-op` 日志的 `Index`，而 Follower 的 `CommitIndex` 由 Leader 在之后的心跳或 `AppendEntries` 请求中告知。
+
+而对于快照来说，其代表的都是 `Applied` 的数据，所以可以安全的加载。
+
+节点配置
+---
+
+节点的配置，按照优先级从高到低
+
+* 日志
+* 快照
+* 用户通过 `inital_conf` 指定
+
+初始值
+---
+
+当一个全新的节点启动时，其相关的初始值如下：
+
+* `state`：FOLLOWER
+* `term`：1
+* `votedFor`: null
+* `FirstLogIndex`：1
+* `LastLogIndex`： 0
+* `CommitIndex`：
+* `ApplyIndex`：快照的 `LastIncludedIndex`
 
 具体实现
 ===
 
-增加 Raft Service
+braft:add_service
 ---
 
-`braft::add_service` 会增加以下 4 个 *Service*：
-* `FileService`：用于 *Follower* 安装快照时，向 *Leader* 下载对应文件
-* `RaftService`：核心服务，处理 *Raft* 的核心逻辑
-* `RaftStat`: 可观测性的一部分
-* `CliService`：控制节点，如配置变更、重置节点列表、转移 *Leader*
-
+用户调用 `braft::add_service` 将 braft 相关 Service 加入到 BRPC Server 中：
 ```cpp
 namespace braft {
 
@@ -141,47 +155,47 @@ int add_service(brpc::Server* server,
 }  // namespace braft
 ```
 
+`braft::add_service` 会增加以下 4 个 Service：
 ```cpp
 int NodeManager::add_service(brpc::Server* server, const butil::EndPoint& listen_address) {
     ...
 
-    // FileService
+    // 1. FileService
     server->AddService(file_service(), brpc::SERVER_DOESNT_OWN_SERVICE);
 
-    // RaftService
+    // 2. RaftService
     server->AddService(new RaftServiceImpl(listen_address), brpc::SERVER_OWNS_SERVICE);
 
-    // RaftStat
+    // 3. RaftStat
     server->AddService(new RaftStatImpl, brpc::SERVER_OWNS_SERVICE);
 
-    // CliService
+    // 4. CliService
     server->AddService(new CliServiceImpl, brpc::SERVER_OWNS_SERVICE);
 
     ...
 }
 ```
 
-node::init()
+braft::Node
 ---
 
-`NodeImpl::init` 主要完成以下几项工作（详情见以下代码注释）：
-* (1) 初始化各类
-* (2)
-* (3) 初始化节点配置：优先从日志或快照中获取，若其为空则使用用户配置的集群列表 `initial_conf`
-* (8) 将节点状态置为 *Follower*
-* (9) 启动快照定时器 `_snapshot_timer`
-* (10) 如果集群列表**不为空**，则调用 `step_down` 启动选举定时器 `_election_timer`
-* (11) 将当前节点加入打对应的复制组中
-* (12) 若配置中的集群列表只有当前节点一个，则直接跳过定时器，直接进行选举
+用户需要构建一个 `braft::Node`：
 
-归纳来说，主要做以下几类工作：
+```cpp
+Node(const GroupId& group_id, const PeerId& peer_id);
+```
+
+Node::init
+---
+
+用户调用 `Node::init` 来启动节点，在 `init` 函数中主要完成以下几项工作：
 
 ```cpp
 int NodeImpl::init(const NodeOptions& options) {
     ...
-    // (1) 初始化以下 4 个定时器
-    //    `_election_timer`：选举定时器
-    //    `_vote_timer`：投票定时器
+    // (1) 初始化以下 4 个定时器（注意：此时并未启动定时器）
+    //    `_election_timer`：选举超时
+    //    `_vote_timer`：投票超时
     //    `_stepdown_timer`：降级定时器
     //    `_snapshot_timer`：快照定时器
     CHECK_EQ(0, _election_timer.init(this, options.election_timeout_ms));
@@ -189,7 +203,7 @@ int NodeImpl::init(const NodeOptions& options) {
     CHECK_EQ(0, _stepdown_timer.init(this, options.election_timeout_ms));
     CHECK_EQ(0, _snapshot_timer.init(this, options.snapshot_interval_s * 1000));
 
-    // (2) 启动任务执行对垒
+    // (2) 启动 ApplyTaskQueue，该队列消费函数为 execute_applying_tasks
     if (bthread::execution_queue_start(&_apply_queue_id, NULL,
                                        execute_applying_tasks, this) != 0) {
         ...
@@ -203,11 +217,11 @@ int NodeImpl::init(const NodeOptions& options) {
     // Create _fsm_caller first as log_manager needs it to report error
     _fsm_caller = new FSMCaller();
 
-    // (4) 初始化
+    // (4) 初始化 Leader Lease 与 Follower Lease，其用于
     _leader_lease.init(options.election_timeout_ms);
     _follower_lease.init(options.election_timeout_ms, options.max_clock_drift_ms);
 
-    // (5)
+    // (5) 初始化日志，并开始遍历日志
     // log storage and log manager init
     if (init_log_storage() != 0) {
         ...
@@ -220,7 +234,7 @@ int NodeImpl::init(const NodeOptions& options) {
         return -1;
     }
 
-    // (7)
+    // (7) 初始化 BallotBox，其用于日志复制时的计数
     // commitment manager init
     _ballot_box = new BallotBox();
     BallotBoxOptions ballot_box_options;
@@ -232,7 +246,7 @@ int NodeImpl::init(const NodeOptions& options) {
         return -1;
     }
 
-    // (8)
+    // (8) 初始化快照存储
     // snapshot storage init and load
     // NOTE: snapshot maybe discard entries when snapshot saved but not discard entries.
     //      init log storage before snapshot storage, snapshot storage will update configration
@@ -271,35 +285,26 @@ int NodeImpl::init(const NodeOptions& options) {
         _follower_lease.reset();
     }
 
-    // (11)
+    // (11) Replicator 负责向 Follower 发送心跳和日志
     // init replicator
     ReplicatorGroupOptions rg_options;
     rg_options.heartbeat_timeout_ms = heartbeat_timeout(_options.election_timeout_ms);
-    rg_options.election_timeout_ms = _options.election_timeout_ms;
-    rg_options.log_manager = _log_manager;
+    ...
     rg_options.ballot_box = _ballot_box;
     rg_options.node = this;
-    rg_options.snapshot_throttle = _options.snapshot_throttle
-        ? _options.snapshot_throttle->get()
-        : NULL;
     rg_options.snapshot_storage = _snapshot_executor
         ? _snapshot_executor->snapshot_storage()
         : NULL;
     _replicator_group.init(NodeId(_group_id, _server_id), rg_options);
 
+    // (12) 将自身角色转变为 Follower
     // set state to follower
     _state = STATE_FOLLOWER;
 
-    LOG(INFO) << "node " << _group_id << ":" << _server_id << " init,"
-              << " term: " << _current_term
-              << " last_log_id: " << _log_manager->last_log_id()
-              << " conf: " << _conf.conf
-              << " old_conf: " << _conf.old_conf;
-
+    // (13) 启动快照定时器
     // start snapshot timer
     if (_snapshot_executor && _options.snapshot_interval_s > 0) {
-        BRAFT_VLOG << "node " << _group_id << ":" << _server_id
-                   << " term " << _current_term << " start snapshot_timer";
+        ...
         _snapshot_timer.start();
     }
 
@@ -307,13 +312,14 @@ int NodeImpl::init(const NodeOptions& options) {
         step_down(_current_term, false, butil::Status::OK());
     }
 
+    // (14) 将当前 Node 加入到对应的 Raft Group 中
     // add node to NodeManager
     if (!global_node_manager->add(this)) {
-        LOG(ERROR) << "NodeManager add " << _group_id
-                   << ":" << _server_id << " failed";
+        ...
         return -1;
     }
 
+    // (15) 如果当前不存在节点变更（即 _conf.stable）
     // Now the raft node is started , have to acquire the lock to avoid race
     // conditions
     std::unique_lock<raft_mutex_t> lck(_mutex);
