@@ -9,21 +9,22 @@
 3. 启动任务队列 `ApplyTaskQueue`
 4. 遍历一遍日志，读取每条日志的 `Header` (24 字节)：
     * 4.1 若 `Header` 中的类型显示其为配置，则读取完整日志以获取配置
-    * 4.2 构建索引（`LogIndex` 到文件 `offset`），便于读取时快速定位
-    * 4.3 获得当前节点的 `FirstLogIndex` 和 `LastLogIndex`
+    * 4.2 构建索引（`logIndex` 到文件 `offset`），便于读取时快速定位
+    * 4.3 获得当前节点的 `firstLogIndex` 和 `lastLogIndex`
 5. 加载快照：
     * 5.1 打开本地快照，并返回 `SnapshotReader`
     * 5.2 以 `SnapshotReader` 作为参数回调用户状态机 `on_snapshot_load` 来加载快照
     * 5.3 等待快照加载完成，将快照元数据中的节点配置设为当前节点配置
 6. 将日志中的配置（步骤 4.1）或用户指定配置（`initial_conf`）设为当前节点配置
-7. 检查日志是否有丢失：若快照元数据中的 `LastIncludedIndex` 小于日志的 `FirstLogIndex` 则表示数据有丢失，则启动失败
-8. 读取 Raft 元数据文件，恢复当前 `term` 以及 `votedFor` 这个投票状态
-9. 启动快照定时器
-10. 将自身角色变为 `Follower`，并启动选举定时器
-11. 将节点加入 Raft Group
-12. 至此，初始化完成，节点将等待选举超时后发起选举
+7. 读取 Raft 元数据文件，即 `term` 与 `votedFor`：
+    * 7.1 将节点 `currentTerm` 设置为 `term`
+    * 7.2 恢复投票状态 `votedFor`
+8. 启动快照定时器
+9. 将自身角色变为 `Follower`，并启动选举定时器
+10. 将节点加入 Raft Group
+11. 至此，初始化完成，节点将等待选举超时后发起选举
 
-从上述流程可以看出初始化工作可以分为以下 2 类：加载持久化存储来恢复节点状态（4,5,6,7,8），以及启动算法（8.9.10）
+从上述流程可以看出，初始化工作可以大致分为以下 2 类：加载持久化存储来恢复节点状态（步骤 4、5、6、7），以及启动算法（步骤 8、9）。
 
 ![图 2.1  Raft Node](image/2.1.png)
 
@@ -33,7 +34,7 @@ RPC Service
 当用户调用 `braft::add_service` 时，braft 会增加以下 4 个 Raft 相关的 Service 至 BRPC Server：
 
 * `FileService`：用于 Follower 安装快照时，向 Leader 下载快照中的文件。
-* `RaftService`：核心服务，处理 Raft 算法，如选举投票、复制日志、安装快照等。
+* `RaftService`：核心服务，用于处理 Raft 算法，如选举投票、复制日志、安装快照等。
 * `RaftStat`: 可观测性的一部分，用户可通过访问 `http://${your_server_endpoint}/raft_stat` 查看当前这个进程上 Node 的列表，以及每个 Node 的内部状态，详见[查看节点状态][节点状态]。
 * `CliService`：允许用户通过发送 RPC 请求来控制节点，如配置变更、重置节点列表、转移 Leader；当然用户也可以通过 API 来控制节点。
 
@@ -60,33 +61,33 @@ ApplyTaskQueue
 
 Raft 拥有以下 3 个持久化存储，这些都需要在节点重启时进行重建：
 
-* RaftMetaStorage: 保存 Raft 算法自身的状态信息，即 `(Term, votedFor)` 这个二元组
-* LogStorage: 存储用户日志以及日志元数据（即 `FirstLogIndex`）
-* SnapshotStorage: 存储用户快照以及元数据
+* RaftMetaStorage：保存 Raft 算法自身的状态数据（即 `term` 与 `votedFor`）
+* LogStorage：存储用户日志以及日志元数据（即 `firstLogIndex`）
+* SnapshotStorage：存储用户快照以及元数据
 
-特别需要注意的是，其实节点的配置也是持久化的，其会保存在快照元数据（`SnapshotStorage`）和日志（`LogStorage`）中。
+比较容易忽略的是，其实节点的配置也是持久化的，其会保存在快照元数据（`SnapshotStorage`）和日志（`LogStorage`）中。
 
-Raft Meta：
+Raft 元数据 `StablePBMeta`：
 ```proto
 message StablePBMeta {
-    required int64 term = 1;       // 当前 Term
-    required string votedfor = 2;  //
+    required int64 term = 1;
+    required string votedfor = 2;
 };
 ```
 
-日志元数据：
+日志元数据 `LogPBMeta`：
 ```proto
 message LogPBMeta {
-    required int64 first_log_index = 1;  //
+    required int64 first_log_index = 1;
 };
 ```
 
 快照元数据 `LocalSnapshotPbMeta`：
 ```proto
 message SnapshotMeta {
-    required int64 last_included_index = 1;  // 快照对应的 LastApplyIndex
+    required int64 last_included_index = 1;
     required int64 last_included_term = 2;
-    repeated string peers = 3;             // 节点配置
+    repeated string peers = 3;
     repeated string old_peers = 4;
 }
 
@@ -109,18 +110,19 @@ message LocalSnapshotPbMeta {
 日志回放与快照
 ---
 
-当节点刚启动时，其不会回放日志，因为 `CommitIndex` 并没有持久化，所以节点在启动时并不知道自己的 `CommitIndex`，也就不知道该 `Apply` 哪些日志。只有当集群产生 Leader 后集群中的节点才开始回放日志，Leader 的 `CommitIndex` 由其当选 Leader 后，提交一条本任期 `no-op` 日志后确定，其 `CommitIndex` 就等于该 `no-op` 日志的 `Index`，而 Follower 的 `CommitIndex` 由 Leader 在之后的心跳或 `AppendEntries` 请求中告知。
+当节点刚启动时，其不会回放日志，因为 `commitIndex` 并没有持久化，所以节点在启动时并不知道自己的 `commitIndex`，也就不知道该 `apply` 哪些日志。只有当集群产生 Leader 后集群中的节点才开始回放日志，Leader 的 `commitIndex` 由其当选 Leader 后，提交一条本任期 `no-op` 日志后确定，其 `commitIndex` 就等于该 `no-op` 日志的 `index`，而 Follower 的 `commitIndex` 由 Leader 在之后的心跳或 `AppendEntries` 请求中告知。
 
-而对于快照来说，其代表的都是 `Applied` 的数据，所以可以安全的加载。
+而对于快照来说，其代表的都是 `applied` 的数据，所以可以安全的加载。
 
 节点配置
 ---
 
-节点的配置，按照优先级从高到低
+节点在启动时，其配置取决以下：
 
-* 日志
-* 快照
-* 用户通过 `inital_conf` 指定
+* 优先读取日志中的配置
+* 若当前节点不存在日志，则读取快照元数据中保存的配置
+* 若当前节点既没有日志，也没有快照，则使用用户指定的 `initial_conf`
+* 若用户没有指定配置，则该节点配置为空
 
 初始值
 ---

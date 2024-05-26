@@ -1,6 +1,31 @@
 附录
 ===
 
+术语表
+---
+
+* Follower
+* Leader
+* Candidate
+* Witness
+* Learner
+* term
+* currentTerm
+* votedFor
+* lastIncludedIndex
+* lastIncludedTerm
+* firstLogIndex
+* lastLogIndex
+* nextIndex
+* applyIndex
+* commitIndex
+* apply
+* commit
+* lastLogId
+* AppendEntries
+* PreVote
+* RequestVote
+
 插图
 ---
 > 所有插图可转存为自己文件，并进行修改
