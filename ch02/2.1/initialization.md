@@ -187,6 +187,10 @@ braft::Node
 ---
 
 此外，用户在启动节点前，需要构建一个 `braft::Node`：
+* GroupId: 一个字符串, 表示这个复制组的 `ID`
+* PeerId：结构是一个 [EndPoint][EndPoint]，表示对外服务的端口，外加一个 Index (默认为 0）用于区分同一进程内的不同副本
+
+[EndPoint]: https://github.com/brpc/brpc/blob/master/src/butil/endpoint.h
 
 ```cpp
 Node(const GroupId& group_id, const PeerId& peer_id);
@@ -203,7 +207,7 @@ int NodeImpl::init(const NodeOptions& options) {
     // (1) 初始化以下 4 个定时器（注意：此时并未启动定时器）
     //    `_election_timer`：选举超时
     //    `_vote_timer`：投票超时
-    //    `_stepdown_timer`：降级定时器
+    //    `_stepdown_timer`：用于实现 Check Quorum
     //    `_snapshot_timer`：快照定时器
     CHECK_EQ(0, _election_timer.init(this, options.election_timeout_ms));
     CHECK_EQ(0, _vote_timer.init(this, options.election_timeout_ms + options.max_clock_drift_ms));
@@ -220,40 +224,39 @@ int NodeImpl::init(const NodeOptions& options) {
     _apply_queue = execution_queue_address(_apply_queue_id);
 
 
-    // (3)
     // Create _fsm_caller first as log_manager needs it to report error
     _fsm_caller = new FSMCaller();
 
-    // (4) 初始化 Leader Lease 与 Follower Lease，其用于
+    // (3) 初始化 Leader Lease 与 Follower Lease，其用于实现 Lease Read
+    // 详见 <3.2 选主优化>
     _leader_lease.init(options.election_timeout_ms);
     _follower_lease.init(options.election_timeout_ms, options.max_clock_drift_ms);
 
-    // (5) 初始化日志，并开始遍历日志
+    // (4) 初始化日志存储，若有日志则开始读取 Header 来构建索引
+    //     详见 <4.3 日志存储>
     // log storage and log manager init
     if (init_log_storage() != 0) {
         ...
         return -1;
     }
 
-    // (6) 初始化
+    // (5) 初始化 FSMCaller，该类用于回调用户状态机，其管理着 applyIndex
     if (init_fsm_caller(LogId(0, 0)) != 0) {
         ...
         return -1;
     }
 
-    // (7) 初始化 BallotBox，其用于日志复制时的计数
+    // (6) 初始化 BallotBox，该类用于日志复制时的 Quorum 计数，其管理着 commitIndex
     // commitment manager init
     _ballot_box = new BallotBox();
-    BallotBoxOptions ballot_box_options;
-    ballot_box_options.waiter = _fsm_caller;
-    ballot_box_options.closure_queue = _closure_queue;
+    ...
     if (_ballot_box->init(ballot_box_options) != 0) {
-        LOG(ERROR) << "node " << _group_id << ":" << _server_id
-                   << " init _ballot_box failed";
+        ...
         return -1;
     }
 
-    // (8) 初始化快照存储
+    // (7) 初始化快照存储，若有快照则开始加载快照，
+    //     并在快照加载完成后，将快照元数据中的配置设为当前节点配置
     // snapshot storage init and load
     // NOTE: snapshot maybe discard entries when snapshot saved but not discard entries.
     //      init log storage before snapshot storage, snapshot storage will update configration
@@ -263,14 +266,14 @@ int NodeImpl::init(const NodeOptions& options) {
         return -1;
     }
 
-    // (8)
+    // (8) 检查日志是否有丢失
     butil::Status st = _log_manager->check_consistency();
     if (!st.ok()) {
         ...
         return -1;
     }
 
-    // (9)
+    // (9) 若日志中有配置，则将其设为当前节点配置；否则使用用户指定的配置
     _conf.id = LogId();
     // if have log using conf in log, else using conf in options
     if (_log_manager->last_log_index() > 0) {
@@ -279,7 +282,7 @@ int NodeImpl::init(const NodeOptions& options) {
         _conf.conf = _options.initial_conf;
     }
 
-    // (10)
+    // (10) 初始化 RaftMetaStorage，若有数据则用来恢复当前节点状态，包括 `currentTerm` 与 `votedFor`
     // init meta and check term
     if (init_meta_storage() != 0) {
         LOG(ERROR) << "node " << _group_id << ":" << _server_id
@@ -292,7 +295,7 @@ int NodeImpl::init(const NodeOptions& options) {
         _follower_lease.reset();
     }
 
-    // (11) Replicator 负责向 Follower 发送心跳和日志
+    // (11) 初始化 Replicator Group，Replicator 负责向 Follower 发送心跳、日志等
     // init replicator
     ReplicatorGroupOptions rg_options;
     rg_options.heartbeat_timeout_ms = heartbeat_timeout(_options.election_timeout_ms);
@@ -315,18 +318,21 @@ int NodeImpl::init(const NodeOptions& options) {
         _snapshot_timer.start();
     }
 
+    // (14) 若当前节点配置不为空，则：
+    //      * (1) 将自己变为 Follower
+    //      * (2) 启动选举定时器，即 _election_timer
     if (!_conf.empty()) {
         step_down(_current_term, false, butil::Status::OK());
     }
 
-    // (14) 将当前 Node 加入到对应的 Raft Group 中
+    // (15) 将当前 Node 加入到对应的 Raft Group 中
     // add node to NodeManager
     if (!global_node_manager->add(this)) {
         ...
         return -1;
     }
 
-    // (15) 如果当前不存在节点变更（即 _conf.stable）
+    // (16) 如果当前不存在节点变更（即 _conf.stable）并且当前配置中只有自己，则直接发起选举（跳过 PreVote）
     // Now the raft node is started , have to acquire the lock to avoid race
     // conditions
     std::unique_lock<raft_mutex_t> lck(_mutex);

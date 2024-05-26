@@ -83,11 +83,15 @@ struct PeerId {
 ```
 
 * GroupId: 一个字符串, 表示这个复制组的 `ID`；
-* PeerId：结构是一个 [EndPoint][EndPoint]，表示对外服务的端口, 外加一个 Index (默认为 0)；
-
-> PeerId 中 Index 的作用是让同一 Raft Group 中不同的副本能运行在同一个进程内。通常我们出于故障域考虑是会将不同的副本运行在不同的机器上，所以不用考虑这个 Index，使用默认值 0 即可。但是如果特别场景下需要运行在一个进程下，由于各副本的 `GroupId` 和 `Endpoint` 都相同，所以需要通过 Index 来区分。 // 存疑：https://github.com/baidu/braft/issues/205
+* PeerId：结构是一个 [EndPoint][EndPoint]，表示对外服务的端口，外加一个 Index (默认为 0）用于区分同一进程内的不同副本
 
 [EndPoint]: https://github.com/brpc/brpc/blob/master/src/butil/endpoint.h
+
+<!--
+TODO:
+> PeerId 中 Index 的作用是让同一 Raft Group 中不同的副本能运行在同一个进程内。通常我们出于故障域考虑是会将不同的副本运行在不同的机器上，所以不用考虑这个 Index，使用默认值 0 即可。但是如果特别场景下需要运行在一个进程下，由于各副本的 `GroupId` 和 `Endpoint` 都相同，所以需要通过 Index 来区分。 // 存疑：https://github.com/baidu/braft/issues/205
+-->
+
 
 添加至 NodeManager
 ---
@@ -109,8 +113,8 @@ int NodeImpl::init(const NodeOptions& options)
     ...
 }
 
+// 将当前节点的 GroupId 和 PeerId 组成的 key 加入到一个 map 中
 bool NodeManager::add(NodeImpl* node) {
-    // butil::DoublyBufferedData<Maps> _nodes;
     // 将 node 将入到 _nodes 的 map 中
 }
 ```
@@ -165,7 +169,7 @@ service RaftService {
 路由请求
 ---
 
-NodeManager 根据请求 `GroupId` 和 `PeerId` 找到对应的 Node，然后再调用 Node 的相关方法处理请求：
+`RaftService` 在收到 RPC 请求后，会让 `NodeManager` 根据请求中的  `GroupId` 和 `PeerId` 找到对应的 Node，然后再调用 Node 的相关方法处理请求：
 
 ```cpp
 void RaftServiceImpl::append_entries(google::protobuf::RpcController* cntl_base,
