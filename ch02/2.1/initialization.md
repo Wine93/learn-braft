@@ -264,8 +264,7 @@ int NodeImpl::init(const NodeOptions& options) {
     // NOTE: snapshot maybe discard entries when snapshot saved but not discard entries.
     //      init log storage before snapshot storage, snapshot storage will update configration
     if (init_snapshot_storage() != 0) {
-        LOG(ERROR) << "node " << _group_id << ":" << _server_id
-                   << " init_snapshot_storage failed";
+        ...
         return -1;
     }
 
@@ -334,7 +333,7 @@ int NodeImpl::init(const NodeOptions& options) {
         return -1;
     }
 
-    // (16) 如果当前不存在节点变更（即 _conf.stable）并且当前配置中只有自己，则直接发起选举（跳过 PreVote）
+    // (16) 如果当前不存在节点变更（即 _conf.stable()）并且当前配置中只有自己，则直接发起选举（跳过 PreVote）
     // Now the raft node is started , have to acquire the lock to avoid race
     // conditions
     std::unique_lock<raft_mutex_t> lck(_mutex);
