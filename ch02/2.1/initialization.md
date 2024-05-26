@@ -45,7 +45,7 @@ ApplyTaskQueue
 
 这是一个串行执行的任务队列，所有需要回调用户状态机的任务都会进入该队列，并被依次串行回调：
 
-| 任 务 类 型          | 说 明                                                                              | 回调函数                                                                       |
+| 任  &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;务 类 型       | 说 明                                                                              | 回调函数                                                                       |
 |:------------------|:-----------------------------------------------------------------------------------|:-------------------------------------------------------------------------------|
 | `COMMITTED`       | 已被提交的日志，需被应用到状态机                                                   | 若日志类型为节点配置，则回调 `on_configuration_committed`，否则回调 `on_apply` |
 | `SNAPSHOT_SAVE`   | 创建快照                                                                           | `on_snapshot_save`                                                             |
@@ -124,6 +124,8 @@ message LocalSnapshotPbMeta {
 * 若当前节点既没有日志，也没有快照，则使用用户指定的 `initial_conf`
 * 若用户没有指定配置，则该节点配置为空
 
+<!--
+TODO:
 初始值
 ---
 
@@ -136,6 +138,7 @@ message LocalSnapshotPbMeta {
 * `LastLogIndex`： 0
 * `CommitIndex`：
 * `ApplyIndex`：快照的 `LastIncludedIndex`
+-->
 
 具体实现
 ===
@@ -143,7 +146,7 @@ message LocalSnapshotPbMeta {
 braft:add_service
 ---
 
-用户调用 `braft::add_service` 将 braft 相关 Service 加入到 BRPC Server 中：
+用户需调用 `braft::add_service` 将 braft 相关 Service 加入到 BRPC Server 中：
 ```cpp
 namespace braft {
 
@@ -159,7 +162,7 @@ int add_service(brpc::Server* server,
 }  // namespace braft
 ```
 
-`braft::add_service` 会增加以下 4 个 Service：
+`braft::add_service` 会调用 `NodeManager::add_service` 来增加以下 4 个 Service：
 ```cpp
 int NodeManager::add_service(brpc::Server* server, const butil::EndPoint& listen_address) {
     ...
@@ -183,7 +186,10 @@ int NodeManager::add_service(brpc::Server* server, const butil::EndPoint& listen
 braft::Node
 ---
 
-用户需要构建一个 `braft::Node`：
+此外，用户在启动节点前，需要构建一个 `braft::Node`：
+
+* GroupId：
+*
 
 ```cpp
 Node(const GroupId& group_id, const PeerId& peer_id);
@@ -192,7 +198,7 @@ Node(const GroupId& group_id, const PeerId& peer_id);
 Node::init
 ---
 
-用户调用 `Node::init` 来启动节点，在 `init` 函数中主要完成以下几项工作：
+最后，用户需调用 `Node::init` 来启动节点，在 `init` 函数中主要完成以下几项工作：
 
 ```cpp
 int NodeImpl::init(const NodeOptions& options) {
