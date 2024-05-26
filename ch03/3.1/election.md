@@ -51,11 +51,14 @@
 
 从以上差异可以看出，`PreVote` 更像是一次预检，检测其连通性和合法性，并没有实际的动作。
 
-> [1] LogId 的比较
+> **LogId 的比较**
 >
 > LogId 由 Log 的 Term 和 Index 组成，对于 2 个 LogId 来说：
 > * 若 `a.Term == b.Term`，则 `a == b`
 > * 若 `(a.Term > b.Term) || (a.Term == b.Term && a.Index > b.Index)`，则 `a > b`
+
+votedFor
+---
 
 幽灵日志
 ---
