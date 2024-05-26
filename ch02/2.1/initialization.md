@@ -46,16 +46,16 @@ ApplyTaskQueue
 
 这是一个串行执行的任务队列，所有需要回调用户状态机的任务都会进入该队列，并被依次串行回调：
 
-| 任  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;务&nbsp; &nbsp;&nbsp;&nbsp;类&nbsp;&nbsp;&nbsp;&nbsp; 型 | 说 明                                                                                 | 回调函数                                                                       |
-|:-------------------------------------------------------------------------------------------------------------|:--------------------------------------------------------------------------------------|:-------------------------------------------------------------------------------|
-| `COMMITTED`                                                                                                  | 已被提交的日志，需被应用到状态机                                                      | 若日志类型为节点配置，则回调 `on_configuration_committed`，否则回调 `on_apply` |
-| `SNAPSHOT_SAVE`                                                                                              | 创建快照                                                                              | `on_snapshot_save`                                                             |
-| `SNAPSHOT_LOAD`                                                                                              | 加载快照                                                                              | `on_snapshot_load`                                                             |
-| `LEADER_STOP`                                                                                                | 当节点不再是 Leader 时                                                                | `on_leader_stop`                                                               |
-| `LEADER_START`                                                                                               | 当节点成为 Leader 时                                                                  | `on_leader_start`                                                              |
-| `START_FOLLOWING`                                                                                            | 当 Follower 或 Candidate 开始跟随 Leader 时；此时其 `leader_id` 为 Leader 的 `PeerId` | `on_start_following`                                                           |
-| `STOP_FOLLOWING`                                                                                             | 当节点不再跟随 Leader；此时其 `leader_id` 将变为空                                    | `on_stop_following`                                                            |
-| `ERROR`                                                                                                      | 当节点出现出错，此时任何 `apply` 任务都将失败                                         | `on_error`                                                                     |
+| 任务类型          | 说明                                                                                  | 回调函数                                                                       |
+|:------------------|:--------------------------------------------------------------------------------------|:-------------------------------------------------------------------------------|
+| `COMMITTED`       | 当已被提交的日志，需被应用到状态机时                                                  | 若日志类型为节点配置，则回调 `on_configuration_committed`，否则回调 `on_apply` |
+| `SNAPSHOT_SAVE`   | 创建快照                                                                              | `on_snapshot_save`                                                             |
+| `SNAPSHOT_LOAD`   | 加载快照                                                                              | `on_snapshot_load`                                                             |
+| `LEADER_STOP`     | 当节点不再是 Leader 时                                                                | `on_leader_stop`                                                               |
+| `LEADER_START`    | 当节点成为 Leader 时                                                                  | `on_leader_start`                                                              |
+| `START_FOLLOWING` | 当 Follower 或 Candidate 开始跟随 Leader 时；此时其 `leader_id` 为 Leader 的 `PeerId` | `on_start_following`                                                           |
+| `STOP_FOLLOWING`  | 当节点不再跟随 Leader；此时其 `leader_id` 将变为空                                    | `on_stop_following`                                                            |
+| `ERROR`           | 当节点出现出错，此时任何 `apply` 任务都将失败                                         | `on_error`                                                                     |
 
 持久化存储
 ---
@@ -122,7 +122,7 @@ message LocalSnapshotPbMeta {
 
 * 优先读取日志中的配置
 * 若当前节点不存在日志，则读取快照元数据中保存的配置
-* 若当前节点既没有日志，也没有快照，则使用用户指定的 `initial_conf`
+* 若当前节点为新节点，既没有日志，也没有快照，则使用用户指定的 `initial_conf`
 * 若用户没有指定配置，则该节点配置为空
 
 <!--
@@ -155,7 +155,7 @@ namespace braft {
 
 int add_service(brpc::Server* server,
                 const butil::EndPoint& listen_addr) {
-    global_init_once_or_die();
+    ...
     return global_node_manager->add_service(server, listen_addr);
 }
 
@@ -187,7 +187,7 @@ braft::Node
 ---
 
 此外，用户在启动节点前，需要构建一个 `braft::Node`：
-* GroupId: 一个字符串, 表示这个复制组的 `ID`
+* GroupId：一个字符串, 表示这个复制组的 `ID`
 * PeerId：结构是一个 [EndPoint][EndPoint]，表示对外服务的端口，外加一个 Index (默认为 0）用于区分同一进程内的不同副本
 
 [EndPoint]: https://github.com/brpc/brpc/blob/master/src/butil/endpoint.h
@@ -205,10 +205,10 @@ Node::init
 int NodeImpl::init(const NodeOptions& options) {
     ...
     // (1) 初始化以下 4 个定时器（注意：此时并未启动定时器）
-    //    `_election_timer`：选举超时
-    //    `_vote_timer`：投票超时
-    //    `_stepdown_timer`：用于实现 Check Quorum
-    //    `_snapshot_timer`：快照定时器
+    //    `_election_timer`: 用于发起选举
+    //    `_vote_timer`: 用于选举的投票计时，在该时间内获得足够选票则选举失败
+    //    `_stepdown_timer`: 用于实现 Check Quorum，详见 <3.2 选主优化>
+    //    `_snapshot_timer`: 用于创建快照
     CHECK_EQ(0, _election_timer.init(this, options.election_timeout_ms));
     CHECK_EQ(0, _vote_timer.init(this, options.election_timeout_ms + options.max_clock_drift_ms));
     CHECK_EQ(0, _stepdown_timer.init(this, options.election_timeout_ms));
@@ -232,7 +232,7 @@ int NodeImpl::init(const NodeOptions& options) {
     _leader_lease.init(options.election_timeout_ms);
     _follower_lease.init(options.election_timeout_ms, options.max_clock_drift_ms);
 
-    // (4) 初始化日志存储，若有日志则开始读取 Header 来构建索引
+    // (4) 初始化日志存储，若有日志则开始遍历并读取日志的 Header 来构建索引
     //     详见 <4.3 日志存储>
     // log storage and log manager init
     if (init_log_storage() != 0) {
@@ -285,8 +285,7 @@ int NodeImpl::init(const NodeOptions& options) {
     // (10) 初始化 RaftMetaStorage，若有数据则用来恢复当前节点状态，包括 `currentTerm` 与 `votedFor`
     // init meta and check term
     if (init_meta_storage() != 0) {
-        LOG(ERROR) << "node " << _group_id << ":" << _server_id
-                   << " init_meta_storage failed";
+        ...
         return -1;
     }
 
@@ -319,8 +318,8 @@ int NodeImpl::init(const NodeOptions& options) {
     }
 
     // (14) 若当前节点配置不为空，则：
-    //      * (1) 将自己变为 Follower
-    //      * (2) 启动选举定时器，即 _election_timer
+    //      (1) 将自己变为 Follower
+    //      (2) 启动选举定时器，即 _election_timer
     if (!_conf.empty()) {
         step_down(_current_term, false, butil::Status::OK());
     }
