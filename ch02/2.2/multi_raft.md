@@ -35,7 +35,7 @@ braft 允许一个进程管理多个 Raft Group，每个 Group 在逻辑上和�
 心跳
 --
 
-由于每个 Group 的 Leader 都需要给其 Follower 发送心跳，而心跳间隔一般都都比较小（默认 100 毫秒），所以如果单台机器上运行大量的 Group，会产生大量的心跳请求。
+由于每个 Group 的 Leader 都需要给其 Follower 发送心跳，而心跳间隔一般都比较小（默认为 100 毫秒），所以如果单台机器上运行大量的 Group，会产生大量的心跳请求。
 
 我们计算 3 副本构成的个 Group 在 1 秒内产生的心跳数：
 
@@ -82,7 +82,7 @@ struct PeerId {
 }
 ```
 
-* GroupId: 一个字符串, 表示这个复制组的 `ID`；
+* GroupId: 一个字符串, 表示这个复制组的 `ID`
 * PeerId：结构是一个 [EndPoint][EndPoint]，表示对外服务的端口，外加一个 Index (默认为 0）用于区分同一进程内的不同副本
 
 [EndPoint]: https://github.com/brpc/brpc/blob/master/src/butil/endpoint.h
@@ -95,7 +95,7 @@ TODO:
 添加至 NodeManager
 ---
 
-用户在调用 `Node::init` 初始化节点时，会将该节点加入全局的 NodeManager 中：
+用户在调用 `Node::init` 初始化节点时，会将该节点加入全局的 `NodeManager` 中：
 
 ```cpp
 int Node::init(const NodeOptions& options) {
@@ -112,7 +112,7 @@ int NodeImpl::init(const NodeOptions& options)
     ...
 }
 
-// 将当前节点的 GroupId 和 PeerId 组成的 key 加入到一个 map 中
+// 将当前节点加入到全局的 map 中，key 为 Node 的 <GroupId, PeerId>，value 为 Node
 bool NodeManager::add(NodeImpl* node) {
     // 将 node 将入到 _nodes 的 map 中
 }
