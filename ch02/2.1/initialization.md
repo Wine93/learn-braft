@@ -347,3 +347,8 @@ int NodeImpl::init(const NodeOptions& options) {
     return 0;
 }
 ```
+
+参考
+---
+
+* [braft docs: server](https://github.com/baidu/braft/blob/master/docs/cn/server.md)
