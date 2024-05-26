@@ -11,7 +11,7 @@
     * 4.1 若 `Header` 中的类型显示其为配置，则读取完整日志以获取配置
     * 4.2 构建索引（`logIndex` 到文件 `offset`），便于读取时快速定位
     * 4.3 获得当前节点的 `firstLogIndex` 和 `lastLogIndex`
-    * 4.4 删除 `firstLogIndex` 之前的所有日志（快照遗留）
+    * 4.4 删除 `firstLogIndex` 之前的日志文件（快照遗留）
 5. 加载快照：
     * 5.1 打开本地快照，并返回 `SnapshotReader`
     * 5.2 以 `SnapshotReader` 作为参数回调用户状态机 `on_snapshot_load` 来加载快照
@@ -108,10 +108,10 @@ message LocalSnapshotPbMeta {
 }
 ```
 
-日志回放与快照
+日志回放
 ---
 
-当节点刚启动时，其不会回放日志，因为 `commitIndex` 并没有持久化，所以节点在启动时并不知道自己的 `commitIndex`，也就不知道该 `apply` 哪些日志。只有当集群产生 Leader 后集群中的节点才开始回放日志，Leader 的 `commitIndex` 由其当选 Leader 后，提交一条本任期 `no-op` 日志后确定，其 `commitIndex` 就等于该 `no-op` 日志的 `index`，而 Follower 的 `commitIndex` 由 Leader 在之后的心跳或 `AppendEntries` 请求中告知。
+当节点刚启动时，其不会回放日志，因为 `commitIndex` 并没有持久化，所以节点在启动时并不知道自己的 `commitIndex`，也就不知道该 `apply` 哪些日志。只有当集群产生 Leader 后集群中的节点才开始回放日志，Leader 的 `commitIndex` 由其当选 Leader 后，提交一条本任期 `no-op` 日志后确定，其 `commitIndex` 就等于该 `no-op` 日志的 `index`，而 Follower 的 `commitIndex` 由 Leader 在之后的心跳或 `AppendEntries` 请求中告知，详见 [3.1 选主流程](/ch03/3.1/election.md)。
 
 而对于快照来说，其代表的都是 `applied` 的数据，所以可以安全的加载。
 
@@ -121,9 +121,11 @@ message LocalSnapshotPbMeta {
 节点在启动时，其配置取决如下：
 
 * 优先读取日志中的配置
-* 若当前节点不存在日志，则读取快照元数据中保存的配置
+* 若当前节点不存在日志或日志中没有配置，则读取快照元数据中保存的配置
 * 若当前节点为新节点，既没有日志，也没有快照，则使用用户指定的 `initial_conf`
 * 若用户没有指定配置，则该节点配置为空
+
+从以上流程可以看出，只有当节点以空节点启动时，用户指定的配置才会生效。
 
 <!--
 TODO:
