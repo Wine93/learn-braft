@@ -4,7 +4,7 @@
 考虑到单机的容量有限，一些追求扩展性的系统，往往会将数据进行分片（Sharding），并将分片放置在不同的 Raft Group（复制组） 中，以达到每个分片都高可用的目的。Sharding + Multi-Raft 的架构比 Single-Raft 的架构在以下几个方面更具优势：
 
 * 扩展性：系统可以在需要的时候新增 Raft Group 用来存放分片，并将其运行在不同的磁盘或机器上，这样就具有很好的扩展性，理论上没有容量上限。
-* 性能：由于日志在 Leader 上都是被串行 `Apply`，而 Multi-Raft 提供多个 Leader，可以提升整体的并发；此外，系统可以将 Leader 打散到各个节点，充分利用各机器的资源，提升整体吞吐。
+* 性能：由于日志在 Leader 上都是被串行 apply，而 Multi-Raft 提供多个 Leader，可以提升整体的并发；此外，系统可以将 Leader 打散到各个节点，充分利用各机器的资源，提升整体吞吐。
 
 > **各架构相关系统**
 >
@@ -23,11 +23,11 @@
 braft 中的 Multi-Raft
 ===
 
-braft 允许一个进程管理多个 Raft Group， 多个 Group 在逻辑上和物理上都是完全独立的，其实现如下：
+braft 允许一个进程管理多个 Raft Group，每个 Group 在逻辑上和物理上都是完全独立的，其实现如下：
 
-* 用户创建 `braft::Node` 时需要指定 Node 的 `GroupId` 和 `PeerId`；
-* 在调用 `Node::init` 进行初始化时会将该 `Node` 加到全局的 `NodeManager` 中；
-* 所有的 RPC 请求中都会携带目标 Node 的 `GroupId` 和 `PeerId`；
+* 用户创建 `braft::Node` 时需要指定 Node 的 `GroupId` 和 `PeerId`
+* 在调用 `Node::init` 进行初始化时会将该 `Node` 加到全局的 `NodeManager` 中
+* 所有的 RPC 请求中都会携带目标 Node 的 `GroupId` 和 `PeerId`
 * `NodeManager` 根据请求中的 `GroupId` 和 `PeerId` 找到对应的 Node，然后再调用 Node 的相关方法处理请求。
 
 ![图 2.3  braft Multi-Raft 实现](image/2.3.png)
@@ -61,7 +61,7 @@ Follower 数 * Group 数 * 1 秒内心跳次数
 具体实现
 ===
 
-用户指定节点信息
+用户指定 Node 信息
 ---
 
 ```cpp
@@ -118,7 +118,7 @@ bool NodeManager::add(NodeImpl* node) {
 }
 ```
 
-RPC 指定路由信息
+RPC 指定 Node 信息
 ---
 
 braft 中的 RPC 请求中都会携带目标 Node 的 `GroupId` 和 `PeerId`：
@@ -165,7 +165,7 @@ service RaftService {
 };
 ```
 
-路由请求
+选择对应 Node
 ---
 
 `RaftService` 在收到 RPC 请求后，会让 `NodeManager` 根据请求中的 `GroupId` 和 `PeerId` 找到对应的 Node，然后再调用 Node 的相关方法处理请求：
