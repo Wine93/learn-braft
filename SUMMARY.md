@@ -2,8 +2,8 @@
 
 ## braft 源码解析
 * [1. 简介](ch01/introduction.md)
-* [2. 初始化](ch02/README.md)
-    * [2.1 节点初始化](ch02/2.1/initialization.md)
+* [2. 启动节点](ch02/README.md)
+    * [2.1 启动流程](ch02/2.1/init.md)
     * [2.2 Multi-Raft](ch02/2.2/multi_raft.md)
 * [3. Leader 选举](ch03/README.md)
     * [3.1 选主流程](ch03/3.1/election.md)

@@ -4,8 +4,8 @@
 流程概览
 ---
 
-1. 在初始化节点前，用户需要创建 BRPC Server，并调用 `braft::add_service` 将 Raft 相关的 Service 加入到 BRPC Server 中，以及启动 BRPC Server
-2. 用户创建 `braft::Node`，并调用 `Node::init` 接口进行初始化，此后初始化流程将由 braft 接管
+1. 在启动节点前，用户需要创建 BRPC Server，并调用 `braft::add_service` 将 Raft 相关的 Service 加入到 BRPC Server 中，以及启动 BRPC Server
+2. 用户创建 `braft::Node`，并调用 `Node::init` 启动节点，此后启动流程将由 braft 接管
 3. 启动任务队列 `ApplyTaskQueue`
 4. 遍历一遍日志，读取每条日志的 `Header` (24 字节)：
     * 4.1 若 `Header` 中的类型显示其为配置，则读取完整日志以获取配置
@@ -23,9 +23,9 @@
 8. 启动快照定时器
 9. 将自身角色变为 `Follower`，并启动选举定时器
 10. 将节点加入 Raft Group
-11. 至此，初始化完成，节点将等待选举超时后发起选举
+11. 至此，启动完成，节点将等待选举超时后发起选举
 
-从上述流程可以看出，初始化工作可以大致分为以下 2 类：加载持久化存储来恢复节点状态（步骤 4、5、6、7），以及启动算法（步骤 8、9）。
+从上述流程可以看出，启动工作可以大致分为以下 2 类：加载持久化存储来恢复节点状态（步骤 4、5、6、7），以及启动算法（步骤 8、9）。
 
 ![图 2.1  Raft Node](image/2.1.png)
 
