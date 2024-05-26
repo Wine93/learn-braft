@@ -117,7 +117,7 @@ message LocalSnapshotPbMeta {
 节点配置
 ---
 
-节点在启动时，其配置取决以下：
+节点在启动时，其配置取决如下：
 
 * 优先读取日志中的配置
 * 若当前节点不存在日志，则读取快照元数据中保存的配置
@@ -187,9 +187,6 @@ braft::Node
 ---
 
 此外，用户在启动节点前，需要构建一个 `braft::Node`：
-
-* GroupId：
-*
 
 ```cpp
 Node(const GroupId& group_id, const PeerId& peer_id);
