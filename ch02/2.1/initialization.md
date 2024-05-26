@@ -51,8 +51,8 @@ ApplyTaskQueue
 | `COMMITTED`       | 当已被提交的日志，需被应用到状态机时                                                  | 若日志类型为节点配置，则回调 `on_configuration_committed`，否则回调 `on_apply` |
 | `SNAPSHOT_SAVE`   | 创建快照                                                                              | `on_snapshot_save`                                                             |
 | `SNAPSHOT_LOAD`   | 加载快照                                                                              | `on_snapshot_load`                                                             |
-| `LEADER_STOP`     | 当节点不再是 Leader 时                                                                | `on_leader_stop`                                                               |
 | `LEADER_START`    | 当节点成为 Leader 时                                                                  | `on_leader_start`                                                              |
+| `LEADER_STOP`     | 当节点不再是 Leader 时                                                                | `on_leader_stop`                                                               |
 | `START_FOLLOWING` | 当 Follower 或 Candidate 开始跟随 Leader 时；此时其 `leader_id` 为 Leader 的 `PeerId` | `on_start_following`                                                           |
 | `STOP_FOLLOWING`  | 当节点不再跟随 Leader；此时其 `leader_id` 将变为空                                    | `on_stop_following`                                                            |
 | `ERROR`           | 当节点出现出错，此时任何 `apply` 任务都将失败                                         | `on_error`                                                                     |
@@ -126,6 +126,7 @@ message LocalSnapshotPbMeta {
 * 若用户没有指定配置，则该节点配置为空
 
 <!--
+TODO:
 初始值
 ---
 
@@ -206,7 +207,7 @@ int NodeImpl::init(const NodeOptions& options) {
     ...
     // (1) 初始化以下 4 个定时器（注意：此时并未启动定时器）
     //    `_election_timer`: 用于发起选举
-    //    `_vote_timer`: 用于选举的投票计时，在该时间内获得足够选票则选举失败
+    //    `_vote_timer`: 用于选举的投票计时，在该时间内未获得足够选票则宣告选举失败
     //    `_stepdown_timer`: 用于实现 Check Quorum，详见 <3.2 选主优化>
     //    `_snapshot_timer`: 用于创建快照
     CHECK_EQ(0, _election_timer.init(this, options.election_timeout_ms));
