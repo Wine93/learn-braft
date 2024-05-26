@@ -11,6 +11,7 @@
     * 4.1 若 `Header` 中的类型显示其为配置，则读取完整日志以获取配置
     * 4.2 构建索引（`logIndex` 到文件 `offset`），便于读取时快速定位
     * 4.3 获得当前节点的 `firstLogIndex` 和 `lastLogIndex`
+    * 4.4 删除 `firstLogIndex` 之前的所有日志（快照遗留）
 5. 加载快照：
     * 5.1 打开本地快照，并返回 `SnapshotReader`
     * 5.2 以 `SnapshotReader` 作为参数回调用户状态机 `on_snapshot_load` 来加载快照
@@ -28,14 +29,14 @@
 
 ![图 2.1  Raft Node](image/2.1.png)
 
-RPC Service
+Raft Service
 ---
 
 当用户调用 `braft::add_service` 时，braft 会增加以下 4 个 Raft 相关的 Service 至 BRPC Server：
 
 * `FileService`：用于 Follower 安装快照时，向 Leader 下载快照中的文件。
-* `RaftService`：核心服务，用于处理 Raft 算法，如选举投票、复制日志、安装快照等。
-* `RaftStat`: 可观测性的一部分，用户可通过访问 `http://${your_server_endpoint}/raft_stat` 查看当前这个进程上 Node 的列表，以及每个 Node 的内部状态，详见[查看节点状态][节点状态]。
+* `RaftService`：核心服务，用于处理 Raft 算法，如选举投票、复制日志、下发安装快照指令等。
+* `RaftStat`：可观测性的一部分，用户可通过访问 `http://${your_server_endpoint}/raft_stat` 查看当前这个进程上 Node 的列表，以及每个 Node 的内部状态，详见[查看节点状态][节点状态]。
 * `CliService`：允许用户通过发送 RPC 请求来控制节点，如配置变更、重置节点列表、转移 Leader；当然用户也可以通过 API 来控制节点。
 
 [节点状态]: https://github.com/baidu/braft/blob/master/docs/cn/server.md#%E6%9F%A5%E7%9C%8B%E8%8A%82%E7%82%B9%E7%8A%B6%E6%80%81
@@ -45,16 +46,16 @@ ApplyTaskQueue
 
 这是一个串行执行的任务队列，所有需要回调用户状态机的任务都会进入该队列，并被依次串行回调：
 
-| 任  &nbsp;&nbsp; &nbsp;&nbsp;&nbsp;务 类 型       | 说 明                                                                              | 回调函数                                                                       |
-|:------------------|:-----------------------------------------------------------------------------------|:-------------------------------------------------------------------------------|
-| `COMMITTED`       | 已被提交的日志，需被应用到状态机                                                   | 若日志类型为节点配置，则回调 `on_configuration_committed`，否则回调 `on_apply` |
-| `SNAPSHOT_SAVE`   | 创建快照                                                                           | `on_snapshot_save`                                                             |
-| `SNAPSHOT_LOAD`   | 加载快照                                                                           | `on_snapshot_load`                                                             |
-| `LEADER_STOP`     | Leader 转换为 Follower                                                             | `on_leader_stop`                                                               |
-| `LEADER_START`    | 当节点成为 Leader                                                                  | `on_leader_start`                                                              |
-| `START_FOLLOWING` | 当 Follower 或 Candidate 开始跟随 Leader 时；此时其 `leader_id` 为 Leader `PeerId` | `on_start_following`                                                           |
-| `STOP_FOLLOWING`  | 当节点不再跟随 Leader；此时其 `leader_id` 将变为空                                 | `on_stop_following`                                                            |
-| `ERROR`           | 当节点出现出错，此时任何 `apply` 任务都将失败                                      | `on_error`                                                                     |
+| 任  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;务&nbsp; &nbsp;&nbsp;&nbsp;类&nbsp;&nbsp;&nbsp;&nbsp; 型 | 说 明                                                                                 | 回调函数                                                                       |
+|:-------------------------------------------------------------------------------------------------------------|:--------------------------------------------------------------------------------------|:-------------------------------------------------------------------------------|
+| `COMMITTED`                                                                                                  | 已被提交的日志，需被应用到状态机                                                      | 若日志类型为节点配置，则回调 `on_configuration_committed`，否则回调 `on_apply` |
+| `SNAPSHOT_SAVE`                                                                                              | 创建快照                                                                              | `on_snapshot_save`                                                             |
+| `SNAPSHOT_LOAD`                                                                                              | 加载快照                                                                              | `on_snapshot_load`                                                             |
+| `LEADER_STOP`                                                                                                | 当节点不再是 Leader 时                                                                | `on_leader_stop`                                                               |
+| `LEADER_START`                                                                                               | 当节点成为 Leader 时                                                                  | `on_leader_start`                                                              |
+| `START_FOLLOWING`                                                                                            | 当 Follower 或 Candidate 开始跟随 Leader 时；此时其 `leader_id` 为 Leader 的 `PeerId` | `on_start_following`                                                           |
+| `STOP_FOLLOWING`                                                                                             | 当节点不再跟随 Leader；此时其 `leader_id` 将变为空                                    | `on_stop_following`                                                            |
+| `ERROR`                                                                                                      | 当节点出现出错，此时任何 `apply` 任务都将失败                                         | `on_error`                                                                     |
 
 持久化存储
 ---
@@ -125,19 +126,18 @@ message LocalSnapshotPbMeta {
 * 若用户没有指定配置，则该节点配置为空
 
 <!--
-TODO:
 初始值
 ---
 
-当一个全新的节点启动时，其相关的初始值如下：
+当一个节点启动时，其相关的初始值如下：
 
 * `state`：FOLLOWER
-* `term`：1
+* `currentTerm`：若有持久化，则为；否则为 1
 * `votedFor`: null
-* `FirstLogIndex`：1
-* `LastLogIndex`： 0
-* `CommitIndex`：
-* `ApplyIndex`：快照的 `LastIncludedIndex`
+* `firstLogIndex`：若有快照，则为快照；1
+* `lastLogIndex`： 0
+* `commitIndex`： 0
+* `applyIndex`：若有快照，则为快照元数据中的 `lastIncludedIndex`；否则为 0
 -->
 
 具体实现
