@@ -6,14 +6,14 @@
 
 1. 节点在选举超时时间（`election_timeout_ms`）内未收到任何心跳而触发选举
 2. 向所有节点广播 `PreVote` 请求，若收到大多数赞成票则进行正式选举，否则重新等待选举超时
-3. 将自身角色转变为 `Candidate`, 并将自身 `currentTerm` 加一，向所有节点广播 `RequestVote` 请求
-4. 在投票超时时间（`vote_timeout_ms`）内若收到足够多的选票则成为 `Leader`，若有收到更高 `term` 的响应则转变为  `Follower` 并重复步骤 1；否则等待投票超时后转变为 `Follower` 并重复步骤 2
+3. 将自身角色转变为 Candidate, 并将自身 `term` 加一，向所有节点广播 `RequestVote` 请求
+4. 在投票超时时间（`vote_timeout_ms`）内若收到足够多的选票则成为 Leader，若有收到更高 `term` 的响应则转变为 Follower 并重复步骤 1；否则等待投票超时后转变为 Follower 并重复步骤 2
 5. 成为 Leader
-    * 5.1 将自身角色转变为 `Leader`
-    * 5.2 对所有 `Follower` 定期广播心跳
+    * 5.1 将自身角色转变为 Leader
+    * 5.2 对所有 Follower 定期广播心跳
     * 5.3 通过发送空的 `AppendEntries` 请求来确定各 Follower 的 `nextIndex`
     * 5.4 将之前任期的日志全部复制给 Follower（**只复制不提交，不更新 commitIndex**）
-    * 5.5 通过复制并提交一条本任期的配置日志来提交之前任期的日志，提交后将进行 `apply`
+    * 5.5 通过复制并提交一条本任期的配置日志来提交之前任期的日志，提交后日志就可以 apply了
     * 5.6 调用状态机的 `on_apply` 来回放之前任期的日志，以恢复状态机
     * 5.7 待日志全部回放完了，回调用户状态机的 `on_configuration_committed` 来应用上述配置
     * 5.8 回调用户状态机的 `on_leader_start`
@@ -77,7 +77,7 @@ service RaftService {
 `PreVote` 与 `RequestVote` 的差异：
 
 * 处理 `RequestVote` 请求时会记录 `votedFor`，确保在同一个任期内只会给一个候选人投票；而 `PreVote` 则可以同时投票给多个候选人，只要其满足以上 2 个条件
-* 处理 `RequestVote` 请求时若发现请求中的 `term` 比自身的大，会 `step_down` 成 Follower，而 `PreVote` 则不会，这点可以确保不会在 PreVote 阶段打断当前 Leader
+* 处理 `RequestVote` 请求时若发现请求中的 `term` 比自身的大，会 `step_down` 成 Follower，而 `PreVote` 则不会，这点可以确保不会在 `PreVote` 阶段打断当前 Leader
 
 从以上差异可以看出，`PreVote` 更像是一次预检，检测其连通性和合法性，并没有实际的动作。
 
@@ -90,24 +90,27 @@ service RaftService {
 votedFor
 ---
 
+每个节点都会记录当前 `term` 内投给了谁（即 `votedFor`），如果在相同 `term` 内已经投过票了，其不会再投票给其他人，这是确保在同一任期内只会产生一个 Leader 的关键。
+
+并且 Raft 会将 `term` 与 `votedFor` 进行持久化，防止在投给某一个候选人后节点 Crash，再重新启动后又投给了另一候选人。 在具体实现方面，节点会先持久化 `term` 与 `votedFor`，再向候选人返回同意响应。
+
 幽灵日志
 ---
 
 ![图 3.1  幽灵日志](image/3.1.png)
 
-从上述选举流程可以看出，Leader 并不是通过 `Quorum` 机制来提交之前任期的日志，而是通过提交本任期的一条日志，顺带提交上一任期的日志。这主要是为了解决 Raft 论文在 `5.4 Safety` 一节中提到的幽灵日志问题，因为该问题会破坏系统的线性一致性，正如上图所示：
+上述选举流程中提到，Leader 并不是通过 `Quorum` 机制来提交之前任期的日志，而是通过提交本任期的一条日志，顺带提交上一任期的日志。这主要是为了解决 Raft 论文在 `5.4 Safety` 一节中提到的幽灵日志问题，因为该问题会破坏系统的线性一致性，正如上图所示：
 
-* (a) `S1` 当选 Term 2 的 Leader，并将日志复制给 `S2`，之后 Crash
-* (b) `S5` 被 `S3,S4,S5` 选为 Term 3 的 Leader，在本地写入一条日志后 Crash
-* (c) `S1` 被 `S1,S2,S3` 选为 Term 4 的 Leader，并将 index=2 的日志复制给 `S3`，达到 `Quorum` 并应用到状态机；并在本地写入一条日志，然后 Crash
-* (d1) S5 被 S2,S3,S4,S5 选为 Term 5 的 Leader，并将 Index=2 的日志复制给所有成员，从而覆盖了原来的日志。
+* (a) `S1` 当选 `term 2` 的 Leader，并将日志复制给 `S2`，之后 Crash
+* (b) `S5` 被 `S3,S4,S5` 选为 `term 3` 的 Leader，在本地写入一条日志后 Crash
+* (c) `S1` 被 `S1,S2,S3` 选为 `term 4` 的 Leader，并将 `index=2` 的日志复制给 `S3`，达到 `Quorum` 并应用到状态机；并在本地写入一条日志，然后 Crash
+* (d1) `S5` 被 `S2,S3,S4,S5` 选为 `term 5` 的 Leader，并将 `index=2` 的日志复制给所有成员，从而覆盖了原来的日志。
 
-从上面流程可以看到，在 (c) 中 `Index=2` 即使被提交了，但在 (d1) 中又被覆盖了。如果我们在 `(c)` 时刻去 S1 读取 `x` 的值，将得到 `2`，之后我们又在 `(d)` 时刻去 S5 读 `x` 的值，将得到是 `1`，这明显违背了线性一致性。
+从上面流程可以看到，在 (c) 中 `index=2` 的日志即使被提交了，但在 (d1) 中又被覆盖了。如果我们在 `(c)` 时刻去 Leader `S1` 读取 `x` 的值，将得到 `1`，之后我们又在 `(d)` 时刻去 Leader `S5` 读 `x` 的值，将得到是 `0`，这明显违背了线性一致性。
 
-所以论文里提出不能通过 `Quorum` 机制提交上一任期的日志，而是需要通过提交本任期的一条日志，顺带提交上一任期的日志，正如 `(d2)` 所示。一般 Raft 实现节点当选 Leader 后提交一条本任期的 `no-op` 日志，而 braft 中提交的是配置日志，主要是在实现上和[重置节点列表][]的特性结合到一起了，其起到的作用是一样的，只要是本任期内的接口，详见以下[提交 no-op 日志](#提交-no-op-日志)。
+所以论文里提出不能通过 `Quorum` 机制提交上一任期的日志，而是需要通过提交本任期的一条日志，顺带提交上一任期的日志，正如 `(d2)` 所示。一般 Raft 实现节点当选 Leader 后提交一条本任期的 `no-op` 日志，而 braft 中提交的是配置日志，主要是在实现上和[重置节点列表][]的特性结合到一起了，其起到的作用是一样的，只要是本任期内的接口，具体实现见以下[提交 no-op 日志](#提交-no-op-日志)。
 
 > 特别需要注意的是，以上的读操作是指除 `Raft Log Read` 之外的其他读取方式。
-
 
 相关接口
 ---
@@ -155,7 +158,7 @@ public:
 阶段一：PreVote
 ===
 
-![图 3.1  PreVote 整体实现](image/3.2.png)
+![图 3.1  PreVote 整体流程](image/3.2.png)
 
 触发投票
 ---
@@ -321,15 +324,16 @@ void NodeImpl::handle_pre_vote_response(const PeerId& peer_id, const int64_t ter
 
 ```
 
+<!--
+TODO(Wine93):
 投票失败
 ---
-
-TODO:
+-->
 
 阶段二：RequestVote
 ===
 
-![图 3.2  RequestVote 整体实现](image/3.3.png)
+![图 3.2  RequestVote 整体流程](image/3.3.png)
 
 发送请求
 ---
@@ -544,7 +548,7 @@ void NodeImpl::become_leader() {
     }
 
     // (4) 设置最小可以提交的 logIndex，在这之前的日志就算复制达到了 Quorum，也不会更新 commitIndex
-    //     注意：这是实现不提交上一任期日志的关键
+    //     注意：这是实现只复制但不提交上一任期日志的关键
     // init commit manager
     _ballot_box->reset_pending_index(_log_manager->last_log_index() + 1);
 
@@ -566,144 +570,109 @@ Leader 会为每个 Follower 创建对应 `Replicator`，并将其启动。每�
 
 * 记录 Follower 的一些状态，比如 `nextIndex`、`flyingAppendEntriesSize` 等；
 * 作为 RPC Client，所有从 Leader 发往 Follower 的 RPC 请求都会通过它，包括心跳、`AppendEntriesRequest`、`InstallSnapshotRequest`；
-* 最重要的就是复制日志，`Replicator` 默认在后台等待；当 Leader 通过 `LogManager` 追加日志时，就会唤醒 `Replicator` 进行发送日志，发送完了继续后台等待新日志的到来，整个过来是个流水线式的实现，没有任何阻塞。
+* 最重要的就是复制日志。`Replicator` 默认在后台等待，当 Leader 通过 `LogManager` 追加日志时，就会唤醒 `Replicator` 进行发送日志，发送完了继续后台等待新日志的到来，整个过来是个流水线式的实现，没有任何阻塞。`Replicator` 的目的是同步 Follower 与 Leader 的日志，只要 Follower 还落后于 Leader，其就会一直工作。
+
+调用 `Replicator::start` 来创建 `Replicator`，并将其启动：
 
 ```cpp
 int ReplicatorGroup::add_replicator(const PeerId& peer) {
     ...
-    if (_rmap.find(peer) != _rmap.end()) {
-        return 0;
-    }
-    ...
     if (Replicator::start(options, &rid) != 0) {
         ...
-        return -1;
     }
-    _rmap[peer] = { rid, options.replicator_status };
-    return 0;
+    ...
 }
-```
 
-```cpp
 int Replicator::start(const ReplicatorOptions& options, ReplicatorId *id) {
-    if (options.log_manager == NULL || options.ballot_box == NULL
-            || options.node == NULL) {
-        LOG(ERROR) << "Invalid arguments, group " << options.group_id;
-        return -1;
-    }
+    // (1) 创建 Replicator
     Replicator* r = new Replicator();
+
+    // (2) 初始化与 Follower 的 channel
+    //     注意：这里的 channel 的 timeout_ms 为 -1
     brpc::ChannelOptions channel_opt;
     channel_opt.connect_timeout_ms = FLAGS_raft_rpc_channel_connect_timeout_ms;
     channel_opt.timeout_ms = -1; // We don't need RPC timeout
     if (r->_sending_channel.Init(options.peer_id.addr, &channel_opt) != 0) {
-        LOG(ERROR) << "Fail to init sending channel"
-                   << ", group " << options.group_id;
-        delete r;
+        ...
         return -1;
     }
 
-    // bind lifecycle with node, AddRef
-    // Replicator stop is async
-    options.node->AddRef();
-    options.replicator_status->AddRef();
-    r->_options = options;
+    // (4）初始化 Follower 的 nextIndex，该值将在步骤 7 中将被矫正
     r->_next_index = r->_options.log_manager->last_log_index() + 1;
+
+    // (5) 创建 bthread 运行 Replicator
     if (bthread_id_create(&r->_id, r, _on_error) != 0) {
-        LOG(ERROR) << "Fail to create bthread_id"
-                   << ", group " << options.group_id;
-        delete r;
+        ...
         return -1;
     }
 
-
-    bthread_id_lock(r->_id, NULL);
-    if (id) {
-        *id = r->_id.value;
-    }
-    LOG(INFO) << "Replicator=" << r->_id << "@" << r->_options.peer_id << " is started"
-              << ", group " << r->_options.group_id;
-    r->_catchup_closure = NULL;
-    r->_update_last_rpc_send_timestamp(butil::monotonic_time_ms());
+    // (6) 启动心跳定时器，其会每隔 100 毫秒向 Follower 发送心跳
     r->_start_heartbeat_timer(butil::gettimeofday_us());
-    // Note: r->_id is unlock in _send_empty_entries, don't touch r ever after
+
+    // (7) 向 Follower 发送空的 AppendEntries 请求来确认 nextIndex
     r->_send_empty_entries(false);
     return 0;
 }
 ```
 
-启动心跳定时器
+定时发送心跳
 ---
+
+`Replicator` 调用 `_start_heartbeat_timer` 启动心跳定时器，其每隔一段时间会发送 `ETIMEDOUT` 状态码，而 `Replicator` 收到该状态码后，会调用 `_send_heartbeat` 发送心跳。
+
+调用 `_start_heartbeat_timer` 启动心跳定时器，心跳间隔在节点初始化时通过 `heartbeat_timeout` 函数算得：
 ```cpp
-static inline int heartbeat_timeout(int election_timeout) {
-    if (FLAGS_raft_election_heartbeat_factor <= 0){
-        LOG(WARNING) << "raft_election_heartbeat_factor flag must be greater than 1"
-                     << ", but get "<< FLAGS_raft_election_heartbeat_factor
-                     << ", it will be set to default value 10.";
-        FLAGS_raft_election_heartbeat_factor = 10;
-    }
-    return std::max(election_timeout / FLAGS_raft_election_heartbeat_factor, 10);
-}
-
-void Replicator::_on_timedout(void* arg) {
-    bthread_id_t id = { (uint64_t)arg };
-    bthread_id_error(id, ETIMEDOUT);
-}
-
 void Replicator::_start_heartbeat_timer(long start_time_us) {
     const timespec due_time = butil::milliseconds_from(
             butil::microseconds_to_timespec(start_time_us),
             *_options.dynamic_heartbeat_timeout_ms);
+
+    // 增加 timer，其 handler 为 _on_timedout
     if (bthread_timer_add(&_heartbeat_timer, due_time,
                        _on_timedout, (void*)_id.value) != 0) {
-        _on_timedout((void*)_id.value);
+        ...
     }
 }
 
-void* Replicator::_send_heartbeat(void* arg) {
-    Replicator* r = NULL;
+// 计算心跳间隔，默认为 election_timeout_ms / 10
+static inline int heartbeat_timeout(int election_timeout) {
+    if (FLAGS_raft_election_heartbeat_factor <= 0){
+        ...
+        FLAGS_raft_election_heartbeat_factor = 10;
+    }
+    return std::max(election_timeout / FLAGS_raft_election_heartbeat_factor, 10);
+}
+```
+
+每隔一段时间会向 `Replicator` 发送 `ETIMEDOUT` 状态码：
+```cpp
+void Replicator::_on_timedout(void* arg) {
     bthread_id_t id = { (uint64_t)arg };
-    if (bthread_id_lock(id, (void**)&r) != 0) {
-        // This replicator is stopped
-        return NULL;
-    }
-    // id is unlock in _send_empty_entries;
-    r->_send_empty_entries(true);
-    return NULL;
+    bthread_id_error(id, ETIMEDOUT);
 }
+```
 
+`Replicator` 收到该状态码后，会调用 `_send_heartbeat` 发送心跳：
+
+```cpp
 int Replicator::_on_error(bthread_id_t id, void* arg, int error_code) {
     Replicator* r = (Replicator*)arg;
     if (error_code == ESTOP) {
-        brpc::StartCancel(r->_install_snapshot_in_fly);
-        brpc::StartCancel(r->_heartbeat_in_fly);
-        brpc::StartCancel(r->_timeout_now_in_fly);
-        r->_cancel_append_entries_rpcs();
-        bthread_timer_del(r->_heartbeat_timer);
-        r->_options.log_manager->remove_waiter(r->_wait_id);
-        r->_notify_on_caught_up(error_code, true);
-        r->_wait_id = 0;
-        LOG(INFO) << "Group " << r->_options.group_id
-                  << " Replicator=" << id << " is going to quit";
-        r->_destroy();
-        return 0;
+        ...
     } else if (error_code == ETIMEDOUT) {
-        // This error is issued in the TimerThread, start a new bthread to avoid
-        // blocking the caller.
-        // Unlock id to remove the context-switch out of the critical section
-        CHECK_EQ(0, bthread_id_unlock(id)) << "Fail to unlock" << id;
-        bthread_t tid;
         if (bthread_start_urgent(&tid, NULL, _send_heartbeat,
                                  reinterpret_cast<void*>(id.value)) != 0) {
-            PLOG(ERROR) << "Fail to start bthread";
-            _send_heartbeat(reinterpret_cast<void*>(id.value));
+            ...
         }
         return 0;
-    } else {
-        CHECK(false) << "Group " << r->_options.group_id
-                     << " Unknown error_code=" << error_code;
-        CHECK_EQ(0, bthread_id_unlock(id)) << "Fail to unlock " << id;
-        return -1;
     }
+    ...
+}
+
+void* Replicator::_send_heartbeat(void* arg) {
+    ...
+    r->_send_empty_entries(true);
+    return NULL;
 }
 ```
 
@@ -711,9 +680,9 @@ int Replicator::_on_error(bthread_id_t id, void* arg, int error_code) {
 ---
 
 Leader 通过发送空的 `AppendEntries` 请求来探测 Follower 的 `nextIndex`，
-只有确定了 `nextIndex` 才能正式向 Follower 发送日志。这里忽略了很多细节，关于 `nextIndex` 的作用和匹配算法，以及相关实现可参考 4.1 日志复制相关内容：
+只有确定了 `nextIndex` 才能正式向 Follower 发送日志。这里忽略了很多细节，关于 `nextIndex` 的作用和匹配算法，以及相关实现可参考 [4.1 日志复制](/ch04/4.1/replicate.md)中的相关内容：
 * [nextIndex](/ch04/4.1/replicate.md#nextindex)
-* [确认 nextIndex 的具体实现](/ch04/4.1/replicate.md#前置步骤确定-nextindex)
+* [具体实现](/ch04/4.1/replicate.md#前置步骤确定-nextindex)
 
 ```cpp
 void Replicator::_send_empty_entries(bool is_heartbeat) {
@@ -721,28 +690,29 @@ void Replicator::_send_empty_entries(bool is_heartbeat) {
     // (1) 设置响应回调函数为 _on_rpc_returned
     google::protobuf::Closure* done = brpc::NewCallback(
                 is_heartbeat ? _on_heartbeat_returned : _on_rpc_returned, ...);
-    // (2) 发送空的 AppendEntries 请求
+    ...
+    // (2) 发送空的 AppendEntries 请求用于探测 nextIndex
     RaftService_Stub stub(&_sending_channel);
     stub.append_entries(cntl.release(), request.release(),
                         response.release(), done);
+    ...
 }
-```
 
-```cpp
 void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
                      AppendEntriesRequest* request,
                      AppendEntriesResponse* response,
                      int64_t rpc_send_time) {
     ...
+    // (3) 更新 Follower 的 nextIndex
     r->_next_index = response->last_log_index() + 1;
     ...
 }
 ```
 
-
-
-复制上一任期日志
+复制之前任期日志
 ---
+
+上述我们已经为每一个 Follower 创建了 `Replicator`，并且确认了每个 Follower 的 `nextIndex`，这时候 `Replicator` 通过 `nextIndex` 判断 Follower 日志还落后于 Leader，将自动向 Follower 发送日志，直至与 Leader 对齐位置。
 
 只复制不提交，如果直接提交会出现幽灵日志问题
 
@@ -817,6 +787,8 @@ int BallotBox::commit_at(
 
 提交 no-op 日志
 ---
+
+
 
 ```cpp
 void NodeImpl::ConfigurationCtx::flush(const Configuration& conf,
@@ -918,8 +890,8 @@ int BallotBox::commit_at(
 }
 ```
 
-## 回调 on_apply
-## 回调 on_configuration_committed
+## on_apply
+## on_configuration_committed
 
 所有已经提交的日志都会被 `apply`，如果该日志类型是配置，则回调状态机的 `on_configuration_committed`，否则回调 `on_apply`，这些逻辑都在 `do_committed` 函数中处理。上面我们提到本任期的配置日志是当前 Leader 的最后一条日志，所以会先调用一个或多个 `on_apply`，最后再调用 `on_configuration_committed`。
 
@@ -985,7 +957,7 @@ void FSMCaller::do_committed(int64_t committed_index) {
 }
 ```
 
-回调 on_leader_start
+on_leader_start
 ---
 
 ```cpp

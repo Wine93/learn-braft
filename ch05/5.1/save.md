@@ -196,7 +196,7 @@ void SnapshotExecutor::do_snapshot(Closure* done) {
         // updated. But it's fine since we will do next snapshot saving in a
         // predictable time.
         ...
-        _log_manager->clear_bufferred_logs();  // TODO(@Wine93)
+        _log_manager->clear_bufferred_logs();  // TODO(Wine93)
         ...
         return;
     }

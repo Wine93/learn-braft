@@ -5,7 +5,7 @@ braft 在实现 Leader 选举的时候做了一些优化，这些优化点归纳
 
 * **快速**：减少选举时间，让集群尽快产生 Leader（如[超时时间随机化](#优化-1超时时间随机化)、[Wakeup Candidate](#优化-2wakeup-candidate)）
 * **稳定**：当集群中有 Leader 时，尽可能保持稳定，减少没必要的选主（如 [PreVote](#优化-3prevote)、[Follower Lease](#优化-4follower-lease)）
-* **分区问题**：解决出现分区时造成的各种问题（如 [PreVote](#优化-3prevote)，[Follower Lease](#优化-4follower-lease)，[Check Quorum](#优化-5check-quorum)、[Leader Lease](#优化-6leader-lease)）
+* **分区问题**：解决出现分区时造成的各种问题（如 [PreVote](#优化-3prevote)、[Follower Lease](#优化-4follower-lease)、[Check Quorum](#优化-5check-quorum)、[Leader Lease](#优化-6leader-lease)）
 
 具体来说，braft 对于分区场景做了很详细的优化：
 
