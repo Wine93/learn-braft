@@ -403,31 +403,19 @@ void NodeImpl::request_peers_to_vote(const std::set<PeerId>& peers,
 int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
                                           RequestVoteResponse* response) {
     ...
-
-    bool disrupted = false;
-    int64_t previous_term = _current_term;
-    bool rejected_by_lease = false;
     do {
-        // ignore older term
         // (1) 投票条件 1：候选人的 term 要大于或等于自己的 term
+        // ignore older term
         if (request->term() < _current_term) {
             ...
             break;
         }
 
-        // (2) 投票条件 2：候选人的最后一条日志和自己的一样新或者新于自己
+        // (2) 投票条件 2：候选人的最后一条日志要和自己的一样新或者新于自己
         LogId last_log_id = _log_manager->last_log_id(true);
         ...
         bool log_is_ok = (LogId(request->last_log_index(), request->last_log_term()) >= last_log_id);
-        int64_t votable_time = _follower_lease.votable_time_from_now();
-
-        // if the vote is rejected by lease, tell the candidate
-        if (votable_time > 0) {  // 大于 0 代表还不可以投票，Follower Lease 的特性，详情参见 <3.2 选举优化>，这里可以忽略
-            rejected_by_lease = log_is_ok;
-            break;
-        }
-
-
+        ...
         // (3) 如果发现有比自己 term 大的成员，则调用 step_down：
         //     (1) 转变为 Follower
         //     (2) 设置 _current_term 为 request->term()
@@ -477,7 +465,7 @@ struct OnRequestVoteRPCDone : public google::protobuf::Closure {
 };
 ```
 
-处理响应，如果在处理响应后发现收到的选票数已达到 `Quorum`，则调用 `become_leader` 进行成为 Leader：
+处理响应，如果在处理响应后发现收到的选票数已达到 `Quorum`，则调用 `become_leader` 成为 Leader：
 
 ```cpp
 void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t term,

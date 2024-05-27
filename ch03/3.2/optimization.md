@@ -1,20 +1,20 @@
 概览
 ===
 
-braft 在实现选举的时候做了一些优化，这些优化点归纳起来主要为了实现以下几个目的：
-* **快速**: 减少选举时间，让集群尽快产生 Leader（如选举时间随机化、*Wakeup Candidate*）
-* **稳定**：当集群中有 Leader 时，尽可能保持稳定，减少没必要的选主（如 Pre-Vote、Follower Lease）
-* **分区问题**：解决出现分区时造成的各种问题（e.g. PreVote，Follower Lease，Check Quorum、Leader Lease）
+braft 在实现 Leader 选举的时候做了一些优化，这些优化点归纳起来主要为了实现以下几个目的：
+
+* **快速**：减少选举时间，让集群尽快产生 Leader（如[超时时间随机化](#优化-1超时时间随机化)、[Wakeup Candidate](#优化-2wakeup-candidate)）
+* **稳定**：当集群中有 Leader 时，尽可能保持稳定，减少没必要的选主（如 [PreVote](#优化-3prevote)、[Follower Lease](#优化-4follower-lease)）
+* **分区问题**：解决出现分区时造成的各种问题（如 [PreVote](#优化-3prevote)，[Follower Lease](#优化-4follower-lease)，[Check Quorum](#优化-5check-quorum)、[Leader Lease](#优化-6leader-lease)）
 
 具体来说，braft 对于分区场景做了很详细的优化：
 
-| 分区场景                    | 造成问题                                                                    | 优化方案                                |
-|:----------------------------|:----------------------------------------------------------------------------|:----------------------------------------|
-| Follower 被隔离于对称网络分区   | Term 增加，重新加入集群会打断 Leader，造成没必要的选举                      | [PreVote](#优化-3pre-vote)              |
-| Follower 位于非对称网络分区 | Follower 选举成功，推高集群其他成员的 Term，间接打断 Leader，造成没必要选举 | [Follower Lease](#优化-4follower-lease) |
-| Leader 位于对称网络分区     | 集群会产生多个 Leader，客户端需要重试；可能会产生 `Stale Read`，破坏线性一致性                                                                             | [Check Quorum](#优化-5check-quorum)、[Leader Lease](#优化-6leader-lease)                          |
-| Leader 位于非对称网络分区   | Leader 永远无法写入，也不会产生新 Leader，客户端会不断重试                                                                            | [Check Quorum](#优化-5check-quorum)                          |
-
+| 分区场景                        | 造成问题                                                                       | 优化方案                                                                 |
+|:--------------------------------|:-------------------------------------------------------------------------------|:-------------------------------------------------------------------------|
+| Follower 被隔离于对称网络分区   | `term` 增加，重新加入集群会打断 Leader，造成没必要的选举                       | [PreVote](#优化-3pre-vote)                                               |
+| Follower 被隔离于非对称网络分区 | Follower 选举成功，推高集群其他成员的 `term`，间接打断 Leader，造成没必要选举  | [Follower Lease](#优化-4follower-lease)                                  |
+| Leader 被隔离于对称网络分区     | 集群会产生多个 Leader，客户端需要重试；可能会产生 `Stale Read`，破坏线性一致性 | [Check Quorum](#优化-5check-quorum)、[Leader Lease](#优化-6leader-lease) |
+| Leader 被隔离于非对称网络分区   | Leader 永远无法写入，也不会产生新 Leader，客户端会不断重试                     | [Check Quorum](#优化-5check-quorum)                                      |
 
 优化 1：超时时间随机化
 ===
@@ -22,13 +22,13 @@ braft 在实现选举的时候做了一些优化，这些优化点归纳起来�
 瓜分选票
 ---
 
-如果多个成员在等待 `election_timeout` 后同时触发选举，可能会造成选票被瓜分，导致无法选出 Leader，从而需要触发下一轮选举。为此，可以将 `election_timeout` 随机化，减少选票被瓜分的可能性。但是在极端情况下，多个成员可能拥有相同的 `election_timeout`，仍会造成选票被瓜分，为此 braft 将 `vote_timeout` 也进行了随机化。双层的随机化可以很大程度降低选票被瓜分的可能性。
+如果多个成员在等待 `election_timeout_ms` 后同时触发选举，可能会造成选票被瓜分，导致无法选出 Leader，从而需要触发下一轮选举。为此，可以将 `election_timeout_ms` 随机化，减少选票被瓜分的可能性。但是在极端情况下，多个成员可能拥有相同的 `election_timeout_ms`，仍会造成选票被瓜分，为此 braft 将 `vote_timeout_ms` 也进行了随机化。双层的随机化可以很大程度降低选票被瓜分的可能性。
 
-> **vote_timeout:**
+> **vote_timeout_ms:**
 >
-> 如果成员在该超时时间内没有得到足够多的选票，将变为 Follower 并重新发起选举，无需等待 `election_timeout`
+> 如果成员在该超时时间内没有得到足够多的选票，将变为 Follower 并重新发起选举，无需等待 `election_timeout_ms`
 
-![图 3.5  相同的选举超时时间](image/random_timeout.png)
+![图 3.5  相同的选举超时时间](image/3.5.png)
 
 具体实现
 ---
@@ -45,7 +45,7 @@ inline int random_timeout(int timeout_ms) {
 `ElectionTimer` 相关逻辑:
 
 ```cpp
-// timeout_ms: 1000
+// timeout_ms：1000
 // 产生的随机时间为：[1000,2000]
 int ElectionTimer::adjust_timeout_ms(int timeout_ms) {
     return random_timeout(timeout_ms);
@@ -64,7 +64,7 @@ void NodeImpl::handle_election_timeout() {
 
 `VoteTimer` 相关逻辑:
 ```cpp
-// timeout_ms: 2000
+// timeout_ms：2000
 // 产生的随机时间为：[2000,3000]
 int VoteTimer::adjust_timeout_ms(int timeout_ms) {
     return random_timeout(timeout_ms);
@@ -81,7 +81,7 @@ void NodeImpl::handle_vote_timeout() {
     if (FLAGS_raft_step_down_when_vote_timedout) {  // 默认为 true
         ...
         step_down(_current_term, false, status);  // 先降为 Follower
-        pre_vote(&lck, false);  // 再进行 Pre-Vote
+        pre_vote(&lck, false);  // 再进行 PreVote
     }
     ...
 }
@@ -93,12 +93,12 @@ void NodeImpl::handle_vote_timeout() {
 Leader 正常退出
 ---
 
-当一个 Leader 正常退出时，它会选择一个日志最长的 Follower，向其发送 `TimeoutNowRequest`，而收到该请求的 Follower 无需等待超时，会立马变为 Candidate 进行选举（无需 `Pre-Vote`）。这样可以缩短集群中没有 Leader 的时间，增加系统的可用性。特别地，在日常运维中，升级服务版本需要暂停 Leader 所在服务时，该优化可以在无形中帮助我们。
+当一个 Leader 正常退出时，它会选择一个日志最长的 Follower，向其发送 `TimeoutNow` 请求，而收到该请求的 Follower 无需等待超时，会立马变为 Candidate 进行选举（无需 `PreVote`）。这样可以缩短集群中没有 Leader 的时间，增加系统的可用性。特别地，在日常运维中，升级服务版本需要暂停 Leader 所在服务时，该优化可以在无形中帮助我们。
 
 具体实现
 ---
 
-Leader 服务正常退出：
+Leader 服务正常退出，会向 Follower 发送 `TimeoutNow` 请求：
 
 ```cpp
 void NodeImpl::shutdown(Closure* done) {  // 服务正常退出会调用 shutdown
@@ -110,10 +110,15 @@ void NodeImpl::shutdown(Closure* done) {  // 服务正常退出会调用 shutdow
 void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate,
                          const butil::Status& status) {
     ...
-    // (1) 先转变为 Follower
+    // (1) 调用状态机的 `on_leader_stop`
+    if (_state == STATE_LEADER) {
+        _fsm_caller->on_leader_stop(status);
+    }
+    ...
+    // (2) 转变为 Follower
     _state = STATE_FOLLOWER;
     ...
-    // (2) 再选择一个日志最长的 Follower 作为 Candidate，向其发送 TimeoutNowRequest
+    // (3) 选择一个日志最长的 Follower 作为 Candidate，向其发送 TimeoutNowRequest
     if (wakeup_a_candidate) {
         _replicator_group.stop_all_and_find_the_next_candidate(
                                             &_waking_candidate, _conf);
@@ -124,7 +129,7 @@ void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate,
 }
 ```
 
-Follower 处理 `TimeoutNowRequest`：
+Follower 收到 `TimeoutNow` 请求，会调用 `handle_timeout_now_request` 进行处理：
 
 ```cpp
 void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
@@ -138,24 +143,24 @@ void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
 }
 ```
 
-优化 3：Pre-Vote
+优化 3：PreVote
 ===
 
 对称网络分区
 ---
 
-![图 3.6  Follower 位于对称网路分区](image/pre_vote.png)
+![图 3.6  Follower 被隔离于对称网路分区](image/3.6.png)
 
 我们考虑上图中在网络分区中发生的一种现象：
 
-* **(a)**: 正常的集群：各节点都能收到 Leader 的心跳
-* **(b)**: 发生网络分区后，由于有一个节点收不到 Leader 的心跳，在等待 `election_timeout` 后触发选举，进行选举时会将角色转变为 Candidate，并将自身的 Term 加一广播 `RequestVoteRequest`；然而由于收不到足够的选票，在 `vote_timeout` 后宣布选举失败从而触发新一轮的选举；不断的选举致使该节点的 Term 不断增大
-* **(c)**: 当网络恢复后，Leader 得知该节点的 Term 比其大，将会自动降为 Follower，从而触发了重新选主。值得一提的是，Leader 有多种渠道得知该节点的 Term 比其大，因为节点之间所有的 RPC 请求与响应都会带上自身的 Term，所以可能是该节点选举发出的 `RequestVoteRequest`，也可能是其心跳的响应，这取决于第一个发往 Leader 的 RPC 包。
+* (a)：正常的集群，各节点都能收到 Leader 的心跳；
+* (b)：发生网络分区后，由于被隔离节点收不到 Leader 的心跳，在等待 `election_timeout_ms` 后触发选举，进行选举时会将角色转变为 Candidate，并将自身的 `term` 加一后广播 `RequestVote` 请求；然而由于收不到足够的选票，在 `vote_timeout_ms` 后宣布选举失败从而触发新一轮的选举；不断的选举致使该节点的 `term` 不断增大；
+* (c)：当网络恢复后，Leader 得知该节点的 `term` 比其大，将会自动降为 Follower，从而触发了重新选主。值得一提的是，Leader 有多种渠道得知该节点的 `term` 比其大，因为节点之间所有的 RPC 请求与响应都会带上自身的 `term`，所以可能是该节点选举发出的 `RequestVote` 请求，也可能是其心跳的响应，这取决于第一个发往 Leader 的 RPC 包。
 
-从上面可以看到，当节点重新回归到集群时，由于其 Term 比 Leader 大，致使 Leader 降为 Follower，从而触发重新选主。而本质原因是，一个不可能赢得选举的节点不断增加了 Term，
+从上面可以看到，当节点重新回归到集群时，由于其 `term` 比 Leader 大，致使 Leader 降为 Follower，从而触发重新选主。而本质原因是，一个不可能赢得选举的节点不断增加了 Term，
 其实这次选举时没必要的，
 
-为了解决这一问题，raft 在正式请求投票前引入了 `Pre-Vote` 阶段，Term 不会增加，节点需要在 `Pre-Vote` 获得足够多的选票才能正式进入 `Vote` 阶段。
+为了解决这一问题，Raft 在正式请求投票前引入了 `PreVote` 阶段，Term 不会增加，节点需要在 `Pre-Vote` 获得足够多的选票才能正式进入 `Vote` 阶段。
 e
 节点在收到 *Pre-Vote* 和 *Vote* 请求后，判断是否要投赞成票的逻辑是一样的，需要同时满足以下 2 个条件：
 
@@ -240,7 +245,7 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
 优化 4：Follower Lease
 ===
 
-上面我们提到了 [PreVote 优化](#优化-3pre-vote) 可以阻止在对称网络分区情况下，节点重新加入集群干扰集群的场景，下面会描述在非对称网络下，`PreVote` 无法阻止的一些场景。
+上面我们提到了 [PreVote 优化](#优化-3prevote)可以阻止在对称网络分区情况下，节点重新加入集群干扰集群的场景，下面会描述在非对称网络下，`PreVote` 无法阻止的一些场景。
 
 非对称网络分区
 ---
@@ -257,7 +262,7 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
 Follower Lease
 ---
 
-为了解决这个问题，braft 引入了 Follower Lease 的特性：当 Follower 认为 Leader 还存活的时候，在 `election_timeout_ms` 时间内就不会投票给别的成员。
+为了解决这个问题，braft 引入了 `Follower Lease` 的特性。当 Follower 认为 Leader 还存活的时候，在 `election_timeout_ms` 时间内就不会投票给别的成员。
 Follower 每次收到 Leader 的心跳或 `AppendEntries` 请求就会更新 Lease，该 Lease 有效时间区间如下：
 
 ![图 3.8  Follower Leader 的有效时间区间](image/follower_lease_valid.png)
@@ -397,7 +402,7 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
 
 ![图 3.9  Leader 位于网路分区](image/check_quorum.png)
 
-**场景 (a)：**
+### 场景 (a)：
 
 * 集群出现非对称网络分区：Leader 可以向 Follower 发送请求，但是却接受不到 Follower 的响应；
 * Follower 可以一直接收到心跳，所以不会发起选举；
@@ -406,7 +411,7 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
 
 从上面可以看出，这种场景下，集群将永远无法写入数据，这是比较危险的。
 
-**场景 (b)：**
+### 场景 (b)：
 
 * S1 为 Term 1 的 Leader，S2, S3 为 Follower；
 * 集群出现对称网络分区，Leader 与 Follower 之间的网络不通；
@@ -418,7 +423,7 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
 Check Quorum
 ---
 
-为了解决上述的提到的问题，Raft 引入了 Check Quorum 的机制，当节点成为 Leader 后，每隔 `election_timeout_ms` 时间内检查 Follower 的存活情况，如果发现少于 `Qroum` 节点存活，Leader 将主动降为 Follower。
+为了解决上述的提到的问题，Raft 引入了 `Check Quorum` 的机制，当节点成为 Leader 后，每隔 `election_timeout_ms` 时间内检查 Follower 的存活情况，如果发现少于 `Quorum` 节点存活，Leader 将主动降为 Follower。
 
 具体实现
 ---
@@ -528,8 +533,8 @@ void Replicator::_on_heartbeat_returned(
 
 我们考虑上图所示的场景：
 
-* S1 被 S2,S3 选为 Term 1 的 Leader
-* 由于集群发生网络分区，S3 收不到 S1 的心跳，发起选举，被 S2,S3 选为 Term 2 的 Leader
+* `S1` 被 `S2`,`S3` 选为 `term 1` 的 `Leader`
+* 由于集群发生网络分区，`S3` 收不到 `S1` 的心跳，发起选举，被 S2,S3 选为 Term 2 的 Leader
 * 此时 Client 1 往 S3 写入数据（x=1），并返回成功
 * 在此之后，Client 2 从 S1 读取 x 的值，将得到 0
 
@@ -677,6 +682,7 @@ int64_t NodeImpl::last_leader_active_timestamp(const Configuration& conf) {
 ```
 
 <!---
+TODO：
 其他: 未实现优化点
 ===
 

@@ -11,10 +11,10 @@ Witness
 
 `Witness` 具有以下特征：
 
-* 参与选举投票，但不能成为 Leader
+* 参与选举投票，但不能成为 Leader（有些实现允许其短暂成为 Leader，再转移给其他节点）
 * 参与日志投票，但不存储日志，不安装快照
 
-详见 [Witness](https://github.com/baidu/braft/blob/master/docs/cn/witness.md)。
+更多介绍详见 [braft 文档](https://github.com/baidu/braft/blob/master/docs/cn/witness.md)。
 
 应用场景
 ---
