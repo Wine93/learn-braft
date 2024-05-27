@@ -104,11 +104,11 @@ votedFor
 * (a) `S1` 当选 `term 2` 的 Leader，并将日志复制给 `S2`，之后 Crash
 * (b) `S5` 被 `S3,S4,S5` 选为 `term 3` 的 Leader，在本地写入一条日志后 Crash
 * (c) `S1` 被 `S1,S2,S3` 选为 `term 4` 的 Leader，并将 `index=2` 的日志复制给 `S3`，达到 `Quorum` 并应用到状态机；在本地写入一条日志，然后 Crash
-* (d1) `S5` 被 `S2,S3,S4,S5` 选为 `term 5` 的 Leader，并将 `index=2` 的日志复制给所有成员，从而覆盖了原来的日志。
+* (d1) `S5` 被 `S2,S3,S4,S5` 选为 `term 5` 的 Leader，并将 `index=2` 的日志复制给所有节点，从而覆盖了原来的日志。
 
 从上面流程可以看到，在 `(c)` 时刻 `index=2` 的日志即使被提交了，但在 `(d1)` 时又被覆盖了。如果我们在 `(c)` 时刻去 Leader `S1` 读取 `x` 的值，得到的将是 `1`，之后我们又在 `(d1)` 时刻去 Leader `S5` 读取 `x` 的值，得到的将是 `0`，这明显违背了线性一致性。
 
-所以论文里提出不能通过 `Quorum` 机制提交之前任期的日志，而是需要通过提交本任期的一条日志，顺带提交上一任期的日志，正如 `(d2)` 所示。一般 Raft 实现会在节点当选 Leader 后提交一条本任期的 `no-op` 日志，而 braft 中提交的是本任期的配置日志，这主要是在实现上和[节点配置变更](/ch06/)的特性结合到一起了，但其起到的作用是一样的，只要是本任期内的日志都能解决幽灵日志问题，具体实现见以下[提交 no-op 日志](/ch03/3.1/election.md#提交-no-op-日志)。
+所以论文里提出不能通过 `Quorum` 机制提交之前任期的日志，而是需要通过提交本任期的一条日志，顺带提交上一任期的日志，正如 `(d2)` 所示。一般 Raft 实现会在节点当选 Leader 后提交一条本任期的 `no-op` 日志，而 braft 中提交的是本任期的配置日志，这主要是在实现上和[节点配置变更](/ch06/)的特性结合到一起了，但其起到的作用是一样的，只要是本任期内的日志都能解决幽灵日志问题，具体实现见以下[提交 no-op 日志](#ti-jiao-noop-ri-zhi)。
 
 > 特别需要注意的是，以上的读操作是指除 `Raft Log Read` 之外的其他读取方式，因为对于 `Raft Log Read` 来说，其读操作就是一条本任期的日志。
 
@@ -163,7 +163,7 @@ public:
 触发投票
 ---
 
-节点在初始化就会启动选举定时器：
+节点在启动时就会启动选举定时器：
 
 ```cpp
 int NodeImpl::init(const NodeOptions& options) {
@@ -182,7 +182,7 @@ void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate,
 }
 ```
 
-待定时器超时后就会调用 `pre_vote` 进行预投票：
+待定时器超时后就会调用 `pre_vote` 进行 `PreVote`：
 
 ```cpp
 // 定时器超时的 handler
@@ -202,22 +202,23 @@ void NodeImpl::handle_election_timeout() {
 发送请求
 ---
 
-在 `pre_vote` 函数中会对所有节点发送 `PreVote` 请求，并设置 RPC 响应的回调函数为 `OnPreVoteRPCDone`，最后调用 `grant_slef` 给自己投一票后，等待其他节点的 `PreVote` 响应：
+在 `pre_vote` 函数中会向所有节点发送 `PreVote` 请求，并设置 RPC 响应的回调函数为 `OnPreVoteRPCDone`，最后调用 `grant_slef` 给自己投一票后，就等待其他节点的 `PreVote` 响应：
 
 ```cpp
 void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
-
+    ...
+    // (1) 获取节点的 lastLog
     const LogId last_log_id = _log_manager->last_log_id(true);
 
     _pre_vote_ctx.init(this, triggered);
     std::set<PeerId> peers;
     _conf.list_peers(&peers);
 
-    // (1) 对组内所有节点发送 `PreVote` 请求
+    // (2) 向组内所有节点发送 `PreVote` 请求
     for (std::set<PeerId>::const_iterator
             iter = peers.begin(); iter != peers.end(); ++iter) {
         ...
-        // (2) 设置回调函数
+        // (3) 设置回调函数
         OnPreVoteRPCDone* done = new OnPreVoteRPCDone(
                 *iter, _current_term, _pre_vote_ctx.version(), this);
         ...
@@ -228,7 +229,7 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
         RaftService_Stub stub(&channel);
         stub.pre_vote(&done->cntl, &done->request, &done->response, done);
     }
-    // (3) 给自己投一票
+    // (4) 给自己投一票
     grant_self(&_pre_vote_ctx, lck);
 }
 ```
@@ -297,7 +298,7 @@ void NodeImpl::handle_pre_vote_response(const PeerId& peer_id, const int64_t ter
                                         const int64_t ctx_version,
                                         const RequestVoteResponse& response) {
     ...
-    // (1) 若发现有成员 term 比自己高，直接 step_down 成 Follower
+    // (1) 若发现有节点 term 比自己高，直接 step_down 成 Follower
     // check response term
     if (response.term() > _current_term) {
         ...
@@ -338,7 +339,7 @@ TODO(Wine93):
 发送请求
 ---
 
-当 PreVote 阶段获得大多数节点的支持后，将调用 `elect_self` 正式进 `RequestVote` 阶段。在 `elect_self` 会将角色转变为 Candidte，并加自身的 `term` 加一，向所有的节点发送 `RequestVote` 请求，最后给自己投一票后，等待其他节点的 `RequestVote` 响应：
+当 `PreVote` 阶段获得大多数节点的支持后，将调用 `elect_self` 正式进 `RequestVote` 阶段。在 `elect_self` 会将角色转变为 Candidte，并加自身的 `term` 加一，向所有的节点发送 `RequestVote` 请求，最后给自己投一票后，就等待其他节点的 `RequestVote` 响应：
 
 ```cpp
 void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
@@ -350,7 +351,7 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
     _voted_id = _server_id;    // (3) 记录 votedFor 投给自己
 
     ...
-    // (4) 启动投票超时器：如果在 vote_timeout 未得到足够多的选票，则变为 Follower 重新进行 PreVote
+    // (4) 启动投票超时器：如果在 vote_timeout_ms 未得到足够多的选票，则变为 Follower 重新进行 PreVote
     _vote_timer.start();
 
     // (5) 获取 LastLog 的 index 和 term（LogId 由 index 和 term 组成）
@@ -358,7 +359,7 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
     ...
     _vote_ctx.set_last_log_id(last_log_id);
 
-    // (6) 向所有成员广播 `RequestVote` 请求
+    // (6) 向所有节点广播 `RequestVote` 请求
     std::set<PeerId> peers;
     _conf.list_peers(&peers);
     request_peers_to_vote(peers, _vote_ctx.disrupted_leader());
@@ -372,12 +373,12 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
 }
 ```
 
-`request_peers_to_vote` 负责向所有成员发送 `RequestVote` 请求：
+`request_peers_to_vote` 负责向所有节点发送 `RequestVote` 请求：
 
 ```cpp
 void NodeImpl::request_peers_to_vote(const std::set<PeerId>& peers,
                                      const DisruptedLeader& disrupted_leader) {
-    // (1) 遍历所有成员，向其发送 `RequestVote` 请求
+    // (1) 遍历所有节点，向其发送 `RequestVote` 请求
     for (std::set<PeerId>::const_iterator
         iter = peers.begin(); iter != peers.end(); ++iter) {
         ...
@@ -420,7 +421,7 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
         ...
         bool log_is_ok = (LogId(request->last_log_index(), request->last_log_term()) >= last_log_id);
         ...
-        // (3) 如果发现有比自己 term 大的成员，则调用 step_down：
+        // (3) 如果发现有比自己 term 大的节点，则调用 step_down：
         //     (1) 转变为 Follower
         //     (2) 设置 _current_term 为 request->term()
         //     (3) 重置 votedFor 为空
@@ -430,7 +431,7 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
             step_down(request->term(), false, status);
         }
 
-        // (4) 投票条件 3：当前 term 没有给其他成员投过票
+        // (4) 投票条件 3：当前 term 没有给其他节点投过票
         if (log_is_ok && _voted_id.is_empty()) {
             ...
             step_down(request->term(), false, status);
@@ -476,7 +477,7 @@ void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t
                                             const int64_t ctx_version,
                                             const RequestVoteResponse& response) {
     ...
-    // (1) 发现有比自己 Term 高的节点，则 step_down 成 Follower
+    // (1) 发现有比自己 term 高的节点，则 step_down 成 Follower
     if (response.term() > _current_term) {
         ...
         step_down(response.term(), false, status);
