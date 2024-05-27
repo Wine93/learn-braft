@@ -13,14 +13,15 @@
     * 5.2 对所有 `Follower` 定期广播心跳
     * 5.3 通过发送空的 `AppendEntries` 请求来确定各 Follower 的 `nextIndex`
     * 5.4 将之前任期的日志全部复制给 Follower（**只复制不提交，不更新 commitIndex**）
-    * 5.5 通过复制并提交一条本任期的配置日志来提交之前任期的日志，并回放（`on_apply`）这些日志来恢复状态机
-    * 5.6 待日志全部回放完了，回调用户状态机的 `on_configuration_committed` 来应用上述配置
-    * 5.7 回调用户状态机的 `on_leader_start`
+    * 5.5 通过复制并提交一条本任期的配置日志来提交之前任期的日志，提交后将进行 `apply`
+    * 5.6 调用状态机的 `on_apply` 来回放之前任期的日志，以恢复状态机
+    * 5.7 待日志全部回放完了，回调用户状态机的 `on_configuration_committed` 来应用上述配置
+    * 5.8 回调用户状态机的 `on_leader_start`
 6. 至此，Leader 可以正式对外服务
 
 上述流程可分为 PreVote (1-2)、RequestVote (3-4)、成为 Leader（5-6）这三个阶段
 
-<
+<!---
 流程注解
 ---
 
@@ -32,6 +33,7 @@
 * 5.5 braft 中成为 Leader 后提交本任期内的第一条日志是配置日志，并非 `no-op`
 * 5.5 `CommitIndex` 并不会持久化，Leader 只有提交了配置日志才能确认，Follower 则在之后的心跳中由 Leader 传递，只有确认了 `CommitIndex` 后才能开始回放日志
 * 5.5 日志复制，这样确保了在调用 `on_leader_start` 前，上一任期的所有日志都已经回调 `on_apply`
+-->
 
 投票规则
 ---
@@ -197,7 +199,7 @@ void NodeImpl::handle_election_timeout() {
 发送请求
 ---
 
-在 `pre_vote` 函数中会对所有节点发送 `PreVote` 请求，并设置 RPC 响应的回调函数为 `OnPreVoteRPCDone`， 最后调用 `grant_slef` 给自己投一票，之后等待投票结果返回：
+在 `pre_vote` 函数中会对所有节点发送 `PreVote` 请求，并设置 RPC 响应的回调函数为 `OnPreVoteRPCDone`，最后调用 `grant_slef` 给自己投一票后，等待其他节点的 `PreVote` 响应：
 
 ```cpp
 void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
@@ -269,7 +271,7 @@ int NodeImpl::handle_pre_vote_request(const RequestVoteRequest* request,
 处理响应
 ---
 
-在收到其他节点的 `PreVote` 响应后，会回调之前设置的回调函数 `OnPreVoteRPCDone->Run()`，在 callback 中会调用 `handle_pre_vote_response` 处理 `PreVote` 响应：
+在收到其他节点的 `PreVote` 响应后，会调用之前设置的回调函数 `OnPreVoteRPCDone->Run()`，在回调函数中会调用 `handle_pre_vote_response` 处理 `PreVote` 响应：
 
 ```cpp
 struct OnPreVoteRPCDone : public google::protobuf::Closure {
@@ -285,35 +287,44 @@ struct OnPreVoteRPCDone : public google::protobuf::Closure {
 };
 ```
 
-处理 `PreVote` 响应：
+处理响应，如果在处理响应后发现收到的选票数已达到 `Quorum`，则调用 `elect_self` 进行正式选举：
+
 ```cpp
+void NodeImpl::handle_pre_vote_response(const PeerId& peer_id, const int64_t term,
+                                        const int64_t ctx_version,
+                                        const RequestVoteResponse& response) {
+    ...
+    // (1) 若发现有成员 term 比自己高，直接 step_down 成 Follower
+    // check response term
+    if (response.term() > _current_term) {
+        ...
+        butil::Status status;
+        status.set_error(EHIGHERTERMRESPONSE, "Raft node receives higher term "
+                "pre_vote_response.");
+        step_down(response.term(), false, status);
+        return;
+    }
+
+    // (2) 收到拒绝投票
+    if (!response.granted() && !response.rejected_by_lease()) {
+        return;
+    }
+    ...
+    // (3) 增加一个选票
+    _pre_vote_ctx.grant(*it);
+    ...
+    // (4) 如果收到的选票数达到 `Quorum`，则调用 `elect_self` 进行正式选举
+    if (_pre_vote_ctx.granted()) {
+        elect_self(&lck);
+    }
+}
 
 ```
 
 投票失败
 ---
 
-```cpp
-void VoteTimer::run() {
-    _node->handle_vote_timeout();
-}
-
-int VoteTimer::adjust_timeout_ms(int timeout_ms) {
-    return random_timeout(timeout_ms);
-}
-```
-
-```cpp
-void NodeImpl::handle_vote_timeout() {
-    ...
-    butil::Status status;
-    status.set_error(ERAFTTIMEDOUT, "Fail to get quorum vote-granted");
-    step_down(_current_term, false, status);
-    pre_vote(&lck, false);
-    ...
-}
-```
-
+TODO:
 
 阶段二：RequestVote
 ===
@@ -323,49 +334,60 @@ void NodeImpl::handle_vote_timeout() {
 发送请求
 ---
 
-当 PreVote 阶段获得大多数节点的支持后，将调用 `elect_self` 正式进 *RequestVote* 阶段。在 `elect_self` 会将角色转变为 Candidte，并加自身的 Term + 1，向所有的节点发送 `RequestVote` 请求，最后给自己投一票后，等待其他节点的 `RequestVote` 响应：
+当 PreVote 阶段获得大多数节点的支持后，将调用 `elect_self` 正式进 `RequestVote` 阶段。在 `elect_self` 会将角色转变为 Candidte，并加自身的 `term` 加一，向所有的节点发送 `RequestVote` 请求，最后给自己投一票后，等待其他节点的 `RequestVote` 响应：
 
 ```cpp
 void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
                           bool old_leader_stepped_down) {
     ...
 
-    _state = STATE_CANDIDATE;  //
-    _current_term++;           // 将自身的 Term+1
-    _voted_id = _server_id;    // 记录 votedFor 投给自己
+    _state = STATE_CANDIDATE;  // (1) 将自身角色转变为 Candidate
+    _current_term++;           // (2) 将自身的 term+1
+    _voted_id = _server_id;    // (3) 记录 votedFor 投给自己
 
     ...
-    // 启动投票超时器：如果在 vote_timeout 未得到足够多的选票，则变为 Follower 重新进行 PreVote
+    // (4) 启动投票超时器：如果在 vote_timeout 未得到足够多的选票，则变为 Follower 重新进行 PreVote
     _vote_timer.start();
 
+    // (5) 获取 LastLog 的 index 和 term（LogId 由 index 和 term 组成）
     const LogId last_log_id = _log_manager->last_log_id(true);
-
+    ...
     _vote_ctx.set_last_log_id(last_log_id);
 
+    // (6) 向所有成员广播 `RequestVote` 请求
     std::set<PeerId> peers;
     _conf.list_peers(&peers);
     request_peers_to_vote(peers, _vote_ctx.disrupted_leader());
 
-    // 持久化 votedFor
+    // (7) 持久化 currentTerm，votedFor
     status = _meta_storage->
                     set_term_and_votedfor(_current_term, _server_id, _v_group_id);
+
+    // (8) 给自己投一票
     grant_self(&_vote_ctx, lck);
 }
 ```
 
+`request_peers_to_vote` 负责向所有成员发送 `RequestVote` 请求：
+
 ```cpp
 void NodeImpl::request_peers_to_vote(const std::set<PeerId>& peers,
                                      const DisruptedLeader& disrupted_leader) {
+    // (1) 遍历所有成员，向其发送 `RequestVote` 请求
     for (std::set<PeerId>::const_iterator
         iter = peers.begin(); iter != peers.end(); ++iter) {
         ...
+
+        // (2) 准备响应回调函数
         OnRequestVoteRPCDone* done =
             new OnRequestVoteRPCDone(*iter, _current_term, _vote_ctx.version(), this);
         ...
+        // (3) 设置请求
         done->request.set_term(_current_term);
         done->request.set_last_log_index(_vote_ctx.last_log_id().index);
         done->request.set_last_log_term(_vote_ctx.last_log_id().term);
 
+        // (4) 正式发送 RPC
         RaftService_Stub stub(&channel);
         stub.request_vote(&done->cntl, &done->request, &done->response, done);
     }
@@ -375,81 +397,71 @@ void NodeImpl::request_peers_to_vote(const std::set<PeerId>& peers,
 处理请求
 ---
 
-节点在收到 `RequestVote` 请求后，会调用 `handle_request_vote_request`
+节点在收到 `RequestVote` 请求后，会调用 `handle_request_vote_request` 处理 `RequestVote` 请求：
 
 ```cpp
 int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
                                           RequestVoteResponse* response) {
     ...
-    PeerId disrupted_leader_id;
-    if (_state == STATE_FOLLOWER &&
-            request->has_disrupted_leader() &&
-            _current_term == request->disrupted_leader().term() &&
-            0 == disrupted_leader_id.parse(request->disrupted_leader().peer_id()) &&
-            _leader_id == disrupted_leader_id) {
-        // The candidate has already disrupted the old leader, we
-        // can expire the lease safely.
-        _follower_lease.expire();
-    }
 
     bool disrupted = false;
     int64_t previous_term = _current_term;
     bool rejected_by_lease = false;
     do {
         // ignore older term
+        // (1) 投票条件 1：候选人的 term 要大于或等于自己的 term
         if (request->term() < _current_term) {
-            // ignore older term
-            LOG(INFO) << "node " << _group_id << ":" << _server_id
-                      << " ignore RequestVote from " << request->server_id()
-                      << " in term " << request->term()
-                      << " current_term " << _current_term;
+            ...
             break;
         }
 
-        // get last_log_id outof node mutex
-        lck.unlock();
+        // (2) 投票条件 2：候选人的最后一条日志和自己的一样新或者新于自己
         LogId last_log_id = _log_manager->last_log_id(true);
-        lck.lock();
-
-
-        bool log_is_ok = (LogId(request->last_log_index(), request->last_log_term())
-                          >= last_log_id);
+        ...
+        bool log_is_ok = (LogId(request->last_log_index(), request->last_log_term()) >= last_log_id);
         int64_t votable_time = _follower_lease.votable_time_from_now();
 
-
-
         // if the vote is rejected by lease, tell the candidate
-        if (votable_time > 0) {  // 大于 0 代表还不可以投票
+        if (votable_time > 0) {  // 大于 0 代表还不可以投票，Follower Lease 的特性，详情参见 <3.2 选举优化>，这里可以忽略
             rejected_by_lease = log_is_ok;
             break;
         }
 
+
+        // (3) 如果发现有比自己 term 大的成员，则调用 step_down：
+        //     (1) 转变为 Follower
+        //     (2) 设置 _current_term 为 request->term()
+        //     (3) 重置 votedFor 为空
         // increase current term, change state to follower
         if (request->term() > _current_term) {
             ...
             step_down(request->term(), false, status);
         }
 
+        // (4) 投票条件 3：当前 term 没有给其他成员投过票
         if (log_is_ok && _voted_id.is_empty()) {
             ...
             step_down(request->term(), false, status);
             _voted_id = candidate_id;  // 记录 votedFor
-            status = _meta_storage->
+            status = _meta_storage->   // 持久化 currentTerm 和 votedFor
                     set_term_and_votedfor(_current_term, candidate_id, _v_group_id);
         }
     } while (0);
 
-    response->set_disrupted(disrupted);
-    response->set_previous_term(previous_term);
+    // (5) 设置响应
+    ...
     response->set_term(_current_term);
     response->set_granted(request->term() == _current_term && _voted_id == candidate_id);
-    response->set_rejected_by_lease(rejected_by_lease);
+    ...
+
     return 0;
 }
 ```
 
 处理响应
 ---
+
+候选人在收到其他节点的 `RequestVote` 响应后，会调用之前设置的回调函数 `OnRequestVoteRPCDone->Run()`，在回调函数中会调用 `handle_request_vote_response` 处理 `RequestVote` 响应：
 
 ```cpp
 struct OnRequestVoteRPCDone : public google::protobuf::Closure {
@@ -465,6 +477,8 @@ struct OnRequestVoteRPCDone : public google::protobuf::Closure {
 };
 ```
 
+处理响应，如果在处理响应后发现收到的选票数已达到 `Quorum`，则调用 `become_leader` 进行成为 Leader：
+
 ```cpp
 void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t term,
                                             const int64_t ctx_version,
@@ -477,32 +491,28 @@ void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t
         return;
     }
     ...
-    //
+    // (2) 收到拒绝投票
     if (!response.granted() && !response.rejected_by_lease()) {
         return;
     }
 
     if (response.granted()) {
+        // (3) 增加一个选票
         _vote_ctx.grant(peer_id);
-        if (peer_id == _follower_lease.last_leader()) {
-            _vote_ctx.grant(_server_id);
-            _vote_ctx.stop_grant_self_timer(this);
-        }
+        ...
+        // (4) 如果收到的选票数达到 `Quorum`，则调用 `become_leader` 正式成为 Leader
         if (_vote_ctx.granted()) {
             return become_leader();
         }
-    } else {
-        // If the follower rejected the vote because of lease, reserve it, and
-        // the candidate will try again after it disrupt the old leader.
-        _vote_ctx.reserve(peer_id);
     }
-    retry_vote_on_reserved_peers();  // 这个有啥作用?
+    ...
 }
 ```
 
-
 投票超时
 ---
+
+`VoteTimer` 在节点开始正式投票（即调用 `elect_self`）就开始计时了。若在投票超时时间内未收到足够多的选票，`VoteTimer` 就会调用 `handle_vote_timeout` 将当前节点 `step_down` 并进行重新 PreVote；反之在收到足够多选票成为 Leader 后将会停止该 Timer：
 
 ```cpp
 void VoteTimer::run() {
@@ -520,23 +530,23 @@ void NodeImpl::handle_vote_timeout() {
 阶段三：成为 Leader
 ===
 
-![图 3.3  become_leader 整体实现](image/become_leader.svg)
+![图 3.3  become_leader 整体实现](image/3.4.png)
+
+## 成为 Leader
+
+节点在 `RequestVote` 阶段收到足够多的选票后，会调用 `become_leader` 正式成为 Leader，在该函数中主要执行成为 Leader 前的准备工作，特别需要注意的是，只有当这些工作全部完成后才会回调用户状态机的 `on_leader_start`，每一项工作将在下面的小节中逐一介绍：
 
 ```cpp
 // in lock
 void NodeImpl::become_leader() {
     ...
     // cancel candidate vote timer
-    _vote_timer.stop();
-    _vote_ctx.reset(this);
-
-    _state = STATE_LEADER;
-    _leader_id = _server_id;
-
-    _replicator_group.reset_term(_current_term);
-    _follower_lease.reset();
-    _leader_lease.on_leader_start(_current_term);
-
+    _vote_timer.stop();  // (1) 停止投票计时器
+    ...
+    _state = STATE_LEADER;  // (2) 将自身角色转变为 Leader
+    _leader_id = _server_id;  // (3) 记录当前 leaderId 为自身的 PeerId
+    ...
+    // (3) 为所有 Follower 创建 Replicator，Replicator 主要负责向 Follower 发送心跳、日志等
     std::set<PeerId> peers;
     _conf.list_peers(&peers);
     for (std::set<PeerId>::const_iterator
@@ -545,14 +555,18 @@ void NodeImpl::become_leader() {
         _replicator_group.add_replicator(*iter);
     }
 
+    // (4) 设置最小可以提交的 logIndex，在这之前的日志就算复制达到了 Quorum，也不会更新 commitIndex
+    //     注意：这是实现不提交上一任期日志的关键
     // init commit manager
-    // 设置最小可以提交的 LogIndex：这是实现不提交上一任期日志的关键，详见一下 [复制日志] 小节
     _ballot_box->reset_pending_index(_log_manager->last_log_index() + 1);
 
     // Register _conf_ctx to reject configuration changing before the first log
     // is committed.
-    CHECK(!_conf_ctx.is_busy());
+    // (5)
     _conf_ctx.flush(_conf.conf, _conf.old_conf);
+
+    // (6) 启动 StepdownTimer，用于实现 Check Quorum 优化
+    //     详见 <3.2 选举优化> 小节
     _stepdown_timer.start();
 }
 ```
@@ -560,26 +574,21 @@ void NodeImpl::become_leader() {
 创建 Replicator
 ---
 
-节点在成为 Leader 后会为每个 Follower 创建对应 `Replicator`，每个 `Replicator` 都是单独的 `bthread`，它主要有以下 3 个作用：
+Leader 会为每个 Follower 创建对应 `Replicator`，并将其启动。每个 `Replicator` 都是单独的 `bthread`，它主要有以下 3 个作用：
 
-* 记录 Follower 的一些状态，包括 `next_index`
-* 作为 RPC Client，所有从 Leader 发往 Follower 的 RPC 请求都会通过它，包括心跳、`AppendEntriesRequest`、`InstallSnapshotRequest`
-* 最重要的就是复制日志，Replicator 默认在后台等待；当 Leader 通过 `LogManager` 追加日志时，就会唤醒 Replicator 进行发送日志，发送完了继续后台等待新日志的到来，整个过来是个流水线式的实现，没有任何阻塞。
+* 记录 Follower 的一些状态，比如 `nextIndex`、`flyingAppendEntriesSize` 等；
+* 作为 RPC Client，所有从 Leader 发往 Follower 的 RPC 请求都会通过它，包括心跳、`AppendEntriesRequest`、`InstallSnapshotRequest`；
+* 最重要的就是复制日志，`Replicator` 默认在后台等待；当 Leader 通过 `LogManager` 追加日志时，就会唤醒 `Replicator` 进行发送日志，发送完了继续后台等待新日志的到来，整个过来是个流水线式的实现，没有任何阻塞。
 
 ```cpp
 int ReplicatorGroup::add_replicator(const PeerId& peer) {
-    CHECK_NE(0, _common_options.term);
+    ...
     if (_rmap.find(peer) != _rmap.end()) {
         return 0;
     }
-    ReplicatorOptions options = _common_options;
-    options.peer_id = peer;
-    options.replicator_status = new ReplicatorStatus;
-    ReplicatorId rid;
+    ...
     if (Replicator::start(options, &rid) != 0) {
-        LOG(ERROR) << "Group " << options.group_id
-                   << " Fail to start replicator to peer=" << peer;
-        delete options.replicator_status;
+        ...
         return -1;
     }
     _rmap[peer] = { rid, options.replicator_status };
@@ -713,43 +722,21 @@ int Replicator::_on_error(bthread_id_t id, void* arg, int error_code) {
 确定 nextIndex
 ---
 
-Leader 通过发送空的 `AppendEntries` 来探测 Follower 的 `nextIndex`
-只有确定了 `nextIndex` 才能正式向 Follower 发送日志。
-这里忽略了很多细节，详情我们将在下一章[复制流程][]中介绍。
-
-Leader 调用 `_send_empty_entries` 向 Follower 发送空的 `AppendEntries` 请求，
-并设置响应回调函数为 `_on_rpc_returned`：
+Leader 通过发送空的 `AppendEntries` 请求来探测 Follower 的 `nextIndex`，
+只有确定了 `nextIndex` 才能正式向 Follower 发送日志。这里忽略了很多细节，关于 `nextIndex` 的作用和匹配算法，以及相关实现可参考 4.1 日志复制相关内容：
+* [nextIndex](/ch04/4.1/replicate.md#nextindex)
+* [确认 nextIndex 的具体实现](/ch04/4.1/replicate.md#前置步骤确定-nextindex)
 
 ```cpp
 void Replicator::_send_empty_entries(bool is_heartbeat) {
     ...
-    // (1) 填充请求中的字段
-    if (_fill_common_fields(
-                request.get(), _next_index - 1, is_heartbeat) != 0) {
-        ...
-    }
-
-    // (2) 设置响应回调函数为 _on_rpc_returned
+    // (1) 设置响应回调函数为 _on_rpc_returned
     google::protobuf::Closure* done = brpc::NewCallback(
                 is_heartbeat ? _on_heartbeat_returned : _on_rpc_returned, ...);
-    // (3) 发送空的 AppendEntries 请求
+    // (2) 发送空的 AppendEntries 请求
     RaftService_Stub stub(&_sending_channel);
     stub.append_entries(cntl.release(), request.release(),
                         response.release(), done);
-}
-
-int Replicator::_fill_common_fields(AppendEntriesRequest* request,
-                                    int64_t prev_log_index,
-                                    bool is_heartbeat) {
-    // 获取 Log 的 Term
-    const int64_t prev_log_term = _options.log_manager->get_term(prev_log_index);
-    ...
-    request->set_term(_options.term);
-    ...
-    request->set_prev_log_index(prev_log_index);  // 当前 leader 的 lastLogIndex
-    request->set_prev_log_term(prev_log_term);    // 当前 leader 的 lastLogTerm
-    request->set_committed_index(_options.ballot_box->last_committed_index());
-    return 0;
 }
 ```
 
@@ -758,192 +745,13 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
                      AppendEntriesRequest* request,
                      AppendEntriesResponse* response,
                      int64_t rpc_send_time) {
-    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
-    std::unique_ptr<AppendEntriesRequest>  req_guard(request);
-    std::unique_ptr<AppendEntriesResponse> res_guard(response);
-    Replicator *r = NULL;
-    bthread_id_t dummy_id = { id };
-    const long start_time_us = butil::gettimeofday_us();
-    if (bthread_id_lock(dummy_id, (void**)&r) != 0) {
-        return;
-    }
-
-    std::stringstream ss;
-    ss << "node " << r->_options.group_id << ":" << r->_options.server_id
-       << " received AppendEntriesResponse from "
-       << r->_options.peer_id << " prev_log_index " << request->prev_log_index()
-       << " prev_log_term " << request->prev_log_term() << " count " << request->entries_size();
-
-    bool valid_rpc = false;
-    int64_t rpc_first_index = request->prev_log_index() + 1;
-    int64_t min_flying_index = r->_min_flying_index();  // _next_index - _flying_append_entries_size
-    CHECK_GT(min_flying_index, 0);
-
-    for (std::deque<FlyingAppendEntriesRpc>::iterator rpc_it = r->_append_entries_in_fly.begin();
-        rpc_it != r->_append_entries_in_fly.end(); ++rpc_it) {
-        if (rpc_it->log_index > rpc_first_index) {
-            break;
-        }
-        if (rpc_it->call_id == cntl->call_id()) {
-            valid_rpc = true;
-        }
-    }
-    if (!valid_rpc) {
-        ss << " ignore invalid rpc";
-        BRAFT_VLOG << ss.str();
-        CHECK_EQ(0, bthread_id_unlock(r->_id)) << "Fail to unlock " << r->_id;
-        return;
-    }
-
-    if (cntl->Failed()) {
-        ss << " fail, sleep.";
-        BRAFT_VLOG << ss.str();
-
-        // TODO: Should it be VLOG?
-        LOG_IF(WARNING, (r->_consecutive_error_times++) % 10 == 0)
-                        << "Group " << r->_options.group_id
-                        << " fail to issue RPC to " << r->_options.peer_id
-                        << " _consecutive_error_times=" << r->_consecutive_error_times
-                        << ", " << cntl->ErrorText();
-        // If the follower crashes, any RPC to the follower fails immediately,
-        // so we need to block the follower for a while instead of looping until
-        // it comes back or be removed
-        // dummy_id is unlock in block
-        r->_reset_next_index();
-        return r->_block(start_time_us, cntl->ErrorCode());
-    }
-    r->_consecutive_error_times = 0;
-    if (!response->success()) {
-        if (response->term() > r->_options.term) {
-            BRAFT_VLOG << " fail, greater term " << response->term()
-                       << " expect term " << r->_options.term;
-            r->_reset_next_index();
-
-            NodeImpl *node_impl = r->_options.node;
-            // Acquire a reference of Node here in case that Node is destroyed
-            // after _notify_on_caught_up.
-            node_impl->AddRef();
-            r->_notify_on_caught_up(EPERM, true);
-            butil::Status status;
-            status.set_error(EHIGHERTERMRESPONSE, "Leader receives higher term "
-                    "%s from peer:%s", response->GetTypeName().c_str(), r->_options.peer_id.to_string().c_str());
-            r->_destroy();
-            node_impl->increase_term_to(response->term(), status);
-            node_impl->Release();
-            return;
-        }
-        ss << " fail, find next_index remote last_log_index " << response->last_log_index()
-           << " local next_index " << r->_next_index
-           << " rpc prev_log_index " << request->prev_log_index();
-        BRAFT_VLOG << ss.str();
-        r->_update_last_rpc_send_timestamp(rpc_send_time);
-        // prev_log_index and prev_log_term doesn't match
-        r->_reset_next_index();
-        if (response->last_log_index() + 1 < r->_next_index) {
-            BRAFT_VLOG << "Group " << r->_options.group_id
-                       << " last_log_index at peer=" << r->_options.peer_id
-                       << " is " << response->last_log_index();
-            // The peer contains less logs than leader
-            r->_next_index = response->last_log_index() + 1;
-        } else {
-            // The peer contains logs from old term which should be truncated,
-            // decrease _last_log_at_peer by one to test the right index to keep
-            if (BAIDU_LIKELY(r->_next_index > 1)) {
-                BRAFT_VLOG << "Group " << r->_options.group_id
-                           << " log_index=" << r->_next_index << " mismatch";
-                --r->_next_index;
-            } else {
-                LOG(ERROR) << "Group " << r->_options.group_id
-                           << " peer=" << r->_options.peer_id
-                           << " declares that log at index=0 doesn't match,"
-                              " which is not supposed to happen";
-            }
-        }
-        // dummy_id is unlock in _send_heartbeat
-        r->_send_empty_entries(false);
-        return;
-    }
-
-    ss << " success";
-    BRAFT_VLOG << ss.str();
-
-    if (response->term() != r->_options.term) {
-        LOG(ERROR) << "Group " << r->_options.group_id
-                   << " fail, response term " << response->term()
-                   << " mismatch, expect term " << r->_options.term;
-        r->_reset_next_index();
-        CHECK_EQ(0, bthread_id_unlock(r->_id)) << "Fail to unlock " << r->_id;
-        return;
-    }
-    r->_update_last_rpc_send_timestamp(rpc_send_time);
-    const int entries_size = request->entries_size();
-    const int64_t rpc_last_log_index = request->prev_log_index() + entries_size;
-    BRAFT_VLOG_IF(entries_size > 0) << "Group " << r->_options.group_id
-                                    << " replicated logs in ["
-                                    << min_flying_index << ", "
-                                    << rpc_last_log_index
-                                    << "] to peer " << r->_options.peer_id;
-    if (entries_size > 0) {
-        r->_options.ballot_box->commit_at(
-                min_flying_index, rpc_last_log_index,
-                r->_options.peer_id);
-        int64_t rpc_latency_us = cntl->latency_us();
-        if (FLAGS_raft_trace_append_entry_latency &&
-            rpc_latency_us > FLAGS_raft_append_entry_high_lat_us) {
-            LOG(WARNING) << "append entry rpc latency us " << rpc_latency_us
-                         << " greater than "
-                         << FLAGS_raft_append_entry_high_lat_us
-                         << " Group " << r->_options.group_id
-                         << " to peer  " << r->_options.peer_id
-                         << " request entry size " << entries_size
-                         << " request data size "
-                         <<  cntl->request_attachment().size();
-        }
-        g_send_entries_latency << cntl->latency_us();
-        if (cntl->request_attachment().size() > 0) {
-            g_normalized_send_entries_latency <<
-                cntl->latency_us() * 1024 / cntl->request_attachment().size();
-        }
-    }
-    // A rpc is marked as success, means all request before it are success,
-    // erase them sequentially.
-    while (!r->_append_entries_in_fly.empty() &&
-           r->_append_entries_in_fly.front().log_index <= rpc_first_index) {
-        r->_flying_append_entries_size -= r->_append_entries_in_fly.front().entries_size;
-        r->_append_entries_in_fly.pop_front();
-    }
-    r->_has_succeeded = true;
-    r->_notify_on_caught_up(0, false);
-    // dummy_id is unlock in _send_entries
-    if (r->_timeout_now_index > 0 && r->_timeout_now_index < r->_min_flying_index()) {
-        r->_send_timeout_now(false, false);
-    }
-    r->_send_entries();
-    return;
-}
-```
-
-```cpp
-void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
-                                             const AppendEntriesRequest* request,
-                                             AppendEntriesResponse* response,
-                                             google::protobuf::Closure* done,
-                                             bool from_append_entries_cache) {
     ...
-    if (request->entries_size() == 0) {  // 响应 send_empty_entries 或心跳
-        response->set_success(true);
-        response->set_term(_current_term);
-        response->set_last_log_index(_log_manager->last_log_index());
-        ...
-        // see the comments at FollowerStableClosure::run()
-        _ballot_box->set_last_committed_index(
-                std::min(request->committed_index(),
-                         prev_log_index));
-        return;
-    }
+    r->_next_index = response->last_log_index() + 1;
     ...
 }
 ```
+
+
 
 复制上一任期日志
 ---
@@ -1122,6 +930,13 @@ int BallotBox::commit_at(
 }
 ```
 
+## 回调 on_apply
+## 回调 on_configuration_committed
+
+所有已经提交的日志都会被 `apply`，如果该日志类型是配置，则回调状态机的 `on_configuration_committed`，否则回调 `on_apply`，这些逻辑都在 `do_committed` 函数中处理。上面我们提到本任期的配置日志是当前 Leader 的最后一条日志，所以会先调用一个或多个 `on_apply`，最后再调用 `on_configuration_committed`。
+
+在回调完 `on_configuration_committed`
+
 ```cpp
 void FSMCaller::do_committed(int64_t committed_index) {
     if (!_error.status().ok()) {
@@ -1199,3 +1014,6 @@ public:
     ...
 };
 ```
+
+参考
+===

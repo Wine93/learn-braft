@@ -4,16 +4,16 @@
 流程概览
 ---
 
-前置步骤：当节点成为 Leader 时会通过发送空的 `AppendEntries` 请求确认各 Follower 的 `nextIndex`
-1. 客户端通过 `apply` 接口向 Leader 提交操作日志
+1. 前置步骤：当节点成为 Leader 时会通过发送空的 `AppendEntries` 请求确认各 Follower 的 `nextIndex`
+2. 客户端通过 `apply` 接口向 Leader 提交操作日志
 2. Leader 向本地追加日志：
-   * 2.1 为日志分配 `Index`，并将其追加到内存存储中
+   * 2.1 为日志分配 `index`，并将其追加到内存存储中
    * 2.2 异步将内存中的日志持久化到磁盘
 3. Leader 将内存中的日志通过 `AppendEntries` 请求并行地发送给所有 Follower
 4. Follower 收到 `AppenEntries` 请求，将日志持久化到本地后返回成功响应
-5. Leader 若收到大多数确定，则提交日志，更新 `CommitIndex`
+5. Leader 若收到大多数确定，则提交日志，更新 `commitIndex`
 6. Leader 回调用户状态机的 `on_apply` 应用日志
-7. 待 `on_apply` 返回后，更新 `ApplyIndex`，并删除内存中的日志
+7. 待 `on_apply` 返回后，更新 `applyIndex`，并删除内存中的日志
 
 流程注解
 ---
@@ -155,6 +155,238 @@ public:
 
 前置步骤：确定 nextIndex
 ===
+
+Leader 通过发送空的 `AppendEntries` 来探测 Follower 的 `nextIndex`
+只有确定了 `nextIndex` 才能正式向 Follower 发送日志。
+这里忽略了很多细节，详情我们将在下一章[复制流程][]中介绍。
+
+Leader 调用 `_send_empty_entries` 向 Follower 发送空的 `AppendEntries` 请求，
+并设置响应回调函数为 `_on_rpc_returned`：
+
+```cpp
+void Replicator::_send_empty_entries(bool is_heartbeat) {
+    ...
+    // (1) 填充请求中的字段
+    if (_fill_common_fields(
+                request.get(), _next_index - 1, is_heartbeat) != 0) {
+        ...
+    }
+
+    // (2) 设置响应回调函数为 _on_rpc_returned
+    google::protobuf::Closure* done = brpc::NewCallback(
+                is_heartbeat ? _on_heartbeat_returned : _on_rpc_returned, ...);
+    // (3) 发送空的 AppendEntries 请求
+    RaftService_Stub stub(&_sending_channel);
+    stub.append_entries(cntl.release(), request.release(),
+                        response.release(), done);
+}
+
+int Replicator::_fill_common_fields(AppendEntriesRequest* request,
+                                    int64_t prev_log_index,
+                                    bool is_heartbeat) {
+    // 获取 Log 的 Term
+    const int64_t prev_log_term = _options.log_manager->get_term(prev_log_index);
+    ...
+    request->set_term(_options.term);
+    ...
+    request->set_prev_log_index(prev_log_index);  // 当前 leader 的 lastLogIndex
+    request->set_prev_log_term(prev_log_term);    // 当前 leader 的 lastLogTerm
+    request->set_committed_index(_options.ballot_box->last_committed_index());
+    return 0;
+}
+```
+
+```cpp
+void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
+                     AppendEntriesRequest* request,
+                     AppendEntriesResponse* response,
+                     int64_t rpc_send_time) {
+    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
+    std::unique_ptr<AppendEntriesRequest>  req_guard(request);
+    std::unique_ptr<AppendEntriesResponse> res_guard(response);
+    Replicator *r = NULL;
+    bthread_id_t dummy_id = { id };
+    const long start_time_us = butil::gettimeofday_us();
+    if (bthread_id_lock(dummy_id, (void**)&r) != 0) {
+        return;
+    }
+
+    std::stringstream ss;
+    ss << "node " << r->_options.group_id << ":" << r->_options.server_id
+       << " received AppendEntriesResponse from "
+       << r->_options.peer_id << " prev_log_index " << request->prev_log_index()
+       << " prev_log_term " << request->prev_log_term() << " count " << request->entries_size();
+
+    bool valid_rpc = false;
+    int64_t rpc_first_index = request->prev_log_index() + 1;
+    int64_t min_flying_index = r->_min_flying_index();  // _next_index - _flying_append_entries_size
+    CHECK_GT(min_flying_index, 0);
+
+    for (std::deque<FlyingAppendEntriesRpc>::iterator rpc_it = r->_append_entries_in_fly.begin();
+        rpc_it != r->_append_entries_in_fly.end(); ++rpc_it) {
+        if (rpc_it->log_index > rpc_first_index) {
+            break;
+        }
+        if (rpc_it->call_id == cntl->call_id()) {
+            valid_rpc = true;
+        }
+    }
+    if (!valid_rpc) {
+        ss << " ignore invalid rpc";
+        BRAFT_VLOG << ss.str();
+        CHECK_EQ(0, bthread_id_unlock(r->_id)) << "Fail to unlock " << r->_id;
+        return;
+    }
+
+    if (cntl->Failed()) {
+        ss << " fail, sleep.";
+        BRAFT_VLOG << ss.str();
+
+        // TODO: Should it be VLOG?
+        LOG_IF(WARNING, (r->_consecutive_error_times++) % 10 == 0)
+                        << "Group " << r->_options.group_id
+                        << " fail to issue RPC to " << r->_options.peer_id
+                        << " _consecutive_error_times=" << r->_consecutive_error_times
+                        << ", " << cntl->ErrorText();
+        // If the follower crashes, any RPC to the follower fails immediately,
+        // so we need to block the follower for a while instead of looping until
+        // it comes back or be removed
+        // dummy_id is unlock in block
+        r->_reset_next_index();
+        return r->_block(start_time_us, cntl->ErrorCode());
+    }
+    r->_consecutive_error_times = 0;
+    if (!response->success()) {
+        if (response->term() > r->_options.term) {
+            BRAFT_VLOG << " fail, greater term " << response->term()
+                       << " expect term " << r->_options.term;
+            r->_reset_next_index();
+
+            NodeImpl *node_impl = r->_options.node;
+            // Acquire a reference of Node here in case that Node is destroyed
+            // after _notify_on_caught_up.
+            node_impl->AddRef();
+            r->_notify_on_caught_up(EPERM, true);
+            butil::Status status;
+            status.set_error(EHIGHERTERMRESPONSE, "Leader receives higher term "
+                    "%s from peer:%s", response->GetTypeName().c_str(), r->_options.peer_id.to_string().c_str());
+            r->_destroy();
+            node_impl->increase_term_to(response->term(), status);
+            node_impl->Release();
+            return;
+        }
+        ss << " fail, find next_index remote last_log_index " << response->last_log_index()
+           << " local next_index " << r->_next_index
+           << " rpc prev_log_index " << request->prev_log_index();
+        BRAFT_VLOG << ss.str();
+        r->_update_last_rpc_send_timestamp(rpc_send_time);
+        // prev_log_index and prev_log_term doesn't match
+        r->_reset_next_index();
+        if (response->last_log_index() + 1 < r->_next_index) {
+            BRAFT_VLOG << "Group " << r->_options.group_id
+                       << " last_log_index at peer=" << r->_options.peer_id
+                       << " is " << response->last_log_index();
+            // The peer contains less logs than leader
+            r->_next_index = response->last_log_index() + 1;
+        } else {
+            // The peer contains logs from old term which should be truncated,
+            // decrease _last_log_at_peer by one to test the right index to keep
+            if (BAIDU_LIKELY(r->_next_index > 1)) {
+                BRAFT_VLOG << "Group " << r->_options.group_id
+                           << " log_index=" << r->_next_index << " mismatch";
+                --r->_next_index;
+            } else {
+                LOG(ERROR) << "Group " << r->_options.group_id
+                           << " peer=" << r->_options.peer_id
+                           << " declares that log at index=0 doesn't match,"
+                              " which is not supposed to happen";
+            }
+        }
+        // dummy_id is unlock in _send_heartbeat
+        r->_send_empty_entries(false);
+        return;
+    }
+
+    ss << " success";
+    BRAFT_VLOG << ss.str();
+
+    if (response->term() != r->_options.term) {
+        LOG(ERROR) << "Group " << r->_options.group_id
+                   << " fail, response term " << response->term()
+                   << " mismatch, expect term " << r->_options.term;
+        r->_reset_next_index();
+        CHECK_EQ(0, bthread_id_unlock(r->_id)) << "Fail to unlock " << r->_id;
+        return;
+    }
+    r->_update_last_rpc_send_timestamp(rpc_send_time);
+    const int entries_size = request->entries_size();
+    const int64_t rpc_last_log_index = request->prev_log_index() + entries_size;
+    BRAFT_VLOG_IF(entries_size > 0) << "Group " << r->_options.group_id
+                                    << " replicated logs in ["
+                                    << min_flying_index << ", "
+                                    << rpc_last_log_index
+                                    << "] to peer " << r->_options.peer_id;
+    if (entries_size > 0) {
+        r->_options.ballot_box->commit_at(
+                min_flying_index, rpc_last_log_index,
+                r->_options.peer_id);
+        int64_t rpc_latency_us = cntl->latency_us();
+        if (FLAGS_raft_trace_append_entry_latency &&
+            rpc_latency_us > FLAGS_raft_append_entry_high_lat_us) {
+            LOG(WARNING) << "append entry rpc latency us " << rpc_latency_us
+                         << " greater than "
+                         << FLAGS_raft_append_entry_high_lat_us
+                         << " Group " << r->_options.group_id
+                         << " to peer  " << r->_options.peer_id
+                         << " request entry size " << entries_size
+                         << " request data size "
+                         <<  cntl->request_attachment().size();
+        }
+        g_send_entries_latency << cntl->latency_us();
+        if (cntl->request_attachment().size() > 0) {
+            g_normalized_send_entries_latency <<
+                cntl->latency_us() * 1024 / cntl->request_attachment().size();
+        }
+    }
+    // A rpc is marked as success, means all request before it are success,
+    // erase them sequentially.
+    while (!r->_append_entries_in_fly.empty() &&
+           r->_append_entries_in_fly.front().log_index <= rpc_first_index) {
+        r->_flying_append_entries_size -= r->_append_entries_in_fly.front().entries_size;
+        r->_append_entries_in_fly.pop_front();
+    }
+    r->_has_succeeded = true;
+    r->_notify_on_caught_up(0, false);
+    // dummy_id is unlock in _send_entries
+    if (r->_timeout_now_index > 0 && r->_timeout_now_index < r->_min_flying_index()) {
+        r->_send_timeout_now(false, false);
+    }
+    r->_send_entries();
+    return;
+}
+```
+
+```cpp
+void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
+                                             const AppendEntriesRequest* request,
+                                             AppendEntriesResponse* response,
+                                             google::protobuf::Closure* done,
+                                             bool from_append_entries_cache) {
+    ...
+    if (request->entries_size() == 0) {  // 响应 send_empty_entries 或心跳
+        response->set_success(true);
+        response->set_term(_current_term);
+        response->set_last_log_index(_log_manager->last_log_index());
+        ...
+        // see the comments at FollowerStableClosure::run()
+        _ballot_box->set_last_committed_index(
+                std::min(request->committed_index(),
+                         prev_log_index));
+        return;
+    }
+    ...
+}
+```
 
 阶段一：
 
