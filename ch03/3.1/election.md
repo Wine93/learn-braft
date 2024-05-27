@@ -14,7 +14,7 @@
     * 5.3 通过发送空的 `AppendEntries` 请求来确定各 Follower 的 `nextIndex`
     * 5.4 将之前任期的日志全部复制给 Follower（**只复制不提交，不更新 commitIndex**）
     * 5.5 通过复制并提交一条本任期的配置日志来提交之前任期的日志，提交后日志就可以 apply了
-    * 5.6 调用状态机的 `on_apply` 来回放之前任期的日志，以恢复状态机
+    * 5.6 调用用户状态机的 `on_apply` 来回放之前任期的日志，以恢复状态机
     * 5.7 待日志全部回放完后，调用用户状态机的 `on_configuration_committed` 来应用上述配置
     * 5.8 调用用户状态机的 `on_leader_start`
 6. 至此，Leader 可以正式对外服务
