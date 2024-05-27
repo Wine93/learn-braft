@@ -8,15 +8,14 @@
 2. 打开本地快照目录，返回 `SnapshotReader`
 3. 将 `SnapshotReader` 作为参数回调用户状态机 `on_snapshot_load`
 4. 等待快照加载完成
-5. 若快照元数据中有集群配置，则回调用户状态机的 `on_configuration_committed`
-6. 更新 `ApplyIndex` 为快照元数据中的 `lastIncludedIndex`
-7. 若快照元数据中有集群配置，将则其设置为当前集群配置
-
+5. 根据快照元数据中的集群配置，回调用户状态机的 `on_configuration_committed`
+6. 更新 `applyIndex` 为快照元数据中的 `lastIncludedIndex`
+7. 若快照元数据中有集群配置，将则其设置为当前集群配置？若？
 
 流程注解
 ---
 
-* 1 由于快照中对应的是已经 `Apply` 的日志，所以只要有快照，都可以直接加载
+* 1 由于快照中对应的是已经 `apply` 的日志，所以只要有快照，都可以直接加载
 
 相关接口
 ---

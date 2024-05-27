@@ -2,15 +2,15 @@
 ===
 
 braft 在实现选举的时候做了一些优化，这些优化点归纳起来主要为了实现以下几个目的：
-* **快**: 减少选举时间，让集群尽快产生 *Leader*（e.g. 选举时间随机化、*Wakeup Candidate*）
-* **稳定**：当集群中有 Leader 时，尽可能保持稳定，减少没必要的选主（e.g. Pre-Vote、Follower Lease）
+* **快速**: 减少选举时间，让集群尽快产生 Leader（如选举时间随机化、*Wakeup Candidate*）
+* **稳定**：当集群中有 Leader 时，尽可能保持稳定，减少没必要的选主（如 Pre-Vote、Follower Lease）
 * **分区问题**：解决出现分区时造成的各种问题（e.g. PreVote，Follower Lease，Check Quorum、Leader Lease）
 
 具体来说，braft 对于分区场景做了很详细的优化：
 
 | 分区场景                    | 造成问题                                                                    | 优化方案                                |
 |:----------------------------|:----------------------------------------------------------------------------|:----------------------------------------|
-| Follower 位于对称网络分区   | Term 增加，重新加入集群会打断 Leader，造成没必要的选举                      | [PreVote](#优化-3pre-vote)              |
+| Follower 被隔离于对称网络分区   | Term 增加，重新加入集群会打断 Leader，造成没必要的选举                      | [PreVote](#优化-3pre-vote)              |
 | Follower 位于非对称网络分区 | Follower 选举成功，推高集群其他成员的 Term，间接打断 Leader，造成没必要选举 | [Follower Lease](#优化-4follower-lease) |
 | Leader 位于对称网络分区     | 集群会产生多个 Leader，客户端需要重试；可能会产生 `Stale Read`，破坏线性一致性                                                                             | [Check Quorum](#优化-5check-quorum)、[Leader Lease](#优化-6leader-lease)                          |
 | Leader 位于非对称网络分区   | Leader 永远无法写入，也不会产生新 Leader，客户端会不断重试                                                                            | [Check Quorum](#优化-5check-quorum)                          |

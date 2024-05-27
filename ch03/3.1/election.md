@@ -4,21 +4,23 @@
 流程概览
 ---
 
-1. 节点在选举超时（`election_timeout`）时间内未收到任何心跳而触发选举
+1. 节点在选举超时时间（`election_timeout_ms`）内未收到任何心跳而触发选举
 2. 向所有节点广播 `PreVote` 请求，若收到大多数赞成票则进行正式选举，否则重新等待选举超时
-3. 将自身角色转变为 `Candidate`, 并将自身 `Term` 加一，向所有节点广播 `RequestVote` 请求
-4. 在投票超时（`vote_timeout`）时间内若收到足够多的选票则成为 `Leader`，若有收到更高 `Term` 的响应则转变为  `Follower` 并重复步骤 1；否则等待投票超时后转变为 `Follower` 并重复步骤 2
+3. 将自身角色转变为 `Candidate`, 并将自身 `currentTerm` 加一，向所有节点广播 `RequestVote` 请求
+4. 在投票超时时间（`vote_timeout_ms`）内若收到足够多的选票则成为 `Leader`，若有收到更高 `term` 的响应则转变为  `Follower` 并重复步骤 1；否则等待投票超时后转变为 `Follower` 并重复步骤 2
 5. 成为 Leader
     * 5.1 将自身角色转变为 `Leader`
     * 5.2 对所有 `Follower` 定期广播心跳
     * 5.3 通过发送空的 `AppendEntries` 请求来确定各 Follower 的 `nextIndex`
-    * 5.4 将上一任期的日志全部复制给 Follower（**只复制不提交，不更新 CommitIndex**）
-    * 5.5 通过复制并提交一条本任期的配置日志来提交上一任期的日志，并回放这些日志来恢复状态机
-    * 5.6 回调用户状态机的 `on_leader_start`
+    * 5.4 将之前任期的日志全部复制给 Follower（**只复制不提交，不更新 commitIndex**）
+    * 5.5 通过复制并提交一条本任期的配置日志来提交之前任期的日志，并回放（`on_apply`）这些日志来恢复状态机
+    * 5.6 待日志全部回放完了，回调用户状态机的 `on_configuration_committed` 来应用上述配置
+    * 5.7 回调用户状态机的 `on_leader_start`
 6. 至此，Leader 可以正式对外服务
 
 上述流程可分为 PreVote (1-2)、RequestVote (3-4)、成为 Leader（5-6）这三个阶段
 
+<
 流程注解
 ---
 
@@ -34,53 +36,7 @@
 投票规则
 ---
 
-在同一任期内，节点发出的 `PreVote` 和 `RequestVote` 的请求是一样的，区别在于`PreVote` 请求中的 `Term` 为自身的 `Term`+1，而发送 `RequestVote` 请求前会先将自身的 `Term`+1。
-
-节点对于 `RequestVote` 请求投赞成票需要同时满足以下 3 个条件：
-
-* Term: 请求中的 `Term` 要大于或等于当前节点的 `Term`
-* LastLogId: 请求中的 `LastLogId` 要大于或等于当前节点的 `LastLogId`<sup>[1]</sup>
-* votedFor:
-
-唯一的区别在于：
-
-* 节点可以对多个
-
-* `RequestVote` 会记录 `votedFor`，确保在同一个任期内只会给一个候选人投票，而 `PreVote` 则可以同时投票给多个候选人，只要其满足以上 2 个条件 // 补充不会投给其他人
-* `RequestVote` 若发现请求中的 `Term` 比自身的大，会 `step_down` 成 Follower，而 `PreVote` 则不会，这点可以确保不会在 Pre-Vote 打断当前 Leader
-
-从以上差异可以看出，`PreVote` 更像是一次预检，检测其连通性和合法性，并没有实际的动作。
-
-> **LogId 的比较**
->
-> LogId 由 Log 的 Term 和 Index 组成，对于 2 个 LogId 来说：
-> * 若 `a.Term == b.Term`，则 `a == b`
-> * 若 `(a.Term > b.Term) || (a.Term == b.Term && a.Index > b.Index)`，则 `a > b`
-
-votedFor
----
-
-幽灵日志
----
-
-![图 3.1  幽灵日志](image/ghost_log.png)
-
-上图是 Raft 论文 `5.4 Safety` 一节中提到的幽灵日志问题，该问题会破坏系统的线性一致性：
-
-* (a) S1 当选 Term 2 的 Leader，并将日志复制给 S2，之后 Crash
-* (b) S5 被 S3,S4,S5 选为 Term 3 的 Leader，在本地写入一条日志后 Crash
-* (c) S1 被 S1,S2,S3 选为 Term 4 的 Leader，并将 Index=2 的日志复制给 S3，达到 `Quorum` 并应用到状态机；并在本地写入一条日志，然后 Crash
-* (d1) S5 被 S2,S3,S4,S5 选为 Term 5 的 Leader，并将 Index=2 的日志复制给所有成员，从而覆盖了原来的日志。
-
-从上面流程可以看到，在 (c) 中 `Index=2` 即使被提交了，但在 (d1) 中又被覆盖了。如果我们在 `(c)` 时刻去 S1 读取 `x` 的值，将得到 `2`，之后我们又在 `(d)` 时刻去 S5 读 `x` 的值，将得到是 `1`，这明显违背了线性一致性。
-
-所以论文里提出不能通过 `Quorum` 机制提交上一任期的日志，而是需要通过提交本任期的一条日志，顺带提交上一任期的日志，正如 `(d2)` 所示。一般 Raft 实现节点当选 Leader 后提交一条本任期的 `no-op` 日志，而 braft 中提交的是配置日志，主要是在实现上和[重置节点列表][]的特性结合到一起了，其起到的作用是一样的，只要是本任期内的接口，详见以下[提交 no-op 日志](#提交-no-op-日志)。
-
-> 特别需要注意的是，以上的读操作是指除 `Raft Log Read` 之外的其他读取方式。
-
-相关 RPC
----
-
+**相关 RPC：**
 ```proto
 message RequestVoteRequest {
     required string group_id = 1;
@@ -106,8 +62,55 @@ service RaftService {
 }
 ```
 
+在同一任期内，节点发出的 `PreVote` 请求和 `RequestVote` 请求的内容是一样的，区别在于：
+  * `PreVote` 请求中的 `term` 为自身的 `term` 加上 1
+  * 而发送 `RequestVote` 请求前会先将自身的 `term` 加 1，再将其作为请求中的 `term`
+
+节点对于 `RequestVote` 请求投赞成票需要同时满足以下 3 个条件，而 `PreVote` 只需满足前 2 个条件：
+
+* term：候选人的 `term` 要大于等于自己的 `term`
+* lastLog：候选人的最后一条日志要和自己的一样新或者新于自己
+* votedFor：自己的 `votedFor` 为空或者等于候选人的 ID
+
+`PreVote` 与 `RequestVote` 的差异：
+
+* 处理 `RequestVote` 请求时会记录 `votedFor`，确保在同一个任期内只会给一个候选人投票；而 `PreVote` 则可以同时投票给多个候选人，只要其满足以上 2 个条件
+* 处理 `RequestVote` 请求时若发现请求中的 `term` 比自身的大，会 `step_down` 成 Follower，而 `PreVote` 则不会，这点可以确保不会在 PreVote 阶段打断当前 Leader
+
+从以上差异可以看出，`PreVote` 更像是一次预检，检测其连通性和合法性，并没有实际的动作。
+
+> **日志新旧比较**
+>
+> 日志由 `term` 和 `index` 组成，对于 2 条日志 `a` 和 `b` 来说：
+> * 若其 `term` 和 `index` 都一样，则 2 条日志一样新
+> * 若 `(a.term > b.term) || (a.term == b.term && a.index > b.index)`，则日志 `a` 新于日志 `b`
+
+votedFor
+---
+
+幽灵日志
+---
+
+![图 3.1  幽灵日志](image/3.1.png)
+
+从上述选举流程可以看出，Leader 并不是通过 `Quorum` 机制来提交之前任期的日志，而是通过提交本任期的一条日志，顺带提交上一任期的日志。这主要是为了解决 Raft 论文在 `5.4 Safety` 一节中提到的幽灵日志问题，因为该问题会破坏系统的线性一致性，正如上图所示：
+
+* (a) `S1` 当选 Term 2 的 Leader，并将日志复制给 `S2`，之后 Crash
+* (b) `S5` 被 `S3,S4,S5` 选为 Term 3 的 Leader，在本地写入一条日志后 Crash
+* (c) `S1` 被 `S1,S2,S3` 选为 Term 4 的 Leader，并将 index=2 的日志复制给 `S3`，达到 `Quorum` 并应用到状态机；并在本地写入一条日志，然后 Crash
+* (d1) S5 被 S2,S3,S4,S5 选为 Term 5 的 Leader，并将 Index=2 的日志复制给所有成员，从而覆盖了原来的日志。
+
+从上面流程可以看到，在 (c) 中 `Index=2` 即使被提交了，但在 (d1) 中又被覆盖了。如果我们在 `(c)` 时刻去 S1 读取 `x` 的值，将得到 `2`，之后我们又在 `(d)` 时刻去 S5 读 `x` 的值，将得到是 `1`，这明显违背了线性一致性。
+
+所以论文里提出不能通过 `Quorum` 机制提交上一任期的日志，而是需要通过提交本任期的一条日志，顺带提交上一任期的日志，正如 `(d2)` 所示。一般 Raft 实现节点当选 Leader 后提交一条本任期的 `no-op` 日志，而 braft 中提交的是配置日志，主要是在实现上和[重置节点列表][]的特性结合到一起了，其起到的作用是一样的，只要是本任期内的接口，详见以下[提交 no-op 日志](#提交-no-op-日志)。
+
+> 特别需要注意的是，以上的读操作是指除 `Raft Log Read` 之外的其他读取方式。
+
+
 相关接口
 ---
+
+一些会在选举过程中调用的状态机接口：
 
 ```cpp
 class StateMachine {
@@ -150,7 +153,7 @@ public:
 阶段一：PreVote
 ===
 
-![图 3.1  PreVote 整体实现](image/pre_vote.svg)
+![图 3.1  PreVote 整体实现](image/3.2.png)
 
 触发投票
 ---
@@ -170,7 +173,7 @@ int NodeImpl::init(const NodeOptions& options) {
 void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate,
                          const butil::Status& status) {
     ...
-    _election_timer.start();
+    _election_timer.start();  // 启动选举定时器
 }
 ```
 
@@ -194,7 +197,7 @@ void NodeImpl::handle_election_timeout() {
 发送请求
 ---
 
-在 `pre_vote` 函数中会对所有节点发送 `PreVote` 请求，并设置 RPC 响应的回调函数为 `OnPreVoteRPCDone`， 最后 调用 `grant_slef` 给自己投一票，之后就进入等待：
+在 `pre_vote` 函数中会对所有节点发送 `PreVote` 请求，并设置 RPC 响应的回调函数为 `OnPreVoteRPCDone`， 最后调用 `grant_slef` 给自己投一票，之后等待投票结果返回：
 
 ```cpp
 void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
@@ -205,9 +208,11 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
     std::set<PeerId> peers;
     _conf.list_peers(&peers);
 
+    // (1) 对组内所有节点发送 `PreVote` 请求
     for (std::set<PeerId>::const_iterator
             iter = peers.begin(); iter != peers.end(); ++iter) {
         ...
+        // (2) 设置回调函数
         OnPreVoteRPCDone* done = new OnPreVoteRPCDone(
                 *iter, _current_term, _pre_vote_ctx.version(), this);
         ...
@@ -218,6 +223,7 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
         RaftService_Stub stub(&channel);
         stub.pre_vote(&done->cntl, &done->request, &done->response, done);
     }
+    // (3) 给自己投一票
     grant_self(&_pre_vote_ctx, lck);
 }
 ```
@@ -245,26 +251,25 @@ int NodeImpl::handle_pre_vote_request(const RequestVoteRequest* request,
         bool grantable = (LogId(request->last_log_index(), request->last_log_term())
                         >= last_log_id);
         if (grantable) {
-            granted = (votable_time == 0);
+            granted = (votable_time == 0);  // votable_time 是 Follower Lease 的特性，将在 <3.2 选举优化中> 详细介绍，这里可忽略
         }
         ...
     } while (0);
 
     // (3) 设置响应
     ...
-    response->set_term(_current_term);
-    response->set_granted(granted);  //
+    response->set_term(_current_term);  // 携带自身的 term
+    response->set_granted(granted);  // true 代表投赞成票
     ...
 
     return 0;
 }
-
 ```
 
 处理响应
 ---
 
-在收到其他节点的 `PreVote` 响应后，会回调之前设置的 callback `OnPreVoteRPCDone->Run()`，在 callback 中会调用 `handle_pre_vote_response` 处理 `PreVote` 响应：
+在收到其他节点的 `PreVote` 响应后，会回调之前设置的回调函数 `OnPreVoteRPCDone->Run()`，在 callback 中会调用 `handle_pre_vote_response` 处理 `PreVote` 响应：
 
 ```cpp
 struct OnPreVoteRPCDone : public google::protobuf::Closure {
@@ -313,7 +318,7 @@ void NodeImpl::handle_vote_timeout() {
 阶段二：RequestVote
 ===
 
-![图 3.2  RequestVote 整体实现](image/vote.svg)
+![图 3.2  RequestVote 整体实现](image/3.3.png)
 
 发送请求
 ---
