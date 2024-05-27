@@ -6,7 +6,7 @@
 
 1. 节点在选举超时时间（`election_timeout_ms`）内未收到任何心跳而触发选举
 2. 向所有节点广播 `PreVote` 请求，若收到大多数赞成票则进行正式选举，否则重新等待选举超时
-3. 将自身角色转变为 Candidate, 并将自身 `term` 加一，向所有节点广播 `RequestVote` 请求
+3. 将自身角色转变为 Candidate，并将自身 `term` 加一，向所有节点广播 `RequestVote` 请求
 4. 在投票超时时间（`vote_timeout_ms`）内若收到足够多的选票则成为 Leader；若有收到更高 `term` 的响应则转变为 Follower 并重复步骤 1；否则等待投票超时后转变为 Follower 并重复步骤 2
 5. 成为 Leader
     * 5.1 将自身角色转变为 Leader

@@ -3,18 +3,18 @@
 
 braft 在实现 Leader 选举的时候做了一些优化，这些优化点归纳起来主要为了实现以下几个目的：
 
-* **快速**：减少选举时间，让集群尽快产生 Leader（如[超时时间随机化](#优化-1超时时间随机化)、[Wakeup Candidate](#优化-2wakeup-candidate)）
-* **稳定**：当集群中有 Leader 时，尽可能保持稳定，减少没必要的选主（如 [PreVote](#优化-3prevote)、[Follower Lease](#优化-4follower-lease)）
-* **分区问题**：解决出现分区时造成的各种问题（如 [PreVote](#优化-3prevote)、[Follower Lease](#优化-4follower-lease)、[Check Quorum](#优化-5check-quorum)、[Leader Lease](#优化-6leader-lease)）
+* **快速**：减少选举时间，让集群尽快产生 Leader（如超时时间随机化、Wakeup Candidate）
+* **稳定**：当集群中有 Leader 时，尽可能保持稳定，减少没必要的选主（如 PreVote、Follower Lease）
+* **分区问题**：解决出现分区时造成的各种问题（如 PreVote、Follower Lease、Check Quorum、Leader Lease）
 
 具体来说，braft 对于分区场景做了很详细的优化：
 
-| 分区场景                        | 造成问题                                                                       | 优化方案                                                                 |
-|:--------------------------------|:-------------------------------------------------------------------------------|:-------------------------------------------------------------------------|
-| Follower 被隔离于对称网络分区   | `term` 增加，重新加入集群会打断 Leader，造成没必要的选举                       | [PreVote](#优化-3pre-vote)                                               |
-| Follower 被隔离于非对称网络分区 | Follower 选举成功，推高集群其他成员的 `term`，间接打断 Leader，造成没必要选举  | [Follower Lease](#优化-4follower-lease)                                  |
-| Leader 被隔离于对称网络分区     | 集群会产生多个 Leader，客户端需要重试；可能会产生 `Stale Read`，破坏线性一致性 | [Check Quorum](#优化-5check-quorum)、[Leader Lease](#优化-6leader-lease) |
-| Leader 被隔离于非对称网络分区   | Leader 永远无法写入，也不会产生新 Leader，客户端会不断重试                     | [Check Quorum](#优化-5check-quorum)                                      |
+| 分区场景                        | 造成问题                                                                       | 优化方案                   |
+|:--------------------------------|:-------------------------------------------------------------------------------|:---------------------------|
+| Follower 被隔离于对称网络分区   | `term` 增加，重新加入集群会打断 Leader，造成没必要的选举                       | PreVote                    |
+| Follower 被隔离于非对称网络分区 | Follower 选举成功，推高集群其他成员的 `term`，间接打断 Leader，造成没必要选举  | Follower Lease             |
+| Leader 被隔离于对称网络分区     | 集群会产生多个 Leader，客户端需要重试；可能会产生 `Stale Read`，破坏线性一致性 | Check Quorum、Leader Lease |
+| Leader 被隔离于非对称网络分区   | Leader 永远无法写入，也不会产生新 Leader，客户端会不断重试                     | Check Quorum               |
 
 优化 1：超时时间随机化
 ===
@@ -160,8 +160,8 @@ void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
 从上面可以看到，当节点重新回归到集群时，由于其 `term` 比 Leader 大，致使 Leader 降为 Follower，从而触发重新选主。而本质原因是，一个不可能赢得选举的节点不断增加了 Term，
 其实这次选举时没必要的，
 
-为了解决这一问题，Raft 在正式请求投票前引入了 `PreVote` 阶段，Term 不会增加，节点需要在 `Pre-Vote` 获得足够多的选票才能正式进入 `Vote` 阶段。
-e
+为了解决这一问题，Raft 在正式请求投票前引入了 `PreVote` 阶段，该阶段不会增加自身 `term`，并且节点需要在 `PreVote` 获得足够多的选票才能正式进入 `RequestVote` 阶段。
+
 节点在收到 *Pre-Vote* 和 *Vote* 请求后，判断是否要投赞成票的逻辑是一样的，需要同时满足以下 2 个条件：
 
 * **Term**: `request.term >= currentTerm`
@@ -177,7 +177,7 @@ e
 具体实现
 ---
 
-当节点选举定时器超时时，先开始 `PreVote`；在 `PreVote` 并不会自身的角色和 `Term`；
+当节点选举定时器超时时，先开始 `PreVote`；在 `PreVote` 并不会自身的角色和 `term`；
 ```cpp
 void ElectionTimer::run() {
     _node->handle_election_timeout();
@@ -196,6 +196,7 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
         ...
         OnPreVoteRPCDone* done = new OnPreVoteRPCDone(...);
         ...
+        // 请求中的 term 为自身的 term 加一
         done->request.set_term(_current_term + 1); // next term
         ...
         RaftService_Stub stub(&channel);
@@ -205,25 +206,24 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
 }
 ```
 
-当 PreVote 阶段收到足够多的选票，调用 `elect_self` 进入 RequestVote 阶段：
+当 `PreVote` 阶段收到足够多的选票，调用 `elect_self` 进入 `RequestVote` 阶段：
 ```cpp
 void NodeImpl::grant_self(VoteBallotCtx* vote_ctx, std::unique_lock<raft_mutex_t>* lck) {
-    int64_t wait_ms = _follower_lease.votable_time_from_now();
-    if (wait_ms == 0) {
-        vote_ctx->grant(_server_id);
-        if (!vote_ctx->granted()) {
-            return;
-        }
-        if (vote_ctx == &_pre_vote_ctx) {
-            elect_self(lck);
-        }
-        ...
+    ...
+    vote_ctx->grant(_server_id);  // 获得一票
+    if (!vote_ctx->granted()) {
+        return;
+    }
+
+    // 获得足够多的选票
+    if (vote_ctx == &_pre_vote_ctx) {
+        elect_self(lck);
     }
     ...
 }
 ```
 
-在 RequestVote 阶段会将转变成 Candidate、增加自身的 `Term` 并且会保存 `votedFor`：
+在 `RequestVote` 阶段会将转变成 Candidate、增加自身的 `term` 并且会保存 `votedFor`：
 
 ```cpp
 void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
@@ -245,7 +245,7 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
 优化 4：Follower Lease
 ===
 
-上面我们提到了 [PreVote 优化](#优化-3prevote)可以阻止在对称网络分区情况下，节点重新加入集群干扰集群的场景，下面会描述在非对称网络下，`PreVote` 无法阻止的一些场景。
+上面我们提到了 `PreVote` 优化可以阻止在对称网络分区情况下，节点重新加入集群干扰集群的场景，下面会描述在非对称网络下，`PreVote` 无法阻止的一些场景。
 
 非对称网络分区
 ---
@@ -255,7 +255,7 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
 * 图中灰色节点因分区或其他原因收不到心跳而发起选举
 * 在发起选举的短时间内，各成员拥有相同的日志，此时上层无写入
 
-![图 3.7  ](image/follower_partition.png)
+![图 3.7  ](image/3.7.png)
 
 * (a) 集群出现非对称网络分区，只有节点 `S1` 与 `S2` 之间无法通信；`S2` 因分区收不到 Leader 的心跳而触发选举；S2 的 PreVote 获得 S2、S3 的同意；S2 将 Term 变为 2 并被 S2、S3 选为 Leader；S2 向 S3 发送心跳，致使 S3 将自身 Term 变为 2；S1 发现 S2 的 Term 比自己高，遂降为 Follower
 
@@ -265,7 +265,7 @@ Follower Lease
 为了解决这个问题，braft 引入了 `Follower Lease` 的特性。当 Follower 认为 Leader 还存活的时候，在 `election_timeout_ms` 时间内就不会投票给别的成员。
 Follower 每次收到 Leader 的心跳或 `AppendEntries` 请求就会更新 Lease，该 Lease 有效时间区间如下：
 
-![图 3.8  Follower Leader 的有效时间区间](image/follower_lease_valid.png)
+![图 3.8  Follower Leader 的有效时间区间](image/3.8.png)
 
 > **关于 max_clock_drift**
 >
@@ -400,9 +400,9 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
 网络分区
 ---
 
-![图 3.9  Leader 位于网路分区](image/check_quorum.png)
+![图 3.9  Leader 位于网路分区](image/3.9.png)
 
-### 场景 (a)：
+**场景 (a)：**
 
 * 集群出现非对称网络分区：Leader 可以向 Follower 发送请求，但是却接受不到 Follower 的响应；
 * Follower 可以一直接收到心跳，所以不会发起选举；
@@ -411,7 +411,7 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
 
 从上面可以看出，这种场景下，集群将永远无法写入数据，这是比较危险的。
 
-### 场景 (b)：
+**场景 (b)：**
 
 * S1 为 Term 1 的 Leader，S2, S3 为 Follower；
 * 集群出现对称网络分区，Leader 与 Follower 之间的网络不通；
@@ -529,16 +529,16 @@ void Replicator::_on_heartbeat_returned(
 违背线性一致性
 ---
 
-![图 3.10 ](image/stale_read.png)
+![图 3.10 ](image/3.10.png)
 
 我们考虑上图所示的场景：
 
-* `S1` 被 `S2`,`S3` 选为 `term 1` 的 `Leader`
+* `S1` 被 `S2,S3` 选为 `term 1` 的 `Leader`
 * 由于集群发生网络分区，`S3` 收不到 `S1` 的心跳，发起选举，被 S2,S3 选为 Term 2 的 Leader
 * 此时 Client 1 往 S3 写入数据（x=1），并返回成功
 * 在此之后，Client 2 从 S1 读取 x 的值，将得到 0
 
-从上面可以看到，Client 1 在 Client 2 写入后读到的依旧是老数据，这违背了线性一致性。当然，上面提到的 [Check Quorum](#优化-5check-quorum) 机制可以减少其（S1）存在的时间，但是不能完全避免。
+从上面可以看到，Client 1 在 Client 2 写入后读到的依旧是老数据，这违背了线性一致性。当然，上面提到的 Check Quorum 机制可以减少其（S1）存在的时间，但是不能完全避免。
 
 > 值得一提的是，对于某些数据不共享的系统，即对某块数据的读写只由单个客户端负责的模型，可以不用考虑该场景；因为其读写都会在同一个 Leader，不会违背线性一致性。
 
