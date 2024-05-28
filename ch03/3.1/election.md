@@ -120,6 +120,19 @@ votedFor
 ```cpp
 class StateMachine {
 public:
+    // Update the StateMachine with a batch a tasks that can be accessed
+    // through |iterator|.
+    //
+    // Invoked when one or more tasks that were passed to Node::apply have been
+    // committed to the raft group (quorum of the group peers have received
+    // those tasks and stored them on the backing storage).
+    //
+    // Once this function returns to the caller, we will regard all the iterated
+    // tasks through |iter| have been successfully applied. And if you didn't
+    // apply all the the given tasks, we would regard this as a critical error
+    // and report a error whose type is ERROR_TYPE_STATE_MACHINE.
+    virtual void on_apply(::braft::Iterator& iter) = 0;
+
     // Invoked when the belonging node becomes the leader of the group at |term|
     // Default: Do nothing
     virtual void on_leader_start(int64_t term);
