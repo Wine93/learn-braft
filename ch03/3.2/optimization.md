@@ -501,6 +501,8 @@ void Replicator::_on_heartbeat_returned(
 
 产生 `Stale Read` 的原因是产生分区后，负责读取的 Leader 已经不是最新的 Leader 了。为了解决上面提到的 `Stale Read`，Raft 提出了以下 3 种读取方式：
 
+> 注意：下图方案图中标记的延时在计算时都忽略了 `read local` 这个步骤，因为这取决于具体的状态机实现
+
 **方案一：Raft Log Read**
 
 ![图 3.11  Raft Log Read](image/3.11.png)
@@ -521,7 +523,7 @@ Leader 接收到读取请求后：
 当然，基于 `ReadIndex Read` 可以实现 `Follower Read`：
 
 1. Follower 收到读取请求后，向 Leader 发送请求获取 Leader 的 `readIndex`
-2. Leader 从走上面的步骤 12，并将 readIndex 返回给 Follower
+2. Leader 重走上面的步骤 1,2，并将 `readIndex` 返回给 Follower
 3. Follower 等待自己的状态机执行，直到 `applyIndex>=readIndex`
 4. Follower 执行读取请求，将结果返回给客户端
 
@@ -550,7 +552,7 @@ Leader Lease
 
 `Leader Lease` 的实现原理是基于一个共同承诺，超半数节点共同承诺在收到 Leader RPC 之后的 `election_timeout_ms` 时间内不再参与投票，这保证了在这段时间内集群内不会产生新的 Leader，正如上图所示。
 
-虽然 Leader 和 Follower 计算超时时间都是用的本地时钟，但是由于时钟漂移问题的存在，即各个节点时钟跑的快慢（振幅）不一样，导致 Follower 提前跑完了 `election_timeout_ms`，从而投票给了别人，让集群在分区场景下产生了多个 Leader。为了防止这种现象，`Follower Lease` 的时间加了一个 `max_clock_drift`，其等于 `election_timeout_ms`（默认为 1 秒），这样即使 Follower 时钟跑得稍微快了些也没有关系。但是针对机器之间时钟振幅相差很大的情况，仍然无法解决。总的来说，Follower 的时钟跑慢点没问题，但是跑快点就可能违背以上的承诺，要想 `Leader Lease` 正常工作，得确保 Leader 和 Follower 的之间的漂移在一定误差内。
+虽然 Leader 和 Follower 计算超时时间都是用的本地时钟，但是由于时钟漂移问题的存在，即各个节点时钟跑的快慢（振幅）不一样，导致 Follower 提前跑完了 `election_timeout_ms`，从而投票给了别人，让集群在分区场景下产生了多个 Leader。为了防止这种现象，`Follower Lease` 的时间加了一个 `max_clock_drift`，其等于 `election_timeout_ms`（默认为 1 秒），这样即使 Follower 时钟跑得稍微快了些也没有关系。但是针对机器之间时钟振幅相差很大的情况，仍然无法解决。总的来说，Follower 的时钟跑慢点没问题，但是跑快点就可能违背以上的承诺，要想 `Leader Lease` 正常工作，得确保 个节点之间的时钟漂移在一定误差内。
 
 `Leader Lease` 的实现必须依赖我们上述提到的 [Follower Lease](#follower-lease)，其实在 braft 中，`Follower Lease` 正是属于 `Leader Lease` 功能的一部分。
 
