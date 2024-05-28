@@ -153,94 +153,46 @@ void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
 
 我们考虑上图中在网络分区中发生的一种现象：
 
-* (a)：正常的集群，各节点都能收到 Leader 的心跳；
-* (b)：发生网络分区后，由于被隔离节点收不到 Leader 的心跳，在等待 `election_timeout_ms` 后触发选举，进行选举时会将角色转变为 Candidate，并将自身的 `term` 加一后广播 `RequestVote` 请求；然而由于收不到足够的选票，在 `vote_timeout_ms` 后宣布选举失败从而触发新一轮的选举；不断的选举致使该节点的 `term` 不断增大；
-* (c)：当网络恢复后，Leader 得知该节点的 `term` 比其大，将会自动降为 Follower，从而触发了重新选主。值得一提的是，Leader 有多种渠道得知该节点的 `term` 比其大，因为节点之间所有的 RPC 请求与响应都会带上自身的 `term`，所以可能是该节点选举发出的 `RequestVote` 请求，也可能是其心跳的响应，这取决于第一个发往 Leader 的 RPC 包。
+* (a)：节点 `S1` 被选为 `term 1` 的 Leader，正常向 `S2,S3` 发送心跳
+* (b)：发生网络分区后，节点 `S2` 收不到 Leader `S1` 的心跳，在等待 `election_timeout_ms` 后触发选举，进行选举时会将角色转变为 Candidate，并将自身的 `term` 加一后广播 `RequestVote` 请求；然而由于分区收不到足够的选票，在 `vote_timeout_ms` 后宣布选举失败从而触发新一轮的选举；不断的选举致使 `S2` 的 `term` 不断增大
+* (c)：当网络恢复后，Leader `S1` 得知 `S2` 的 `term` 比其大，将会自动降为 Follower，从而触发了重新选主。值得一提的是，Leader `S1` 有多种渠道得知 `S2` 的 `term` 比其大，因为节点之间所有的 RPC 请求与响应都会带上自身的 `term`，所以可能是 `S2` 选举发出的 `RequestVote` 请求，也可能是 `S2` 响应 `S1` 的心跳请求，这取决于第一个发往 Leader `S1` 的 RPC 包。
 
-从上面可以看到，当节点重新回归到集群时，由于其 `term` 比 Leader 大，致使 Leader 降为 Follower，从而触发重新选主。而本质原因是，一个不可能赢得选举的节点不断增加了 Term，
-其实这次选举时没必要的，
+从上面可以看到，当节点 `S2` 重新回归到集群时，由于其 `term` 比 Leader 大，致使 Leader 降为 Follower，从而触发重新选主。而 `S2` 大概率不会赢得选举，最终的 Leader 可能还是 `S1`，因为在节点 `S2` 被隔离的这段时间，`S1,S3` 有新的日志写入，导致 `S1,S3` 的日志都要比 `S2` 新，所以这么看，这是一次没有必要的选举。
 
 为了解决这一问题，Raft 在正式请求投票前引入了 `PreVote` 阶段，该阶段不会增加自身 `term`，并且节点需要在 `PreVote` 获得足够多的选票才能正式进入 `RequestVote` 阶段。
 
-节点在收到 *Pre-Vote* 和 *Vote* 请求后，判断是否要投赞成票的逻辑是一样的，需要同时满足以下 2 个条件：
+PreVote
+---
+在同一任期内，节点发出的 `PreVote` 请求和 `RequestVote` 请求的内容是一样的，区别在于：
+  * `PreVote` 请求中的 `term` 为自身的 `term` 加上 1
+  * 而发送 `RequestVote` 请求前会先将自身的 `term` 加 1，再将其作为请求中的 `term`
 
-* **Term**: `request.term >= currentTerm`
-* **Log**: `request.lastLogTerm > lastLogTerm` 或者 `request.lastLogTerm == lastLogTerm && request.lastLogIndex >= lastLogIndex`
+节点对于 `RequestVote` 请求投赞成票需要同时满足以下 3 个条件，而 `PreVote` 只需满足前 2 个条件：
 
-唯一的区别在于：
+* term：候选人的 `term` 要大于等于自己的 `term`
+* lastLog：候选人的最后一条日志要和自己的一样新或者新于自己
+* votedFor：自己的 `votedFor` 为空或者等于候选人的 ID
 
-* *Vote* 会记录当前任期，确保在同一个任期内只会给一个候选人投票，而 `Pre-Vote` 则可以同时投票给多个候选人，只要其满足以上 2 个条件
-* `step_down`
+`PreVote` 与 `RequestVote` 的差异：
 
-从差异可以看出，*Pre-Vote* 更像是一次预检，检测其连通性和合法性，并没有实际的动作。
+* 处理 `RequestVote` 请求时会记录 `votedFor`，确保在同一个任期内只会给一个候选人投票；而 `PreVote` 则可以同时投票给多个候选人，只要其满足上述的 2 个条件
+* 处理 `RequestVote` 请求时若发现请求中的 `term` 比自身的大，会 `step_down` 成 Follower，而 `PreVote` 则不会，这点可以确保不会在 `PreVote` 阶段打断当前 Leader
+
+从以上差异可以看出，`PreVote` 更像是一次预检，检测其连通性和合法性，并没有实际的动作。
+
+> **日志新旧比较**
+>
+> 日志由 `term` 和 `index` 组成，对于 2 条日志 `a` 和 `b` 来说：
+> * 若其 `term` 和 `index` 都一样，则 2 条日志一样新
+> * 若 `(a.term > b.term) || (a.term == b.term && a.index > b.index)`，则日志 `a` 新于日志 `b`
 
 具体实现
 ---
 
-当节点选举定时器超时时，先开始 `PreVote`；在 `PreVote` 并不会自身的角色和 `term`；
-```cpp
-void ElectionTimer::run() {
-    _node->handle_election_timeout();
-}
+具体实现我们在 [3.1 选举流程](/ch03/3.1/election.md)中已经详细解析过了，详见：
 
-void NodeImpl::handle_election_timeout() {
-    ...
-    return pre_vote(&lck, triggered);
-    // Don't touch any thing of *this ever after
-}
-
-void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
-    ...
-    for (std::set<PeerId>::const_iterator
-            iter = peers.begin(); iter != peers.end(); ++iter) {
-        ...
-        OnPreVoteRPCDone* done = new OnPreVoteRPCDone(...);
-        ...
-        // 请求中的 term 为自身的 term 加一
-        done->request.set_term(_current_term + 1); // next term
-        ...
-        RaftService_Stub stub(&channel);
-        stub.pre_vote(&done->cntl, &done->request, &done->response, done);
-    }
-    grant_self(&_pre_vote_ctx, lck);
-}
-```
-
-当 `PreVote` 阶段收到足够多的选票，调用 `elect_self` 进入 `RequestVote` 阶段：
-```cpp
-void NodeImpl::grant_self(VoteBallotCtx* vote_ctx, std::unique_lock<raft_mutex_t>* lck) {
-    ...
-    vote_ctx->grant(_server_id);  // 获得一票
-    if (!vote_ctx->granted()) {
-        return;
-    }
-
-    // 获得足够多的选票
-    if (vote_ctx == &_pre_vote_ctx) {
-        elect_self(lck);
-    }
-    ...
-}
-```
-
-在 `RequestVote` 阶段会将转变成 Candidate、增加自身的 `term` 并且会保存 `votedFor`：
-
-```cpp
-void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
-                          bool old_leader_stepped_down) {
-    ...
-    _state = STATE_CANDIDATE;
-    _current_term++;
-    _voted_id = _server_id;
-    ...
-    status = _meta_storage->
-                    set_term_and_votedfor(_current_term, _server_id, _v_group_id);
-    ...
-    grant_self(&_vote_ctx, lck);
-}
-```
-
-更多详情参见[选举流程](/ch03/3.1/election.md)。
+* [第一阶段：PreVote](/ch03/3.1/election.md#jie-duan-yi-prevote)
+* [第二阶段：RequestVote](/ch03/3.1/election.md#jie-duan-er-requestvote)
 
 优化 4：Follower Lease
 ===
@@ -356,8 +308,7 @@ int NodeImpl::handle_pre_vote_request(const RequestVoteRequest* request,
     do {
         ...
         int64_t votable_time = _follower_lease.votable_time_from_now();
-        bool grantable = (LogId(request->last_log_index(), request->last_log_term())
-                        >= last_log_id);
+        ...
         if (grantable) {
             granted = (votable_time == 0);
             rejected_by_lease = (votable_time > 0);
