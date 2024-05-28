@@ -464,7 +464,7 @@ void Replicator::_send_empty_entries(bool is_heartbeat) {
                         response.release(), done);
 }
 
-// 心跳响应：
+// 心跳响应：参数 rpc_send_time 为上述创建 Closure 时保存
 void Replicator::_on_heartbeat_returned(
         ReplicatorId id, brpc::Controller* cntl,
         AppendEntriesRequest* request,
