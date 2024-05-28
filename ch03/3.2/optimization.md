@@ -163,33 +163,11 @@ void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
 
 PreVote
 ---
-在同一任期内，节点发出的 `PreVote` 请求和 `RequestVote` 请求的内容是一样的，区别在于：
-  * `PreVote` 请求中的 `term` 为自身的 `term` 加上 1
-  * 而发送 `RequestVote` 请求前会先将自身的 `term` 加 1，再将其作为请求中的 `term`
-
-节点对于 `RequestVote` 请求投赞成票需要同时满足以下 3 个条件，而 `PreVote` 只需满足前 2 个条件：
-
-* term：候选人的 `term` 要大于等于自己的 `term`
-* lastLog：候选人的最后一条日志要和自己的一样新或者新于自己
-* votedFor：自己的 `votedFor` 为空或者等于候选人的 ID
-
-`PreVote` 与 `RequestVote` 的差异：
-
-* 处理 `RequestVote` 请求时会记录 `votedFor`，确保在同一个任期内只会给一个候选人投票；而 `PreVote` 则可以同时投票给多个候选人，只要其满足上述的 2 个条件
-* 处理 `RequestVote` 请求时若发现请求中的 `term` 比自身的大，会 `step_down` 成 Follower，而 `PreVote` 则不会，这点可以确保不会在 `PreVote` 阶段打断当前 Leader
-
-从以上差异可以看出，`PreVote` 更像是一次预检，检测其连通性和合法性，并没有实际的动作。
-
-> **日志新旧比较**
->
-> 日志由 `term` 和 `index` 组成，对于 2 条日志 `a` 和 `b` 来说：
-> * 若其 `term` 和 `index` 都一样，则 2 条日志一样新
-> * 若 `(a.term > b.term) || (a.term == b.term && a.index > b.index)`，则日志 `a` 新于日志 `b`
+关于 `PreVote` 的作用以及其与 `RequestVote` 之间的区别，我们已经在[<3.1 选举流程>](/ch03/3.1/election.md)中介绍过了，参见[投票规则](/ch03/3.1/election.md#tou-piao-gui-ze)。
 
 具体实现
 ---
-
-具体实现我们在 [3.1 选举流程](/ch03/3.1/election.md)中已经详细解析过了，详见：
+具体实现我们也在[<3.1 选举流程>](/ch03/3.1/election.md)中已经详细解析过了，参见：
 
 * [第一阶段：PreVote](/ch03/3.1/election.md#jie-duan-yi-prevote)
 * [第二阶段：RequestVote](/ch03/3.1/election.md#jie-duan-er-requestvote)
