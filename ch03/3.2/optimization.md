@@ -226,6 +226,7 @@ Follower 每次收到 Leader 的心跳或 `AppendEntries` 请求就会更新 Lea
 ---
 
 当我们手动转移 Leader 时，希望集群内能尽快产生新 Leader，而 Follower Lease 的存在可能导致一些节点不会投票给新的候选人，直至 Lease 过期。 为此 braft 在实现时做了一个优化，其大致流程如下：
+
 * 当 Leader 转移领导权给候选人时，候选人会立即发起选举（跳过 `PreVote`）
 * 当候选人收到老 Leader 的投票后，会在 `RequestVote` 的请求中带上该 Leader 的 Id（即 `disrupted_leader`），并对那些因 Lease 而拒绝的节点重发 `RequestVote` 请求
 * 所有节点在收到 `RequestVote` 请求后，如果发现请求中带有 `disrupted_leader` 并且`disrupted_leader` 等于之前 Follower Lease 跟随的 Leader，则将当前 Lease 作废并投赞成票
