@@ -35,9 +35,9 @@ Replicator
 
 节点刚成为 Leader 时会为每个 Follower 创建一个 `Replicator`，其运行在单独的 `bthread` 上，其主要有以下几个作用：
 
-* 记录 Follower 的一些状态，如 `nextIndex`、`lastRPCTimestamp`
-* 任何发往 Follower 的指令都将通过 `Replicator` 发送，如 `InstallSnapshot`
-* 同步日志：`Replicator` 会不断地向 Follower 同步日志，直到 Follower 成功复制了 Leader 的所有日志后，其将在后台等待新日志的到来。
+* 记录 Follower 的一些状态，如 `nextIndex`、`flyingAppendEntriesSize`
+* 作为 RPC Client，所有从 Leader 发往 Follower 的 RPC 请求都会通过它，包括心跳、`AppendEntriesRequest`、`InstallSnapshotRequest`；
+* 同步日志：`Replicator` 会不断地向 Follower 同步日志，直到 Follower 成功复制了 Leader 的所有日志后，其将会后台等待新日志的到来。
 
 nextIndex
 ---

@@ -553,9 +553,9 @@ void NodeImpl::become_leader() {
     // init commit manager
     _ballot_box->reset_pending_index(_log_manager->last_log_index() + 1);
 
+    // (5) 复制并提交本一条任期的配置日志
     // Register _conf_ctx to reject configuration changing before the first log
     // is committed.
-    // (5)
     _conf_ctx.flush(_conf.conf, _conf.old_conf);
 
     // (6) 启动 StepdownTimer，用于实现 Check Quorum 优化
@@ -571,7 +571,7 @@ Leader 会为每个 Follower 创建对应 `Replicator`，并将其启动。每�
 
 * 记录 Follower 的一些状态，比如 `nextIndex`、`flyingAppendEntriesSize` 等；
 * 作为 RPC Client，所有从 Leader 发往 Follower 的 RPC 请求都会通过它，包括心跳、`AppendEntriesRequest`、`InstallSnapshotRequest`；
-* 最重要的就是复制日志。`Replicator` 默认在后台等待，当 Leader 通过 `LogManager` 追加日志时，就会唤醒 `Replicator` 进行发送日志，发送完了继续后台等待新日志的到来，整个过来是个流水线式的实现，没有任何阻塞。`Replicator` 的目的是同步 Follower 与 Leader 的日志，只要 Follower 还落后于 Leader，其就会一直工作。
+* 同步日志：`Replicator` 会不断地向 Follower 同步日志，直到 Follower 成功复制了 Leader 的所有日志后，其会在后台等待新日志的到来。
 
 调用 `Replicator::start` 来创建 `Replicator`，并将其启动：
 
@@ -621,7 +621,7 @@ int Replicator::start(const ReplicatorOptions& options, ReplicatorId *id) {
 
 `Replicator` 调用 `_start_heartbeat_timer` 启动心跳定时器，其每隔一段时间会发送 `ETIMEDOUT` 状态码，而 `Replicator` 收到该状态码后，会调用 `_send_heartbeat` 发送心跳。
 
-调用 `_start_heartbeat_timer` 启动心跳定时器，心跳间隔在节点初始化时通过 `heartbeat_timeout` 函数算得：
+调用 `_start_heartbeat_timer` 启动心跳定时器，心跳间隔时间在节点初始化时通过 `heartbeat_timeout` 函数算得：
 ```cpp
 void Replicator::_start_heartbeat_timer(long start_time_us) {
     const timespec due_time = butil::milliseconds_from(
@@ -645,7 +645,7 @@ static inline int heartbeat_timeout(int election_timeout) {
 }
 ```
 
-每隔一段时间会向 `Replicator` 发送 `ETIMEDOUT` 状态码：
+定时器会每隔一段时间向 `Replicator` 发送 `ETIMEDOUT` 状态码：
 ```cpp
 void Replicator::_on_timedout(void* arg) {
     bthread_id_t id = { (uint64_t)arg };
@@ -672,7 +672,7 @@ int Replicator::_on_error(bthread_id_t id, void* arg, int error_code) {
 
 void* Replicator::_send_heartbeat(void* arg) {
     ...
-    r->_send_empty_entries(true);
+    r->_send_empty_entries(true);  // 发送空的 `AppendEntries` 请求
     return NULL;
 }
 ```
@@ -683,7 +683,7 @@ void* Replicator::_send_heartbeat(void* arg) {
 Leader 通过发送空的 `AppendEntries` 请求来探测 Follower 的 `nextIndex`，
 只有确定了 `nextIndex` 才能正式向 Follower 发送日志。这里忽略了很多细节，关于 `nextIndex` 的作用和匹配算法，以及相关实现可参考 [4.1 日志复制](/ch04/4.1/replicate.md)中的相关内容：
 * [nextIndex](/ch04/4.1/replicate.md#nextindex)
-* [具体实现](/ch04/4.1/replicate.md#前置步骤确定-nextindex)
+* [具体实现](/ch04/4.1/replicate.md#qian-zhi-bu-zhou-que-ding-nextindex)
 
 ```cpp
 void Replicator::_send_empty_entries(bool is_heartbeat) {
@@ -713,42 +713,37 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
 复制之前任期日志
 ---
 
-上述我们已经为每一个 Follower 创建了 `Replicator`，并且确认了每个 Follower 的 `nextIndex`，这时候 `Replicator` 通过 `nextIndex` 判断 Follower 日志还落后于 Leader，将自动向 Follower 发送日志，直至与 Leader 对齐位置。
+上述我们已经为每一个 Follower 创建了 `Replicator`，并且确认了每个 Follower 的 `nextIndex`，这时候 `Replicator` 通过 `nextIndex` 判断 Follower 日志还落后于 Leader，将自动向 Follower 同步日志，直至与 Leader 对齐为止。
 
-只复制不提交，如果直接提交会出现幽灵日志问题
+注意，这些日志只复制并不提交。通常情况下，Leader 每向一个 Follower 成功复制日志后，都会调用 `BallotBox::commit_at` 将对应日志的投票数加一，当投票数达到 `Quorum` 时，Leader 就会更新 `commitIndex`，并应用这些日志。
+
+节点在刚成 Leader 时通过调用以下函数将第一条可以提交的 `logIndex` （即 `_pending_index`）设为了 Leader 的 `lastLogIndex+1`：
 
 ```cpp
+void NodeImpl::become_leader() {
+    _ballot_box->reset_pending_index(_log_manager->last_log_index() + 1);
+}
 
-// 当一个节点成为 leader 时，需要调用 reset_pending_index() 来重置 _pending_index:
-//   _ballot_box->reset_pending_index(_log_manager->last_log_index() + 1);
 int BallotBox::reset_pending_index(int64_t new_pending_index) {
-    BAIDU_SCOPED_LOCK(_mutex);
-    CHECK(_pending_index == 0 && _pending_meta_queue.empty())
-        << "pending_index " << _pending_index << " pending_meta_queue "
-        << _pending_meta_queue.size();
-    CHECK_GT(new_pending_index, _last_committed_index.load(
-                                    butil::memory_order_relaxed));
+    ...
     _pending_index = new_pending_index;
     _closure_queue->reset_first_index(new_pending_index);
     return 0;
 }
+```
 
+在调用 `commit_at` 函数时，只有 `logIndex>=_pending_index` 的日志才能被提交：
+```cpp
 // 将 index 在 [fist_log_index, last_log_index] 之间的日志的投票数加一
 int BallotBox::commit_at(
         int64_t first_log_index, int64_t last_log_index, const PeerId& peer) {
-    // FIXME(chenzhangyi01): The cricital section is unacceptable because it
-    // blocks all the other Replicators and LogManagers
-    std::unique_lock<raft_mutex_t> lck(_mutex);
-    if (_pending_index == 0) {
-        return EINVAL;
-    }
-    if (last_log_index < _pending_index) {
+    ...
+    if (last_log_index < _pending_index) {  // (1) 如果在 _pending_index 之前的日志将无法被提交
         return 0;
     }
-    if (last_log_index >= _pending_index + (int64_t)_pending_meta_queue.size()) {
-        return ERANGE;
-    }
+    ...
 
+    // (2) 在这之后的日志可以正常计算 `Quorum`
     int64_t last_committed_index = 0;
     const int64_t start_at = std::max(_pending_index, first_log_index);
     Ballot::PosHint pos_hint;
@@ -763,146 +758,69 @@ int BallotBox::commit_at(
     if (last_committed_index == 0) {
         return 0;
     }
-
-    // When removing a peer off the raft group which contains even number of
-    // peers, the quorum would decrease by 1, e.g. 3 of 4 changes to 2 of 3. In
-    // this case, the log after removal may be committed before some previous
-    // logs, since we use the new configuration to deal the quorum of the
-    // removal request, we think it's safe to commit all the uncommitted
-    // previous logs, which is not well proved right now
-    // TODO: add vlog when committing previous logs
-    for (int64_t index = _pending_index; index <= last_committed_index; ++index) {
-        _pending_meta_queue.pop_front();
-    }
-
+    ...
     _pending_index = last_committed_index + 1;
-    _last_committed_index.store(last_committed_index, butil::memory_order_relaxed);
-    lck.unlock();
+    _last_committed_index.store(last_committed_index, butil::memory_order_relaxed);  // (3) 更新 commitIndex
     // The order doesn't matter
-    _waiter->on_committed(last_committed_index);
+    _waiter->on_committed(last_committed_index);  // (4) 调用 FSMCaller::do_committed 开始应用日志
     return 0;
 }
-
 ```
-
 
 提交 no-op 日志
 ---
 
-
+一般 Raft 实现会在节点当选 Leader 后提交一条本任期的 `no-op` 日志，而 braft 中提交的是本任期的配置日志。在节点成为 Leader 后调用 `_conf_ctx.flush(...)` 复制并提交配置日志：
 
 ```cpp
 void NodeImpl::ConfigurationCtx::flush(const Configuration& conf,
                                        const Configuration& old_conf) {
-    CHECK(!is_busy());
-    conf.list_peers(&_new_peers);
-    if (old_conf.empty()) {
-        _stage = STAGE_STABLE;
-        _old_peers = _new_peers;
-    } else {
-        _stage = STAGE_JOINT;
-        old_conf.list_peers(&_old_peers);
-    }
+    ...
+    _stage = STAGE_STABLE;
+    _old_peers = _new_peers;
+    ...
     _node->unsafe_apply_configuration(conf, old_conf.empty() ? NULL : &old_conf,
                                       true);
 
 }
+```
 
+`ConfigurationCtx::flush` 会调用 `unsafe_apply_configuration` 函数来做以下几件事：
+```cpp
 void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
                                           const Configuration* old_conf,
                                           bool leader_start) {
-    CHECK(_conf_ctx.is_busy());
-    LogEntry* entry = new LogEntry();
-    entry->AddRef();
-    entry->id.term = _current_term;
-    entry->type = ENTRY_TYPE_CONFIGURATION;
-    entry->peers = new std::vector<PeerId>;
-    new_conf.list_peers(entry->peers);
-    if (old_conf) {
-        entry->old_peers = new std::vector<PeerId>;
-        old_conf->list_peers(entry->old_peers);
-    }
+    ...
+    // (1) 设置日志应用后的回调函数，
+    //     即该配置日志被复制并成功应用后（调用 on_on_configuration_committed）
+    //     就会调用该回调函数
     ConfigurationChangeDone* configuration_change_done =
             new ConfigurationChangeDone(this, _current_term, leader_start, _leader_lease.lease_epoch());
     // Use the new_conf to deal the quorum of this very log
     _ballot_box->append_pending_task(new_conf, old_conf, configuration_change_done);
 
+    // (2) 将配置日志追加到 LogManager，其会唤醒 Replicator 向 Follower 同步日志
     std::vector<LogEntry*> entries;
     entries.push_back(entry);
     _log_manager->append_entries(&entries,
                                  new LeaderStableClosure(
                                         NodeId(_group_id, _server_id),
                                         1u, _ballot_box));
+    // (3) 将配置设为当前节点配置
     _log_manager->check_and_set_configuration(&_conf);
-}
-```
-
-下面涉及到日志复制的流程，我们在这里只列出关键逻辑，之后会在日志复制章节详细讲解。
-
-```cpp
-// 将 index 在 [fist_log_index, last_log_index] 之间的日志的投票数加一
-int BallotBox::commit_at(
-        int64_t first_log_index, int64_t last_log_index, const PeerId& peer) {
-    // FIXME(chenzhangyi01): The cricital section is unacceptable because it
-    // blocks all the other Replicators and LogManagers
-    std::unique_lock<raft_mutex_t> lck(_mutex);
-    if (_pending_index == 0) {
-        return EINVAL;
-    }
-    if (last_log_index < _pending_index) {
-        return 0;
-    }
-    if (last_log_index >= _pending_index + (int64_t)_pending_meta_queue.size()) {
-        return ERANGE;
-    }
-
-    int64_t last_committed_index = 0;
-    const int64_t start_at = std::max(_pending_index, first_log_index);
-    Ballot::PosHint pos_hint;
-    for (int64_t log_index = start_at; log_index <= last_log_index; ++log_index) {
-        Ballot& bl = _pending_meta_queue[log_index - _pending_index];
-        pos_hint = bl.grant(peer, pos_hint);
-        if (bl.granted()) {
-            last_committed_index = log_index;
-        }
-    }
-
-    if (last_committed_index == 0) {
-        return 0;
-    }
-
-    // When removing a peer off the raft group which contains even number of
-    // peers, the quorum would decrease by 1, e.g. 3 of 4 changes to 2 of 3. In
-    // this case, the log after removal may be committed before some previous
-    // logs, since we use the new configuration to deal the quorum of the
-    // removal request, we think it's safe to commit all the uncommitted
-    // previous logs, which is not well proved right now
-    // TODO: add vlog when committing previous logs
-    for (int64_t index = _pending_index; index <= last_committed_index; ++index) {
-        _pending_meta_queue.pop_front();
-    }
-
-    _pending_index = last_committed_index + 1;
-    _last_committed_index.store(last_committed_index, butil::memory_order_relaxed);
-    lck.unlock();
-    // The order doesn't matter
-    _waiter->on_committed(last_committed_index);
-    return 0;
 }
 ```
 
 ## on_apply
 ## on_configuration_committed
 
-所有已经提交的日志都会被 `apply`，如果该日志类型是配置，则回调状态机的 `on_configuration_committed`，否则回调 `on_apply`，这些逻辑都在 `do_committed` 函数中处理。上面我们提到本任期的配置日志是当前 Leader 的最后一条日志，所以会先调用一个或多个 `on_apply`，最后再调用 `on_configuration_committed`。
+上面已经提到将配置日志交给 `LogManager` 进行复制，待其复制达到 `Quorum` 后，才会更新 `commitIndex`，并会调用 `FSMCaller::do_committed` 开始应用日志，参见上述的 `BallotBox::commit_at` 函数。
 
-在回调完 `on_configuration_committed`
+当然应用的日志包括之前任期的日志和本任期的配置日志。如果日志类型是配置，则调用状态机的 `on_configuration_committed`，否则回调 `on_apply`：
 
 ```cpp
 void FSMCaller::do_committed(int64_t committed_index) {
-    if (!_error.status().ok()) {
-        return;
-    }
+    ...
     int64_t last_applied_index = _last_applied_index.load(
                                         butil::memory_order_relaxed);
 
@@ -910,56 +828,43 @@ void FSMCaller::do_committed(int64_t committed_index) {
     if (last_applied_index >= committed_index) {
         return;
     }
-    std::vector<Closure*> closure;
-    int64_t first_closure_index = 0;
-    CHECK_EQ(0, _closure_queue->pop_closure_until(committed_index, &closure,
-                                                  &first_closure_index));
-
+    ...
     IteratorImpl iter_impl(_fsm, _log_manager, &closure, first_closure_index,
                  last_applied_index, committed_index, &_applying_index);
     for (; iter_impl.is_good();) {
-        if (iter_impl.entry()->type != ENTRY_TYPE_DATA) {
+            ...
+            // (1) 如果是配置日志，则调用状态机的 `on_configuration_committed`
             if (iter_impl.entry()->type == ENTRY_TYPE_CONFIGURATION) {
-                if (iter_impl.entry()->old_peers == NULL) {
-                    // Joint stage is not supposed to be noticeable by end users.
+                    ...
                     _fsm->on_configuration_committed(
                             Configuration(*iter_impl.entry()->peers),
                             iter_impl.entry()->id.index);
                 }
             }
-            // For other entries, we have nothing to do besides flush the
-            // pending tasks and run this closure to notify the caller that the
-            // entries before this one were successfully committed and applied.
+            ...
+            // (1.1) 调用回调函数，即 `ConfigurationChangeDone`
             if (iter_impl.done()) {
                 iter_impl.done()->Run();
             }
             iter_impl.next();
             continue;
         }
+        ...
+        // (2) 如果是普通日志，则调用状态机的 `on_apply`
         Iterator iter(&iter_impl);
         _fsm->on_apply(iter);
-        LOG_IF(ERROR, iter.valid())
-                << "Node " << _node->node_id()
-                << " Iterator is still valid, did you return before iterator "
-                   " reached the end?";
-        // Try move to next in case that we pass the same log twice.
+        ...
         iter.next();
     }
-    if (iter_impl.has_error()) {
-        set_error(iter_impl.error());
-        iter_impl.run_the_rest_closure_with_error();
-    }
-    const int64_t last_index = iter_impl.index() - 1;
-    const int64_t last_term = _log_manager->get_term(last_index);
-    LogId last_applied_id(last_index, last_term);
+    // (3) 更新 applyindex
     _last_applied_index.store(committed_index, butil::memory_order_release);
-    _last_applied_term = last_term;
-    _log_manager->set_applied_id(last_applied_id);
 }
 ```
 
 on_leader_start
 ---
+
+在配置日志被应用（即调用 `on_configuration_committed`）后，会调用其回调函数 `ConfigurationChangeDone::Run()`，在该函数中会调用状态机的 `on_leader_start` 开启 Leader 任期：
 
 ```cpp
 class ConfigurationChangeDone : public Closure {
@@ -975,6 +880,3 @@ public:
     ...
 };
 ```
-
-参考
-===
