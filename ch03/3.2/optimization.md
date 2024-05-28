@@ -765,8 +765,8 @@ int64_t NodeImpl::last_leader_active_timestamp(const Configuration& conf) {
     }
 
     // (4) 返回堆里最小的时间戳
-    //     之所以要返回最早的，因为先发送 RPC 的，会先开始 Follower Lease，
-    //     当然其也会越早过期，违背承诺，投票给其他节点
+    //     之所以要返回最早的，是因为先发送 RPC 的，会先开始 Follower Lease，
+    //     当然其也会先过期，违背承诺，投票给其他节点
     std::pop_heap(last_rpc_send_timestamps.begin(), last_rpc_send_timestamps.end(), compare);
     return last_rpc_send_timestamps.back();
 }
