@@ -155,7 +155,7 @@ void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
 
 * (a)：节点 `S1` 被选为 `term 1` 的 Leader，正常向 `S2,S3` 发送心跳
 * (b)：发生网络分区后，节点 `S2` 收不到 Leader `S1` 的心跳，在等待 `election_timeout_ms` 后触发选举，进行选举时会将角色转变为 Candidate，并将自身的 `term` 加一后广播 `RequestVote` 请求；然而由于分区收不到足够的选票，在 `vote_timeout_ms` 后宣布选举失败从而触发新一轮的选举；不断的选举致使 `S2` 的 `term` 不断增大
-* (c)：当网络恢复后，Leader `S1` 得知 `S2` 的 `term` 比其大，将会自动降为 Follower，从而触发了重新选主。值得一提的是，Leader `S1` 有多种渠道得知 `S2` 的 `term` 比其大，因为节点之间所有的 RPC 请求与响应都会带上自身的 `term`，所以可能是 `S2` 选举发出的 `RequestVote` 请求，也可能是 `S2` 响应 `S1` 的心跳请求，这取决于第一个发往 Leader `S1` 的 RPC 包。
+* (c)：当网络恢复后，Leader `S1` 得知 `S2` 的 `term` 比其大，将会自动降为 Follower，从而触发了重新选主。值得一提的是，Leader `S1` 有多种渠道得知 `S2` 的 `term` 比其大，因为节点之间所有的 RPC 请求与响应都会带上自身的 `term`，所以可能是 `S2` 选举发出的 `RequestVote` 请求，也可能是 `S2` 响应 `S1` 的心跳请求，这取决于第一个发往 Leader `S1` 的 RPC 包
 
 从上面可以看到，当节点 `S2` 重新回归到集群时，由于其 `term` 比 Leader 大，致使 Leader 降为 Follower，从而触发重新选主。而 `S2` 大概率不会赢得选举，最终的 Leader 可能还是 `S1`，因为在节点 `S2` 被隔离的这段时间，`S1,S3` 有新的日志写入，导致 `S1,S3` 的日志都要比 `S2` 新，所以这么看，这是一次没有必要的选举。
 
@@ -163,10 +163,12 @@ void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
 
 PreVote
 ---
+
 关于 `PreVote` 的作用以及其与 `RequestVote` 之间的区别，我们已经在[<3.1 选举流程>](/ch03/3.1/election.md)中介绍过了，参见[投票规则](/ch03/3.1/election.md#tou-piao-gui-ze)。
 
 具体实现
 ---
+
 具体实现我们也在[<3.1 选举流程>](/ch03/3.1/election.md)中已经详细解析过了，参见：
 
 * [第一阶段：PreVote](/ch03/3.1/election.md#jie-duan-yi-prevote)
@@ -175,7 +177,7 @@ PreVote
 优化 4：Follower Lease
 ===
 
-上面我们提到了 `PreVote` 优化可以阻止在对称网络分区情况下，节点重新加入集群干扰集群的场景，下面会描述在非对称网络下，`PreVote` 无法阻止的一些场景。
+上面我们提到了 `PreVote` 优化可以阻止在对称网络分区情况下，节点重新加入集群干扰集群的场景，下面会介绍在非对称网络下，`PreVote` 无法阻止的一些场景。
 
 非对称网络分区
 ---
@@ -186,8 +188,13 @@ PreVote
 * 在发起选举的短时间内，各成员拥有相同的日志，此时上层无写入
 
 ![图 3.7  ](image/3.7.png)
+**场景 (a)：**
 
-* (a) 集群出现非对称网络分区，只有节点 `S1` 与 `S2` 之间无法通信；`S2` 因分区收不到 Leader 的心跳而触发选举；S2 的 PreVote 获得 S2、S3 的同意；S2 将 Term 变为 2 并被 S2、S3 选为 Leader；S2 向 S3 发送心跳，致使 S3 将自身 Term 变为 2；S1 发现 S2 的 Term 比自己高，遂降为 Follower
+* `S1` 为 `term 1` 的 Leader；集群出现非对称网络分区，只有节点 `S1` 与 `S2` 之间无法通信
+* 节点 `S2` 因分区收不到 Leader `S1` 的心跳而触发选举；`S2` 在 `PreVote` 阶段获得 `S2,S3` 的同意
+* `S2` 将 `term` 变为 2 并在 `ReuquestVote` 阶段获得 `S2,S3` 同意被选为 `term 2` 的 Leader
+* Leader `S2` 向 `S3` 发送心跳，致使 `S3` 将自身 `term` 变为 2
+* `S1` 发现 `S2` 的 `term` 比自己高，遂降为 Follower，从而触发 `S1,S3` 这个分区的重新选举
 
 Follower Lease
 ---
@@ -635,3 +642,4 @@ TODO：
 * [TiKV 功能介绍 – Lease Read](https://cn.pingcap.com/blog//lease-read/)
 * [CAP理论中的P到底是个什么意思？](https://www.zhihu.com/question/54105974)
 * [TiDB 新特性漫谈：从 Follower Read 说起](https://cn.pingcap.com/blog/follower-read-the-new-features-of-tidb/#Follower_Read)
+* [raft 成员变更](https://zhuanlan.zhihu.com/p/606448818)

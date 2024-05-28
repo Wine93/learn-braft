@@ -555,8 +555,274 @@ void NodeImpl::become_leader() {
 阶段三：同步新配置
 ===
 
+新阶段
+---
+
+```cpp
+void NodeImpl::ConfigurationCtx::next_stage() {
+    CHECK(is_busy());
+    switch (_stage) {
+    case STAGE_CATCHING_UP:
+        if (_nchanges > 1) {
+            _stage = STAGE_JOINT;
+            Configuration old_conf(_old_peers);
+            return _node->unsafe_apply_configuration(
+                    Configuration(_new_peers), &old_conf, false);
+        }
+        // Skip joint consensus since only one peer has been changed here. Make
+        // it a one-stage change to be compitible with the legacy
+        // implementation.
+    case STAGE_JOINT:
+        _stage = STAGE_STABLE;
+        return _node->unsafe_apply_configuration(
+                    Configuration(_new_peers), NULL, false);
+    case STAGE_STABLE:
+        {
+            bool should_step_down =
+                _new_peers.find(_node->_server_id) == _new_peers.end();
+            butil::Status st = butil::Status::OK();
+            reset(&st);
+            if (should_step_down) {
+                _node->step_down(_node->_current_term, true,
+                        butil::Status(ELEADERREMOVED, "This node was removed"));
+            }
+            return;
+        }
+    case STAGE_NONE:
+        CHECK(false) << "Can't reach here";
+        return;
+    }
+}
+```
+
+```cpp
+void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
+                                          const Configuration* old_conf,
+                                          bool leader_start) {
+    CHECK(_conf_ctx.is_busy());
+    LogEntry* entry = new LogEntry();
+    entry->AddRef();
+    entry->id.term = _current_term;
+    entry->type = ENTRY_TYPE_CONFIGURATION;
+    entry->peers = new std::vector<PeerId>;
+    new_conf.list_peers(entry->peers);
+    if (old_conf) {
+        entry->old_peers = new std::vector<PeerId>;
+        old_conf->list_peers(entry->old_peers);
+    }
+    ConfigurationChangeDone* configuration_change_done =
+            new ConfigurationChangeDone(this, _current_term, leader_start, _leader_lease.lease_epoch());
+    // Use the new_conf to deal the quorum of this very log
+    _ballot_box->append_pending_task(new_conf, old_conf, configuration_change_done);
+
+    std::vector<LogEntry*> entries;
+    entries.push_back(entry);
+    _log_manager->append_entries(&entries,
+                                 new LeaderStableClosure(
+                                        NodeId(_group_id, _server_id),
+                                        1u, _ballot_box));
+    _log_manager->check_and_set_configuration(&_conf);
+}
+```
+
+提交新配置
+---
+
+```cpp
+class ConfigurationChangeDone : public Closure {
+public:
+    void Run() {
+        if (status().ok()) {
+            _node->on_configuration_change_done(_term);
+            if (_leader_start) {
+                _node->leader_lease_start(_lease_epoch);
+                _node->_options.fsm->on_leader_start(_term);
+            }
+        }
+        delete this;
+    }
+private:
+    ConfigurationChangeDone(
+            NodeImpl* node, int64_t term, bool leader_start, int64_t lease_epoch)
+        : _node(node)
+        , _term(term)
+        , _leader_start(leader_start)
+        , _lease_epoch(lease_epoch)
+    {
+        _node->AddRef();
+    }
+    ~ConfigurationChangeDone() {
+        _node->Release();
+        _node = NULL;
+    }
+friend class NodeImpl;
+    NodeImpl* _node;
+    int64_t _term;
+    bool _leader_start;
+    int64_t _lease_epoch;
+};
+```
+
+```cpp
+void NodeImpl::on_configuration_change_done(int64_t term) {
+    BAIDU_SCOPED_LOCK(_mutex);
+    if (_state > STATE_TRANSFERRING || term != _current_term) {
+        LOG(WARNING) << "node " << node_id()
+                     << " process on_configuration_change_done "
+                     << " at term=" << term
+                     << " while state=" << state2str(_state)
+                     << " and current_term=" << _current_term;
+        // Callback from older version
+        return;
+    }
+    _conf_ctx.next_stage();
+}
+```
+
+
 阶段四：清理工作
 ===
+
+新阶段
+---
+
+```cpp
+void NodeImpl::ConfigurationCtx::next_stage() {
+    ...
+    case STAGE_STABLE:
+        {
+            bool should_step_down =
+                _new_peers.find(_node->_server_id) == _new_peers.end();
+            butil::Status st = butil::Status::OK();
+            reset(&st);
+            if (should_step_down) {
+                _node->step_down(_node->_current_term, true,
+                        butil::Status(ELEADERREMOVED, "This node was removed"));
+            }
+            return;
+        }
+    ...
+}
+```
+
+```cpp
+void NodeImpl::ConfigurationCtx::reset(butil::Status* st) {
+    // reset() should be called only once
+    if (_stage == STAGE_NONE) {
+        BRAFT_VLOG << "node " << _node->node_id()
+                   << " reset ConfigurationCtx when stage is STAGE_NONE already";
+        return;
+    }
+
+    LOG(INFO) << "node " << _node->node_id()
+              << " reset ConfigurationCtx, new_peers: " << Configuration(_new_peers)
+              << ", old_peers: " << Configuration(_old_peers);
+    if (st && st->ok()) {
+        _node->stop_replicator(_new_peers, _old_peers);
+    } else {
+        // leader step_down may stop replicators of catching up nodes, leading to
+        // run catchup_closure
+        _node->stop_replicator(_old_peers, _new_peers);
+    }
+    _new_peers.clear();
+    _old_peers.clear();
+    _adding_peers.clear();
+    ++_version;
+    _stage = STAGE_NONE;
+    _nchanges = 0;
+    _node->check_majority_nodes_readonly();
+    if (_done) {
+        if (!st) {
+            _done->status().set_error(EPERM, "leader stepped down");
+        } else {
+            _done->status() = *st;
+        }
+        run_closure_in_bthread(_done);
+        _done = NULL;
+    }
+}
+```
+
+停止 Replicator
+---
+
+```cpp
+void NodeImpl::stop_replicator(const std::set<PeerId>& keep,
+                               const std::set<PeerId>& drop) {
+    for (std::set<PeerId>::const_iterator
+            iter = drop.begin(); iter != drop.end(); ++iter) {
+        if (keep.find(*iter) == keep.end() && *iter != _server_id) {
+            _replicator_group.stop_replicator(*iter);
+        }
+    }
+}
+```
+
+```cpp
+int ReplicatorGroup::stop_replicator(const PeerId &peer) {
+    std::map<PeerId, ReplicatorIdAndStatus>::iterator iter = _rmap.find(peer);
+    if (iter == _rmap.end()) {
+        return -1;
+    }
+    ReplicatorId rid = iter->second.id;
+    // Calling ReplicatorId::stop might lead to calling stop_replicator again,
+    // erase iter first to avoid race condition
+    _rmap.erase(iter);
+    return Replicator::stop(rid);
+}
+```
+
+```cpp
+int Replicator::stop(ReplicatorId id) {
+    bthread_id_t dummy_id = { id };
+    Replicator* r = NULL;
+    // already stopped
+    if (bthread_id_lock(dummy_id, (void**)&r) != 0) {
+        return 0;
+    }
+    // to run _catchup_closure if it is not NULL
+    r->_notify_on_caught_up(EPERM, true);
+    CHECK_EQ(0, bthread_id_unlock(dummy_id)) << "Fail to unlock " << dummy_id;
+    return bthread_id_error(dummy_id, ESTOP);
+}
+```
+
+```cpp
+int Replicator::_on_error(bthread_id_t id, void* arg, int error_code) {
+    Replicator* r = (Replicator*)arg;
+    if (error_code == ESTOP) {
+        brpc::StartCancel(r->_install_snapshot_in_fly);
+        brpc::StartCancel(r->_heartbeat_in_fly);
+        brpc::StartCancel(r->_timeout_now_in_fly);
+        r->_cancel_append_entries_rpcs();
+        bthread_timer_del(r->_heartbeat_timer);
+        r->_options.log_manager->remove_waiter(r->_wait_id);
+        r->_notify_on_caught_up(error_code, true);
+        r->_wait_id = 0;
+        LOG(INFO) << "Group " << r->_options.group_id
+                  << " Replicator=" << id << " is going to quit";
+        r->_destroy();
+        return 0;
+    } else if (error_code == ETIMEDOUT) {
+        // This error is issued in the TimerThread, start a new bthread to avoid
+        // blocking the caller.
+        // Unlock id to remove the context-switch out of the critical section
+        CHECK_EQ(0, bthread_id_unlock(id)) << "Fail to unlock" << id;
+        bthread_t tid;
+        if (bthread_start_urgent(&tid, NULL, _send_heartbeat,
+                                 reinterpret_cast<void*>(id.value)) != 0) {
+            PLOG(ERROR) << "Fail to start bthread";
+            _send_heartbeat(reinterpret_cast<void*>(id.value));
+        }
+        return 0;
+    } else {
+        CHECK(false) << "Group " << r->_options.group_id
+                     << " Unknown error_code=" << error_code;
+        CHECK_EQ(0, bthread_id_unlock(id)) << "Fail to unlock " << id;
+        return -1;
+    }
+}
+```
 
 其他：故障恢复
 ===
