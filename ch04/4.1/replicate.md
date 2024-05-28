@@ -153,7 +153,7 @@ public:
 };
 ```
 
-前置步骤：确定 nextIndex
+前置阶段：确定 nextIndex
 ===
 
 Leader 通过发送空的 `AppendEntries` 来探测 Follower 的 `nextIndex`

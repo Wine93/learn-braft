@@ -569,9 +569,9 @@ void NodeImpl::become_leader() {
 
 Leader 会为每个 Follower 创建对应 `Replicator`，并将其启动。每个 `Replicator` 都是单独的 `bthread`，它主要有以下 3 个作用：
 
-* 记录 Follower 的一些状态，比如 `nextIndex`、`flyingAppendEntriesSize` 等；
-* 作为 RPC Client，所有从 Leader 发往 Follower 的 RPC 请求都会通过它，包括心跳、`AppendEntriesRequest`、`InstallSnapshotRequest`；
-* 同步日志：`Replicator` 会不断地向 Follower 同步日志，直到 Follower 成功复制了 Leader 的所有日志后，其会在后台等待新日志的到来。
+* 记录 Follower 的一些状态，比如 `nextIndex`、`flyingAppendEntriesSize` 等
+* 作为 RPC Client，所有从 Leader 发往 Follower 的 RPC 请求都会通过它，包括心跳、`AppendEntriesRequest`、`InstallSnapshotRequest`
+* 同步日志：`Replicator` 会不断地向 Follower 同步日志，直到 Follower 成功复制了 Leader 的所有日志后，其会在后台等待新日志的到来
 
 调用 `Replicator::start` 来创建 `Replicator`，并将其启动：
 
@@ -683,7 +683,7 @@ void* Replicator::_send_heartbeat(void* arg) {
 Leader 通过发送空的 `AppendEntries` 请求来探测 Follower 的 `nextIndex`，
 只有确定了 `nextIndex` 才能正式向 Follower 发送日志。这里忽略了很多细节，关于 `nextIndex` 的作用和匹配算法，以及相关实现可参考 [4.1 日志复制](/ch04/4.1/replicate.md)中的相关内容：
 * [nextIndex](/ch04/4.1/replicate.md#nextindex)
-* [具体实现](/ch04/4.1/replicate.md#qian-zhi-bu-zhou-que-ding-nextindex)
+* [具体实现](/ch04/4.1/replicate.md#qian-zhi-jie-duan-que-ding-nextindex)
 
 ```cpp
 void Replicator::_send_empty_entries(bool is_heartbeat) {
@@ -717,18 +717,19 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
 
 注意，这些日志只复制并不提交。通常情况下，Leader 每向一个 Follower 成功复制日志后，都会调用 `BallotBox::commit_at` 将对应日志的投票数加一，当投票数达到 `Quorum` 时，Leader 就会更新 `commitIndex`，并应用这些日志。
 
-节点在刚成 Leader 时通过调用以下函数将第一条可以提交的 `logIndex` （即 `_pending_index`）设为了 Leader 的 `lastLogIndex+1`：
+节点在刚成为 Leader 时通过调用以下函数将第一条可以提交的 `logIndex` （即 `_pending_index`）设为了 Leader 的 `lastLogIndex+1`：
 
 ```cpp
 void NodeImpl::become_leader() {
+    ...
     _ballot_box->reset_pending_index(_log_manager->last_log_index() + 1);
+    ...
 }
 
 int BallotBox::reset_pending_index(int64_t new_pending_index) {
     ...
     _pending_index = new_pending_index;
-    _closure_queue->reset_first_index(new_pending_index);
-    return 0;
+    ...
 }
 ```
 
@@ -738,7 +739,8 @@ int BallotBox::reset_pending_index(int64_t new_pending_index) {
 int BallotBox::commit_at(
         int64_t first_log_index, int64_t last_log_index, const PeerId& peer) {
     ...
-    if (last_log_index < _pending_index) {  // (1) 如果在 _pending_index 之前的日志将无法被提交
+    // (1) 如果在 _pending_index 之前的日志将无法被提交
+    if (last_log_index < _pending_index) {
         return 0;
     }
     ...
@@ -760,9 +762,11 @@ int BallotBox::commit_at(
     }
     ...
     _pending_index = last_committed_index + 1;
-    _last_committed_index.store(last_committed_index, butil::memory_order_relaxed);  // (3) 更新 commitIndex
+    // (3) 更新 commitIndex
+    _last_committed_index.store(last_committed_index, butil::memory_order_relaxed);
+    // (4) 调用 FSMCaller::do_committed 开始应用日志
     // The order doesn't matter
-    _waiter->on_committed(last_committed_index);  // (4) 调用 FSMCaller::do_committed 开始应用日志
+    _waiter->on_committed(last_committed_index);
     return 0;
 }
 ```
@@ -770,9 +774,15 @@ int BallotBox::commit_at(
 提交 no-op 日志
 ---
 
-一般 Raft 实现会在节点当选 Leader 后提交一条本任期的 `no-op` 日志，而 braft 中提交的是本任期的配置日志。在节点成为 Leader 后调用 `_conf_ctx.flush(...)` 复制并提交配置日志：
+一般 Raft 实现会在节点当选 Leader 后提交一条本任期的 `no-op` 日志，而 braft 中提交的是本任期的配置日志。在节点刚成为 Leader 时会调用 `ConfigurationCtx::flush` 复制并提交配置日志：
 
 ```cpp
+void NodeImpl::become_leader() {
+    ...
+    _conf_ctx.flush(_conf.conf, _conf.old_conf);
+    ...
+}
+
 void NodeImpl::ConfigurationCtx::flush(const Configuration& conf,
                                        const Configuration& old_conf) {
     ...
@@ -792,7 +802,7 @@ void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
                                           bool leader_start) {
     ...
     // (1) 设置日志应用后的回调函数，
-    //     即该配置日志被复制并成功应用后（调用 on_on_configuration_committed）
+    //     即该配置日志被复制并成功应用（调用 on_on_configuration_committed）后
     //     就会调用该回调函数
     ConfigurationChangeDone* configuration_change_done =
             new ConfigurationChangeDone(this, _current_term, leader_start, _leader_lease.lease_epoch());
@@ -842,7 +852,7 @@ void FSMCaller::do_committed(int64_t committed_index) {
                 }
             }
             ...
-            // (1.1) 调用回调函数，即 `ConfigurationChangeDone`
+            // (1.1) 其待被应用后，调用回调函数，即 `ConfigurationChangeDone::Run`
             if (iter_impl.done()) {
                 iter_impl.done()->Run();
             }
@@ -864,7 +874,7 @@ void FSMCaller::do_committed(int64_t committed_index) {
 on_leader_start
 ---
 
-在配置日志被应用（即调用 `on_configuration_committed`）后，会调用其回调函数 `ConfigurationChangeDone::Run()`，在该函数中会调用状态机的 `on_leader_start` 开启 Leader 任期：
+在配置日志被应用（即调用 `on_configuration_committed`）后，其会调用其回调函数 `ConfigurationChangeDone::Run()`，在该函数中会调用状态机的 `on_leader_start` 开启 Leader 任期：
 
 ```cpp
 class ConfigurationChangeDone : public Closure {
