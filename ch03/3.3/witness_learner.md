@@ -24,7 +24,7 @@ Witness
 * 双中心：一个中心不可用，服务可能就不可用（取决于不可用中心是否为多数节点所在中心）
 * 三中心：只有当两个中心同时不可用时，服务才不可用
 
-但是三中心意味着需要更多的资源，这时候可以将一个副本设置成 `Witness`，而部署 `Witness` 的节点可以为低配机器，因为其不存储任何数据。这样在保证可用性的同时又降低了成本。
+但是三中心意味着需要更多的资源，这时候可以将一个副本设置成 `Witness`，而部署 `Witness` 的节点可以为低配机器，因为其不存储数据。这样在保证可用性的同时又降低了成本。
 
 ![图 3.15  Witness 的应用](image/3.15.png)
 
@@ -137,7 +137,7 @@ Learner 具有以下特征：
 
 > 当然，Learner 也可以支持读到最新的数据；如果 Raft 库支持 ReadIndex 的话，那可以在 Learner 上实现类似 Follower Read 的功能，详见 [ReadIndex Read](/ch03/3.2/optimization.md#xian-xing-yi-zhi-xing-du)。
 
-![图 3.16  Learner 的应用场景](image/learner.png)
+![图 3.16  Learner 的应用场景](image/3.16.png)
 
 具体实现
 ---
