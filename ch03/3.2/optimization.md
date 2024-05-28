@@ -199,7 +199,7 @@ PreVote
 
 **场景 (b)：**
 
-该场景主要描述的是通过配置变更后，被移除的节点干扰集群的场景，由于这里涉及配置变更相关的流程，所以该场景我们将在[<6.1 配置变更>](/ch06/6.1/configuration_change.md)中详细介绍，参见[干扰集群](/ch06/6.1/configuration_change.md#ganraojiqun)。
+该场景主要描述的是通过配置变更后，被移除的节点干扰集群的场景，由于这里涉及配置变更相关的流程，所以该场景我们将在[<6.1 配置变更>](/ch06/6.1/configuration_change.md)中详细介绍，参见[干扰集群](/ch06/6.1/configuration_change.md#gan-rao-ji-qun)。
 
 **场景 (c)：**
 
@@ -208,7 +208,7 @@ PreVote
 * `S2` 将 `term` 变为 2，并在 `ReuquestVote` 阶段获得 `S2,S3` 同意被选为 `term 2` 的 Leader
 * `S1` 因得知集群内有节点 `term` 比它高，遂降为 Follower
 
-从上面三个场景可以看出，其实这些选举都是没必要的，因为保持原来的 Leader 依然可以让集群正常工作。
+从以上三个场景可以看出，其实这些选举都是没必要的，因为保持原来的 Leader 依然可以让集群正常工作。
 
 Follower Lease
 ---
