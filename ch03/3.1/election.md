@@ -158,7 +158,7 @@ public:
 阶段一：PreVote
 ===
 
-![图 3.1  PreVote 整体流程](image/3.2.png)
+![图 3.2  PreVote 整体流程](image/3.2.png)
 
 触发投票
 ---
@@ -334,7 +334,7 @@ TODO(Wine93):
 阶段二：RequestVote
 ===
 
-![图 3.2  RequestVote 整体流程](image/3.3.png)
+![图 3.3  RequestVote 整体流程](image/3.3.png)
 
 发送请求
 ---
@@ -523,7 +523,7 @@ void NodeImpl::handle_vote_timeout() {
 阶段三：成为 Leader
 ===
 
-![图 3.3  become_leader 整体实现](image/3.4.png)
+![图 3.4  become_leader 整体流程](image/3.4.png)
 
 ## 成为 Leader
 
@@ -770,6 +770,8 @@ int BallotBox::commit_at(
     return 0;
 }
 ```
+
+这里可能忽略了一些日志复制的细节，你可以参考 [4.1 日志复制](/ch04/4.1/replicate.md)中的相关内容。
 
 提交 no-op 日志
 ---
