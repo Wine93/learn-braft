@@ -483,55 +483,55 @@ void Replicator::_on_heartbeat_returned(
 违背线性一致性
 ---
 
-![图 3.10 ](image/3.10.png)
+![图 3.10  分区导致系统违背线性一致性](image/3.10.png)
 
 我们考虑上图所示的场景：
 
-* `S1` 被 `S2,S3` 选为 `term 1` 的 `Leader`
-* 由于集群发生网络分区，`S3` 收不到 `S1` 的心跳，发起选举，被 S2,S3 选为 Term 2 的 Leader
-* 此时 Client 1 往 S3 写入数据（x=1），并返回成功
-* 在此之后，Client 2 从 S1 读取 x 的值，将得到 0
+* 节点 `S1` 被 `S2,S3` 选为 `term 1` 的 `Leader`
+* 由于集群发生网络分区，`S3` 收不到 `S1` 的心跳，发起选举，被 `S2,S3` 选为 `term 2` 的 Leader
+* 此时 `Client 1` 往新 Leader `S3` 写入数据（`x=1`），并返回成功
+* 在此之后，`Client 2` 从老 Leader `S1` 读取 `x` 的值，得到的将是 `0`
 
-从上面可以看到，Client 1 在 Client 2 写入后读到的依旧是老数据，这违背了线性一致性。当然，上面提到的 Check Quorum 机制可以减少其（S1）存在的时间，但是不能完全避免。
+从上面可以看到，`Client 1` 在 `Client 2` 写入后读到的依旧是老数据，这违背了线性一致性。当然，上面提到的 `Check Quorum` 机制可以减少老 Leader `S1` 存在的时间，但是不能完全避免。
 
-> 值得一提的是，对于某些数据不共享的系统，即对某块数据的读写只由单个客户端负责的模型，可以不用考虑该场景；因为其读写都会在同一个 Leader，不会违背线性一致性。
+> 值得一提的是，对于某些数据不共享的系统，即对某块数据的读写只由单个客户端负责的模型，可以不用考虑该场景；因为其读写都会在同一个 Leader 上，所以不会违背线性一致性。
 
 线性一致性读
 ---
 
-产生 `Stale Read` 的本质原因是负责读取的 Leader 已经不是最新的 Leader 了。 为了解决上面提到的 `Stale Read`，Raft 提出了以下 3 种读取方式：
+产生 `Stale Read` 的原因是产生分区后，负责读取的 Leader 已经不是最新的 Leader 了。为了解决上面提到的 `Stale Read`，Raft 提出了以下 3 种读取方式：
 
 **方案一：Raft Log Read**
 
-![图 3.11  Raft Log Read](image/raft_log_read.png)
+![图 3.11  Raft Log Read](image/3.11.png)
 
 Leader 接收到读取请求后，将读请求的 Log 走一遍日志的复制，待其被提交后，apply 的时候读取状态机的数据返回给客户端。显然，这种读取方式非常的低效。
 
 **方案二：ReadIndex Read**
 
-![图 3.12  ReadIndex Read](image/read_index.png)
+![图 3.12  ReadIndex Read](image/3.12.png)
 
 Leader 接收到读取请求后：
 
-1. 将当前的 `CommitIndex` 记为 `ReadIndex`；
-2. 向 Follower 发送心跳，收到 `Quorum` 成功响应可以确定自己依旧是 Leader；
-3. Leader 等待自己的状态机执行，直到 `ApplyIndex>=ReadIndex`；
-4. Leader 执行读取请求，将结果返回给客户端；
+1. 将当前的 `commitIndex` 记为 `readIndex`
+2. 向 Follower 发送心跳，收到 `Quorum` 成功响应可以确定自己依旧是 Leader
+3. Leader 等待自己的状态机执行，直到 `applyIndex>=readIndex`
+4. Leader 执行读取请求，将结果返回给客户端
 
-当然，基于 `ReadIndex Read` 可以实现 Follower Read：
+当然，基于 `ReadIndex Read` 可以实现 `Follower Read`：
 
-1. Follower 收到读取请求后，向 Leader 发送请求获取 Leader 的 `ReadIndex`
-2. Leader 从走上面的步骤 12，并将 ReadIndex 返回给 Follower
-3. Follower 等待自己的状态机执行，直到 `ApplyIndex>=ReadIndex`；
-4. Follower 执行读取请求，将结果返回给客户端；
+1. Follower 收到读取请求后，向 Leader 发送请求获取 Leader 的 `readIndex`
+2. Leader 从走上面的步骤 12，并将 readIndex 返回给 Follower
+3. Follower 等待自己的状态机执行，直到 `applyIndex>=readIndex`
+4. Follower 执行读取请求，将结果返回给客户端
 
-可以看到 ReadIndex Read 比 Raft Log Read 拥有更好的时延。
+可以看到 `ReadIndex Read` 比 `Raft Log Read` 拥有更低的时延。
 
 **方案三：Lease Read**
 
-![图 3.13  Lease Read](image/lease_read.png)
+![图 3.13  Lease Read](image/3.13.png)
 
-我们上面提到，违背线性一致性的原因是集群产生了多主，当前 Leader 已不是最新的 Leader。而 braft 提供的 Leader Lease 可以确保在租约内，集群中只有当前一个主。基于其实现的读取方式，称为 Lease Read。
+我们上面提到，违背线性一致性的原因是集群分区后产生了多主，当前 Leader 已不是最新的 Leader。而 braft 提供的 `Leader Lease` 可以确保在租约内，集群中只有当前一个主。基于其实现的读取方式，称为 `Lease Read`。
 
 只要 Leader 判断其还在租约内，可以直接读取状态机向客户端返回结果。
 
@@ -546,13 +546,13 @@ Leader 接收到读取请求后：
 Leader Lease
 ---
 
-![图 3.14  Leader Lease 的有效时间区间](image/leader_lease.png)
+![图 3.14  3 副本场景下 Leader Lease 有效时间区间](image/3.14.png)
 
-Leader Lease 的实现原理是基于一个共同承诺，超半数节点共同承诺在收到 Leader RPC 之后的 `election_timeout_ms` 时间内不再参与投票，这保证了在这段时间内集群内不会产生新的 Leader，正如上图所示。
+`Leader Lease` 的实现原理是基于一个共同承诺，超半数节点共同承诺在收到 Leader RPC 之后的 `election_timeout_ms` 时间内不再参与投票，这保证了在这段时间内集群内不会产生新的 Leader，正如上图所示。
 
-虽然 Leader 和 Follower 计算超时时间都是用的本地时钟，但是由于时钟漂移问题的存在，即各个节点时钟跑的快慢（振幅）不一样，导致 Follower 提前跑完了 `election_timeout_ms`，从而投票给了别人，让集群产生了多个 Leader。为了防止这种现象，Follower Lease 的时间加了一个 `max_clock_drift`，其等于 `election_timeout_ms`，默认是 1 秒，这样即使 Follower 时钟跑得稍微快了些也没有关系。但是针对机器之间时钟振幅相差很大的情况，仍然无法解决。
+虽然 Leader 和 Follower 计算超时时间都是用的本地时钟，但是由于时钟漂移问题的存在，即各个节点时钟跑的快慢（振幅）不一样，导致 Follower 提前跑完了 `election_timeout_ms`，从而投票给了别人，让集群在分区场景下产生了多个 Leader。为了防止这种现象，`Follower Lease` 的时间加了一个 `max_clock_drift`，其等于 `election_timeout_ms`（默认为 1 秒），这样即使 Follower 时钟跑得稍微快了些也没有关系。但是针对机器之间时钟振幅相差很大的情况，仍然无法解决。总的来说，Follower 的时钟跑慢点没问题，但是跑快点就可能违背以上的承诺，要想 `Leader Lease` 正常工作，得确保 Leader 和 Follower 的之间的漂移在一定误差内。
 
-Leader Lease 的实现必须依赖我们上述提到的 [Follower Lease](#follower-lease)，其实在 braft 中，Follower Lease 正是属于 Leader Lease 功能的一部分。
+`Leader Lease` 的实现必须依赖我们上述提到的 [Follower Lease](#follower-lease)，其实在 braft 中，`Follower Lease` 正是属于 `Leader Lease` 功能的一部分。
 
 具体实现
 ---
