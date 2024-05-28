@@ -188,13 +188,27 @@ PreVote
 * 在发起选举的短时间内，各成员拥有相同的日志，此时上层无写入
 
 ![图 3.7  ](image/3.7.png)
+
 **场景 (a)：**
 
-* `S1` 为 `term 1` 的 Leader；集群出现非对称网络分区，只有节点 `S1` 与 `S2` 之间无法通信
-* 节点 `S2` 因分区收不到 Leader `S1` 的心跳而触发选举；`S2` 在 `PreVote` 阶段获得 `S2,S3` 的同意
-* `S2` 将 `term` 变为 2 并在 `ReuquestVote` 阶段获得 `S2,S3` 同意被选为 `term 2` 的 Leader
+* 节点 `S1` 为 `term 1` 的 Leader；集群出现非对称网络分区，只有 `S1` 与 `S2` 之间无法通信
+* `S2` 因分区收不到 Leader `S1` 的心跳而触发选举；`S2` 在 `PreVote` 阶段获得 `S2,S3` 的同意
+* `S2` 将 `term` 变为 2，并在 `ReuquestVote` 阶段获得 `S2,S3` 同意被选为 `term 2` 的 Leader
 * Leader `S2` 向 `S3` 发送心跳，致使 `S3` 将自身 `term` 变为 2
 * `S1` 发现 `S2` 的 `term` 比自己高，遂降为 Follower，从而触发 `S1,S3` 这个分区的重新选举
+
+**场景 (b)：**
+
+该场景主要描述的是通过配置变更后，被移除的节点干扰集群的场景，由于这里涉及到配置变更相关的流程，所以该场景我们将在[<6.1 配置变更>](/ch06/6.1/configuration.md)中详细介绍，参见[干扰集群](/ch06/6.1/configuration_change.md#ganraojiqun)。值得一提的是，即使没有 Follower Lease，该场景在目前 braft 的实现中也是不会发生的。
+
+**场景 (c)：**
+
+* 节点 `S1` 为 `term 1` 的 Leader
+* 由于网络间歇丢包，导致 `S2` 未能在 `election_timeout_ms` 时间内收到心跳，从而触发选举；`S2` 在 `PreVote` 阶段收到 `S2,S3` 的同意
+* `S2` 将 `term` 变为 2，并在 `ReuquestVote` 阶段获得 `S2,S3` 同意被选为 `term 2` 的 Leader
+* `S3` 因得知集群内有节点 `term` 比它高，遂降为 Follower
+
+从上面这 3 个场景可以已看出，其实这些选举都没被必要的，因为保持原来的 Leader 依然可以让集群正常工作。
 
 Follower Lease
 ---
@@ -202,56 +216,48 @@ Follower Lease
 为了解决这个问题，braft 引入了 `Follower Lease` 的特性。当 Follower 认为 Leader 还存活的时候，在 `election_timeout_ms` 时间内就不会投票给别的成员。
 Follower 每次收到 Leader 的心跳或 `AppendEntries` 请求就会更新 Lease，该 Lease 有效时间区间如下：
 
-![图 3.8  Follower Leader 的有效时间区间](image/3.8.png)
+![图 3.8  Follower Lease 有效时间区间](image/3.8.png)
 
 > **关于 max_clock_drift**
 >
-> 需要注意的是，Follower Lease 其实是下面提到的 Leader Lease 的一部分，之所以引入 `max_clock_drift`，主要是考虑时钟漂移的问题，各节点时钟跑的快慢不一样，这在下面也会讲到。
+> 需要注意的是，Follower Lease 其实是下面提到的 Leader Lease 特性的一部分。之所以引入 `max_clock_drift`，主要是考虑时钟漂移的问题，关于这一点我们将在下面 Leader Lease 一节中详细介绍。单就 Follower Lease 这个特性来说，加不加该偏移值都不会影响其正确性。
+
+转移 Leader
+---
+
+当我们手动转移 Leader 时，希望集群内能尽快产生新 Leader，而 Follower Lease 的存在可能导致一些节点不会投票给新的候选人，直至 Lease 过期。 为此 braft 在实现时做了一个优化，其大致流程如下：
+* 当 Leader 转移领导权给候选人时，候选人会立即发起选举（跳过 `PreVote`）
+* 当候选人收到老 Leader 的投票后，会在 `RequestVote` 的请求中带上该 Leader 的 Id（即 `disrupted_leader`），并对那些因 Lease 而拒绝的节点重发 `RequestVote` 请求
+* 所有节点在收到 `RequestVote` 请求后，如果发现请求中带有 `disrupted_leader` 并且`disrupted_leader` 等于之前 Follower Lease 跟随的 Leader，则将当前 Lease 作废并投赞成票
+
+总的来说，如果候选人的领导权是由老 Leader 交接而来，其他跟随老 Leader 的节点就可以放弃 Lease 安心投票，让集群尽快产生 Leader。具体细节以及相关实现见 [PR#262](https://github.com/baidu/braft/pull/262)。
 
 具体实现
 ---
 
-初始化 Lease：
+在节点启动时会初始化 Lease：
 
 ```cpp
-void FollowerLease::init(int64_t election_timeout_ms, int64_t max_clock_drift_ms) {
-    _election_timeout_ms = election_timeout_ms;
-    _max_clock_drift_ms = max_clock_drift_ms;
-    // When the node restart, we are not sure when the lease will be expired actually,
-    // so just be conservative.
-    _last_leader_timestamp = butil::monotonic_time_ms();
-}
-
-void FollowerLease::reset() {
-    _last_leader = PeerId();
-    _last_leader_timestamp = 0;
-}
-
-// 在节点初始化的时候初始化 Lease：
+// 在节点启动时初始化 Lease：
 int NodeImpl::init(const NodeOptions& options) {
     ...
     _follower_lease.init(options.election_timeout_ms, options.max_clock_drift_ms);
    ...
 }
 
-// 在节点成为 Leader 时重置 Lease：
-void NodeImpl::become_leader() {
-    ...
-    _follower_lease.reset();
-    ...
+void FollowerLease::init(int64_t election_timeout_ms, int64_t max_clock_drift_ms) {
+    _election_timeout_ms = election_timeout_ms;
+    _max_clock_drift_ms = max_clock_drift_ms;
+
+    // When the node restart, we are not sure when the lease will be expired actually,
+    // so just be conservative.
+    _last_leader_timestamp = butil::monotonic_time_ms();
 }
 ```
 
-更新 Lease：
+在收到 Leader 的心跳或者 `AppendEntries` 请求时更新 Lease：
 
 ```cpp
-// 更新 last_leader_timestamp
-void FollowerLease::renew(const PeerId& leader_id) {
-    _last_leader = leader_id;
-    _last_leader_timestamp = butil::monotonic_time_ms();
-}
-
-// 节点收到 Leader 的心跳或者复制日志请求：
 void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                                              const AppendEntriesRequest* request,
                                              AppendEntriesResponse* response,
@@ -264,17 +270,55 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
     }
     ...
 }
+
+// 更新 last_leader_timestamp
+void FollowerLease::renew(const PeerId& leader_id) {
+    _last_leader = leader_id;
+    _last_leader_timestamp = butil::monotonic_time_ms();
+}
 ```
 
-若在 Lease 内则拒绝投票：
+如果还在租约内，代表 Leader 还存活着，Follower 就不会给其他节点投赞成票，包括 `PreVote` 和 `RequestVote`：
 
 ```cpp
-// Lease 剩余的时间
-//   0: 不在 Lease 内，可以投票
-//   >0: 还在 Lease 内，不允许投票
+// 处理 PreVote 请求
+int NodeImpl::handle_pre_vote_request(const RequestVoteRequest* request,
+                                      RequestVoteResponse* response) {
+    ...
+    bool rejected_by_lease = false;
+    int64_t votable_time = _follower_lease.votable_time_from_now();
+    if (grantable) {
+        rejected_by_lease = (votable_time > 0);  // 大于 0 代表还在租约内，则拒绝投票
+    }
+    ...
+    response->set_rejected_by_lease(rejected_by_lease);
+    ...
+}
+
+// 处理 RequestVote 请求
+int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
+                                          RequestVoteResponse* response) {
+    ...
+    bool rejected_by_lease = false;
+    ...
+    int64_t votable_time = _follower_lease.votable_time_from_now();
+    // if the vote is rejected by lease, tell the candidate
+    if (votable_time > 0) {  // 大于 0 代表还在租约内，则拒绝投票
+        rejected_by_lease = log_is_ok;
+        break;
+    }
+    ...
+    response->set_rejected_by_lease(rejected_by_lease);
+    ...
+}
+
+/*
+ * Lease 剩余的时间
+ *  =0: 不在 Lease 内，可以投票
+ *  >0: 还在 Lease 内，不允许投票
+ */
 int64_t FollowerLease::votable_time_from_now() {
     ...
-    // votable_timestamp: 超过这个时间点可以进行投票
     int64_t now = butil::monotonic_time_ms();
     int64_t votable_timestamp = _last_leader_timestamp + _election_timeout_ms +
                                 _max_clock_drift_ms;
@@ -282,49 +326,6 @@ int64_t FollowerLease::votable_time_from_now() {
         return 0;
     }
     return votable_timestamp - now;
-}
-
-// 处理 PreVote 请求
-int NodeImpl::handle_pre_vote_request(const RequestVoteRequest* request,
-                                      RequestVoteResponse* response) {
-    ...
-    bool granted = false;
-    bool rejected_by_lease = false;
-    do {
-        ...
-        int64_t votable_time = _follower_lease.votable_time_from_now();
-        ...
-        if (grantable) {
-            granted = (votable_time == 0);
-            rejected_by_lease = (votable_time > 0);
-        }
-        ...
-
-    } while (0);
-
-    ...
-    response->set_rejected_by_lease(rejected_by_lease);
-    ...
-}
-
-// 处理 RequestVote 请求：
-int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
-                                          RequestVoteResponse* response) {
-    //
-    bool rejected_by_lease = false;
-    ...
-    bool log_is_ok = (LogId(request->last_log_index(), request->last_log_term())
-                          >= last_log_id);
-    int64_t votable_time = _follower_lease.votable_time_from_now();
-    // if the vote is rejected by lease, tell the candidate
-    if (votable_time > 0) {  // 大于 0 代表还不可以投票
-        rejected_by_lease = log_is_ok;
-        break;
-    }
-
-    ...
-    response->set_rejected_by_lease(rejected_by_lease);
-    ...
 }
 ```
 

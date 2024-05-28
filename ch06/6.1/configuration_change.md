@@ -45,6 +45,9 @@
 
 从上面可以看出，一旦 `C{old,new}` 已达到 `Quorum` 被提交，则可以立马应用 `C{new}`，因为即使此时 Leader 此时挂掉，新 Leader 也将继续推进变更从而使用  `C{new}`，等同于处于事务的隐式提交（implicit commit）一样。详见以下[故障恢复](#其他故障恢复)。
 
+干扰集群
+---
+
 <!---
 TODO:
 * https://github.com/baidu/braft/issues/204
