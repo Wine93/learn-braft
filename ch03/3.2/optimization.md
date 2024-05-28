@@ -550,7 +550,7 @@ Leader Lease
 
 `Leader Lease` 的实现原理是基于一个共同承诺，超半数节点共同承诺在收到 Leader RPC 之后的 `election_timeout_ms` 时间内不再参与投票，这保证了在这段时间内集群内不会产生新的 Leader，正如上图所示。
 
-虽然 Leader 和 Follower 计算超时时间都是用的本地时钟，但是由于时钟漂移问题的存在，即各个节点时钟跑的快慢（振幅）不一样，导致 Follower 提前跑完了 `election_timeout_ms`，从而投票给了别人，让集群在分区场景下产生了多个 Leader。为了防止这种现象，`Follower Lease` 的时间加了一个 `max_clock_drift`，其等于 `election_timeout_ms`（默认为 1 秒），这样即使 Follower 时钟跑得稍微快了些也没有关系。但是针对机器之间时钟振幅相差很大的情况，仍然无法解决。总的来说，Follower 的时钟跑慢点没问题，但是跑快点就可能违背以上的承诺，要想 `Leader Lease` 正常工作，得确保 个节点之间的时钟漂移在一定误差内。
+虽然 Leader 和 Follower 计算超时时间都是用的本地时钟，但是由于时钟漂移问题的存在，即各个节点时钟跑的快慢（振幅）不一样，导致 Follower 提前跑完了 `election_timeout_ms`，从而投票给了别人，让集群在分区场景下产生了多个 Leader。为了防止这种现象，`Follower Lease` 的时间加了一个 `max_clock_drift`，其等于 `election_timeout_ms`（默认为 1 秒），这样即使 Follower 时钟跑得稍微快了些也没有关系。但是针对机器之间时钟振幅相差很大的情况，仍然无法解决。总的来说，Follower 的时钟跑慢点没问题，但是跑快点就可能违背以上的承诺，要想 `Leader Lease` 正常工作，得确保各个节点之间的时钟漂移在一定误差内。
 
 `Leader Lease` 的实现必须依赖我们上述提到的 [Follower Lease](#follower-lease)，其实在 braft 中，`Follower Lease` 正是属于 `Leader Lease` 功能的一部分。
 
