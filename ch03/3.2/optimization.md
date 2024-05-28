@@ -561,9 +561,9 @@ braft 提供了 `is_leader_lease_valid` 和 `get_leader_lease_status` 这 2 个�
 
 * `DISABLED`：未开启 `Leader Lease` 特性；该特性默认关闭，用户需要将 `FLAGS_raft_enable_leader_lease` 设置为 `true` 来开启该特性
 * `EXPIRED`：当前 Leader 已经主动 `step_down` 了，不再是 Leader 了
-* `NOT_READY`：当前节点是 Leader，但是不保证它的数据是最新的；这会出现在节点已经当选 Leader，但还在回放数据，并未调用 `on_leader_start`；或者节点 `step_down` 时
-* `VALID`：确定当前是集群内唯一的 Leader
-* `SUSPECT`：存疑的；当前租约已经过期了，需要 Leader 根据各 Follower 的 RPC 响应时间来重新续约。braft 并不是后台线程自动续约的，而是需要 Leader 在用户调用接口时主动续约，但其实这 2 种实现的租约区间是一样的，因为 Leader 一直记录着各 Follower RPC 的响应时间，这些响应时间就是租约的另一种存在形式，在需要续租的时候将其转换成对应租约即可，参见以上图 3.14。
+* `NOT_READY`：当前节点是 Leader，但是不保证它的数据是最新的；这会出现在节点已经当选 Leader，但还在回放数据，并未调用 `on_leader_start`；亦或在节点 `step_down` 时
+* `VALID`：确定当前 Leader 是集群内唯一的 Leader
+* `SUSPECT`：存疑的；当前租约已经过期了，需要 Leader 根据与各 Follower 最后通信时间来重新续约。braft 并不是后台线程自动续约的，而是需要 Leader 在用户调用接口时主动续约，但其实这 2 种实现的租约区间是一样的，因为 Leader 一直记录着与各 Follower 最后的通信时间，这些通信时间就是租约的另一种存在形式，在需要续租的时候将其转换成对应租约即可，参见以上图 3.14。
 
 ```cpp
 bool NodeImpl::is_leader_lease_valid() {
@@ -576,7 +576,7 @@ void NodeImpl::get_leader_lease_status(LeaderLeaseStatus* lease_status) {
     // Fast path for leader to lease check
     LeaderLease::LeaseInfo internal_info;
     // (1) 先获取下当前 Lease 的状态，如果是明确的状态可直接返回给用户
-    //     如果租约已经过期了，则根据记录的 Follower RPC 响应时间重新续约
+    //     如果租约已经过期了，则根据记录的各 Follower 最后通信时间来重新续约
     _leader_lease.get_lease_info(&internal_info);
     switch (internal_info.state) {
         case LeaderLease::DISABLED:
@@ -604,7 +604,7 @@ void NodeImpl::get_leader_lease_status(LeaderLeaseStatus* lease_status) {
         return;
     }
 
-    // (3) 根据记录的 Follower 的 RPC 响应重新续约
+    // (3) 根据记录的各 Follower 最后通信时间来重新续约
     int64_t last_active_timestamp = last_leader_active_timestamp();
     _leader_lease.renew(last_active_timestamp);
 
@@ -765,7 +765,7 @@ int64_t NodeImpl::last_leader_active_timestamp(const Configuration& conf) {
     }
 
     // (4) 返回堆里最小的时间戳
-    //     之所以要返回最早的，因为越早开始 Follower Lease 的则会越早过期，违背承诺，投票给其他节点
+    //     之所以要返回最早的，因为越早发送 RPC 的，会先开始 Follower Lease，当然其也会越早过期，违背承诺，投票给其他节点
     std::pop_heap(last_rpc_send_timestamps.begin(), last_rpc_send_timestamps.end(), compare);
     return last_rpc_send_timestamps.back();
 }
