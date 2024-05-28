@@ -348,30 +348,30 @@ void FollowerLease::expire() {
 优化 5：Check Quorum
 ===
 
-前面我们讨论了 Follower 位于网络分区时出现的问题以及相关的优化，现在我们讨论下 Leader 位于网络分区下的场景。
+前面我们讨论了 Follower 被隔离于网络分区时出现的问题以及相关的优化，现在我们讨论下 Leader 被隔离于网络分区下的场景。
 
 网络分区
 ---
 
-![图 3.9  Leader 位于网路分区](image/3.9.png)
+![图 3.9  Leader 被隔离于网路分区](image/3.9.png)
 
 **场景 (a)：**
 
-* 集群出现非对称网络分区：Leader 可以向 Follower 发送请求，但是却接受不到 Follower 的响应；
-* Follower 可以一直接收到心跳，所以不会发起选举；
-* 由于 Leader 向 Follower 发送的复制日志请求，一直收不到 `ACK`，导致日志永远无法被 commit；从而导致 Leader 一直不断的重试复制（需要注意的是，日志复制是没有超时的）；
-* 客户端因写入操作超时，不断发起重试；
+* 集群出现非对称网络分区：Leader `S1` 可以向 Follower `S2,S3` 发送请求，但是却接受不到 Follower 的响应
+* Follower `S2,S3` 可以一直接收到心跳，所以不会发起选举
+* 由于 Leader `S1` 向 Follower `S2,S3` 发送的复制日志请求，一直收不到 `ACK`，导致日志永远无法被 commit；从而导致 Leader 一直不断的重试复制（需要注意的是，日志复制是没有超时的）
+* 客户端因写入操作超时，不断发起重试
 
 从上面可以看出，这种场景下，集群将永远无法写入数据，这是比较危险的。
 
 **场景 (b)：**
 
-* S1 为 Term 1 的 Leader，S2, S3 为 Follower；
-* 集群出现对称网络分区，Leader 与 Follower 之间的网络不通；
-* S3 因收不到 Leader 的心跳发起选举，被 S2,S3 选为 Term 2 的 Leader；
-* 客户端在 S1 写入操作超时；刷新 Leader，向 S3 发起重试，写入成功；
+* 节点 `S1` 为 `term 1` 的 Leader，`S2,S3` 为 Follower
+* 集群出现对称网络分区，Leader 与 Follower 之间的网络不通
+* Follower `S3` 因收不到 Leader 的心跳发起选举，被 `S2,S3` 选为 `term 2` 的 Leader
+* 客户端在老 Leader `S1` 上写入超时；刷新 Leader，向新 Leader `S3` 发起重试，写入成功；
 
-从以上流程可以看出，该场景会导致客户端的重试；如果客户端比较多的话，需要全部都刷新一遍 Leader；另外，该场景可能也会导致 `Stale Read`
+从以上流程可以看出，该场景会导致客户端的重试；如果客户端比较多的话，需要全部都刷新一遍 Leader。
 
 Check Quorum
 ---
@@ -383,6 +383,7 @@ Check Quorum
 
 当节点成为 Leader 时，会启动 `StepdownTimer`，该 Timer 每个 `election_timeout_ms` 运行运行一次：
 ```cpp
+// 成为 Leader 后启动 StepdownTimer：
 void NodeImpl::become_leader() {
     ...
     _stepdown_timer.start();
@@ -396,7 +397,7 @@ int NodeImpl::init(const NodeOptions& options) {
 }
 ```
 
-Timer 超时后，会调用 `check_dead_nodes` 检测节点的存活情况：
+Timer 超时后，会调用 `check_dead_nodes` 检测节点的存活情况，如果少于一半的节点存活，则主动降为 Follower：
 
 ```cpp
 void StepdownTimer::run() {
