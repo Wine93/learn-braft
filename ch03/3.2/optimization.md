@@ -557,10 +557,26 @@ Leader Lease
 具体实现
 ---
 
+braft 提供了 `is_leader_lease_valid` 和 `get_leader_lease_status` 这 2 个接口，用户需要在读之前调用这 2 个接口来判断当前 Leader 是否仍在租期内。`get_leader_lease_status` 函数首先会判断一下当前的租约状态，其可能是以下几种：
+
+* `DISABLED`：未开启 `Leader Lease` 特性；该特性默认关闭，用户需要将 `FLAGS_raft_enable_leader_lease` 设置为 `true` 来开启该特性
+* `EXPIRED`：当前 Leader 已经主动 `step_down` 了，不再是 Leader 了
+* `NOT_READY`：当前节点是 Leader，但是不保证它的数据是最新的；这会出现在节点已经当选 Leader，但还在回放数据，并未调用 `on_leader_start`；或者节点 `step_down` 时
+* `VALID`：确定当前是集群内唯一的 Leader
+* `SUSPECT`：存疑的；当前租约已经过期了，需要 Leader 根据各 Follower 的 RPC 响应时间来重新续约。braft 并不是后台线程自动续约的，而是需要 Leader 在用户调用接口时主动续约，但其实这 2 种实现的租约区间是一样的，因为 Leader 一直记录着各 Follower RPC 的响应时间，这些响应时间就是租约的另一种存在形式，在需要续租的时候将其转换成对应租约即可，参见以上图 3.14。
+
 ```cpp
+bool NodeImpl::is_leader_lease_valid() {
+    LeaderLeaseStatus lease_status;
+    get_leader_lease_status(&lease_status);
+    return lease_status.state == LEASE_VALID;
+}
+
 void NodeImpl::get_leader_lease_status(LeaderLeaseStatus* lease_status) {
     // Fast path for leader to lease check
     LeaderLease::LeaseInfo internal_info;
+    // (1) 先获取下当前 Lease 的状态，如果是明确的状态可直接返回给用户
+    //     如果租约已经过期了，则根据记录的 Follower RPC 响应时间重新续约
     _leader_lease.get_lease_info(&internal_info);
     switch (internal_info.state) {
         case LeaderLease::DISABLED:
@@ -582,13 +598,17 @@ void NodeImpl::get_leader_lease_status(LeaderLeaseStatus* lease_status) {
             break;
     }
 
-    BAIDU_SCOPED_LOCK(_mutex);
+    // (2) 当前已经不再是 Leader，直接返回 `EXPIRED`
     if (_state != STATE_LEADER) {
         lease_status->state = LEASE_EXPIRED;
         return;
     }
+
+    // (3) 根据记录的 Follower 的 RPC 响应重新续约
     int64_t last_active_timestamp = last_leader_active_timestamp();
     _leader_lease.renew(last_active_timestamp);
+
+    // (4) 重新获取租约状态
     _leader_lease.get_lease_info(&internal_info);
     if (internal_info.state != LeaderLease::VALID && internal_info.state != LeaderLease::DISABLED) {
         butil::Status status;
@@ -605,6 +625,115 @@ void NodeImpl::get_leader_lease_status(LeaderLeaseStatus* lease_status) {
 }
 ```
 
+`get_leader_lease_status` 会调用 `get_lease_info` 获取当前租约的状态：
+```cpp
+void LeaderLease::get_lease_info(LeaseInfo* lease_info) {
+    lease_info->term = 0;
+    lease_info->lease_epoch = 0;
+    if (!FLAGS_raft_enable_leader_lease) {  // (1) DISABLED
+        lease_info->state = LeaderLease::DISABLED;
+        return;
+    }
+
+    BAIDU_SCOPED_LOCK(_mutex);
+    if (_term == 0) {  // (2) EXPIRED
+        lease_info->state = LeaderLease::EXPIRED;
+        return;
+    }
+    if (_last_active_timestamp == 0) {  // (3) NOT_READY
+        lease_info->state = LeaderLease::NOT_READY;
+        return;
+    }
+    if (butil::monotonic_time_ms() < _last_active_timestamp + _election_timeout_ms) {  // (4) VALID
+        lease_info->term = _term;
+        lease_info->lease_epoch = _lease_epoch;
+        lease_info->state = LeaderLease::VALID;
+    } else {  // SUSPECT
+        lease_info->state = LeaderLease::SUSPECT;
+    }
+}
+```
+
+租约状态更新（1）：节点启时会创建 `LeaderLease` 并调用 `LeaderLease::init` 进行初始化
+```cpp
+int NodeImpl::init(const NodeOptions& options) {
+    ...
+    _leader_lease.init(options.election_timeout_ms);
+    ...
+}
+
+class LeaderLease {
+ public:
+ ...
+ LeaderLease()
+        : _election_timeout_ms(0)
+        , _last_active_timestamp(0)
+        , _term(0)
+        , _lease_epoch(0)
+    {}
+...
+}
+
+void LeaderLease::init(int64_t election_timeout_ms) {
+    _election_timeout_ms = election_timeout_ms;
+}
+```
+
+租约状态更新（2）：刚成为 Leader 时
+```cpp
+void NodeImpl::become_leader() {
+    ...
+    _leader_lease.on_leader_start(_current_term);
+    ...
+    // 状态机的 on_leader_start 回调在这之后
+}
+
+void LeaderLease::on_leader_start(int64_t term) {
+    ...
+    ++_lease_epoch;
+    _term = term;
+    _last_active_timestamp = 0;
+}
+```
+
+租约状态更新（3）：当 Leader `step_down` 时
+```cpp
+void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate,
+                         const butil::Status& status) {
+    ...
+    if (_state == STATE_LEADER) {
+        _leader_lease.on_leader_stop();
+    }
+    ...
+}
+
+void LeaderLease::on_leader_stop() {
+    ...
+    _last_active_timestamp = 0;
+    _term = 0;
+}
+```
+
+租约状态更新（4）：在 `get_leader_lease_status` 中调用 `last_leader_active_timestamp` 获得租约有效区间中开始的时间戳，并调用 `LeaderLease::renew` 进行续约：
+
+```cpp
+void NodeImpl::get_leader_lease_status(LeaderLeaseStatus* lease_status) {
+    ...
+    int64_t last_active_timestamp = last_leader_active_timestamp();
+    _leader_lease.renew(last_active_timestamp);
+    ...
+}
+```
+
+先看续约函数：
+```cpp
+void LeaderLease::renew(int64_t last_active_timestamp) {
+    ...
+    _last_active_timestamp = last_active_timestamp;
+}
+```
+
+`last_leader_active_timestamp` 函数会计算在达到 `Quorum` 响应的这批节点中，最早向其发送 RPC 对应的时间戳：
 ```cpp
 int64_t NodeImpl::last_leader_active_timestamp(const Configuration& conf) {
     std::vector<PeerId> peers;
@@ -616,12 +745,16 @@ int64_t NodeImpl::last_leader_active_timestamp(const Configuration& conf) {
             continue;
         }
 
+        // (1) 获取对应 Follower 的最后一次 RPC 发送时间戳，并将其放入数组中
+        //     注意 last_rpc_send_timestamp 记录的是 Leader 发出去的时间戳，
+        //     但是只有当节点返回响应时该值才有效，如果节点未响应，获取该值将得到 0
         int64_t timestamp = _replicator_group.last_rpc_send_timestamp(peers[i]);
         last_rpc_send_timestamps.push_back(timestamp);
-        // 构建最大堆
+        // (2) 根据发出去的时间戳构建最小堆
         std::push_heap(last_rpc_send_timestamps.begin(), last_rpc_send_timestamps.end(), compare);
         if (last_rpc_send_timestamps.size() > peers.size() / 2) {
-            // 每次扔掉一个最大的，
+            // (3) 每次扔掉一个最早发出去的 RPC 时间戳，保持堆里面的数量始终为 `Quorum`-1
+            //     之所以保持 `Quorum` - 1，是因为 Leader 本身也是一个节点
             std::pop_heap(last_rpc_send_timestamps.begin(), last_rpc_send_timestamps.end(), compare);
             last_rpc_send_timestamps.pop_back();
         }
@@ -630,20 +763,23 @@ int64_t NodeImpl::last_leader_active_timestamp(const Configuration& conf) {
     if (last_rpc_send_timestamps.empty()) {
         return butil::monotonic_time_ms();
     }
+
+    // (4) 返回堆里最小的时间戳
     std::pop_heap(last_rpc_send_timestamps.begin(), last_rpc_send_timestamps.end(), compare);
     return last_rpc_send_timestamps.back();
 }
+
+// 比较函数
+struct LastActiveTimestampCompare {
+    bool operator()(const int64_t& a, const int64_t& b) {
+        return a > b;
+    }
+};
 ```
 
-<!---
-TODO：
-其他: 未实现优化点
-===
 
-优先级选举
----
 
--->
+
 
 参考
 ===
