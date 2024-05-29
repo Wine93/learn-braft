@@ -15,6 +15,8 @@
 7. Leader 调用用户状态机的 `on_apply` 应用日志
 8. 待 `on_apply` 返回后，更新 `applyIndex`，并删除内存中的日志
 
+![图 4.3  日志复制整体流程图](image/4.3.png)
+
 <!--
 TODO(Wine93)：
 流程注解
@@ -382,11 +384,6 @@ int Replicator::_continue_sending(void* arg, int error_code) {
     ...
 }
 ```
-
-整体流程图
-===
-
-![图 4.3  日志复制整体流程图](image/4.3.png)
 
 阶段一：追加日志
 ===
