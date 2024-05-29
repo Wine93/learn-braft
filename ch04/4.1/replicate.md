@@ -383,11 +383,6 @@ int Replicator::_continue_sending(void* arg, int error_code) {
 }
 ```
 
-整体流程图概览
----
-
-![图 4.3  日志复制整体流程图](image/4.3.png)
-
 阶段一：追加日志
 ===
 
@@ -954,7 +949,7 @@ int BallotBox::commit_at(
 }
 ```
 
-步骤五：应用日志
+阶段五：应用日志
 ===
 
 放入队列
@@ -1092,3 +1087,8 @@ TODO(Wine93,P0)
 
 正常情况下，日志都是会被复制成功的，即使 Follower Crash 了，Leader 也会不断重试直到其恢复正常或被剔除集群。只有当当前 Leader 不再是 Leader 时，日志复制才会失败，框架会调用用户任务的 `Closure`。
 -->
+
+总结
+===
+
+![图 4.3  日志复制整体流程图](image/4.3.png)
