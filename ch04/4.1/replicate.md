@@ -79,10 +79,10 @@ nextIndex
 
 ![图 4.2  探测过程](image/4.2.png)
 
+<!--
 日志生命周期
 ---
 
-<!--
 TODO(Wine93,P0)
 **1. 日志诞生**
 
@@ -208,12 +208,12 @@ public:
 前置阶段：确定 nextIndex
 ===
 
-Leader 通过发送空的 `AppendEntries` 来探测 Follower 的 `nextIndex`
-只有确定了 `nextIndex` 才能正式向 Follower 发送日志。
-这里忽略了很多细节，详情我们将在下一章[复制流程][]中介绍。
+`Replicator` 在创建时会通过发送空的 `AppendEntries` 请求来探测 Follower 的 `nextIndex`，只有确定了 `nextIndex` 才能正式向 Follower 发送日志。具体的匹配算法我们已经在 [nextIndex](#nextIndex) 中详细介绍过了。
 
-Leader 调用 `_send_empty_entries` 向 Follower 发送空的 `AppendEntries` 请求，
-并设置响应回调函数为 `_on_rpc_returned`：
+发送 `AE` 请求
+---
+
+`Replicator` 调用 `_send_empty_entries` 向 Follower 发送空的 `AppendEntries` 请求，并设置响应回调函数为 `_on_rpc_returned`：
 
 ```cpp
 void Replicator::_send_empty_entries(bool is_heartbeat) {
@@ -233,190 +233,26 @@ void Replicator::_send_empty_entries(bool is_heartbeat) {
                         response.release(), done);
 }
 
+// 填充字段
 int Replicator::_fill_common_fields(AppendEntriesRequest* request,
                                     int64_t prev_log_index,
                                     bool is_heartbeat) {
-    // 获取 Log 的 Term
+    // 获取 matchIndex 对应的 term，我们称之为 matchTerm
     const int64_t prev_log_term = _options.log_manager->get_term(prev_log_index);
     ...
-    request->set_term(_options.term);
+    request->set_term(_options.term);  // (1) 当前 Leader 的 term
     ...
-    request->set_prev_log_index(prev_log_index);  // 当前 leader 的 lastLogIndex
-    request->set_prev_log_term(prev_log_term);    // 当前 leader 的 lastLogTerm
-    request->set_committed_index(_options.ballot_box->last_committed_index());
+    request->set_prev_log_index(prev_log_index);  // (2) matchIndex
+    request->set_prev_log_term(prev_log_term);    // (3) matchTerm
+    ...
     return 0;
 }
 ```
 
-```cpp
-void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
-                     AppendEntriesRequest* request,
-                     AppendEntriesResponse* response,
-                     int64_t rpc_send_time) {
-    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
-    std::unique_ptr<AppendEntriesRequest>  req_guard(request);
-    std::unique_ptr<AppendEntriesResponse> res_guard(response);
-    Replicator *r = NULL;
-    bthread_id_t dummy_id = { id };
-    const long start_time_us = butil::gettimeofday_us();
-    if (bthread_id_lock(dummy_id, (void**)&r) != 0) {
-        return;
-    }
+处理 `AE` 请求
+---
 
-    std::stringstream ss;
-    ss << "node " << r->_options.group_id << ":" << r->_options.server_id
-       << " received AppendEntriesResponse from "
-       << r->_options.peer_id << " prev_log_index " << request->prev_log_index()
-       << " prev_log_term " << request->prev_log_term() << " count " << request->entries_size();
-
-    bool valid_rpc = false;
-    int64_t rpc_first_index = request->prev_log_index() + 1;
-    int64_t min_flying_index = r->_min_flying_index();  // _next_index - _flying_append_entries_size
-    CHECK_GT(min_flying_index, 0);
-
-    for (std::deque<FlyingAppendEntriesRpc>::iterator rpc_it = r->_append_entries_in_fly.begin();
-        rpc_it != r->_append_entries_in_fly.end(); ++rpc_it) {
-        if (rpc_it->log_index > rpc_first_index) {
-            break;
-        }
-        if (rpc_it->call_id == cntl->call_id()) {
-            valid_rpc = true;
-        }
-    }
-    if (!valid_rpc) {
-        ss << " ignore invalid rpc";
-        BRAFT_VLOG << ss.str();
-        CHECK_EQ(0, bthread_id_unlock(r->_id)) << "Fail to unlock " << r->_id;
-        return;
-    }
-
-    if (cntl->Failed()) {
-        ss << " fail, sleep.";
-        BRAFT_VLOG << ss.str();
-
-        // TODO: Should it be VLOG?
-        LOG_IF(WARNING, (r->_consecutive_error_times++) % 10 == 0)
-                        << "Group " << r->_options.group_id
-                        << " fail to issue RPC to " << r->_options.peer_id
-                        << " _consecutive_error_times=" << r->_consecutive_error_times
-                        << ", " << cntl->ErrorText();
-        // If the follower crashes, any RPC to the follower fails immediately,
-        // so we need to block the follower for a while instead of looping until
-        // it comes back or be removed
-        // dummy_id is unlock in block
-        r->_reset_next_index();
-        return r->_block(start_time_us, cntl->ErrorCode());
-    }
-    r->_consecutive_error_times = 0;
-    if (!response->success()) {
-        if (response->term() > r->_options.term) {
-            BRAFT_VLOG << " fail, greater term " << response->term()
-                       << " expect term " << r->_options.term;
-            r->_reset_next_index();
-
-            NodeImpl *node_impl = r->_options.node;
-            // Acquire a reference of Node here in case that Node is destroyed
-            // after _notify_on_caught_up.
-            node_impl->AddRef();
-            r->_notify_on_caught_up(EPERM, true);
-            butil::Status status;
-            status.set_error(EHIGHERTERMRESPONSE, "Leader receives higher term "
-                    "%s from peer:%s", response->GetTypeName().c_str(), r->_options.peer_id.to_string().c_str());
-            r->_destroy();
-            node_impl->increase_term_to(response->term(), status);
-            node_impl->Release();
-            return;
-        }
-        ss << " fail, find next_index remote last_log_index " << response->last_log_index()
-           << " local next_index " << r->_next_index
-           << " rpc prev_log_index " << request->prev_log_index();
-        BRAFT_VLOG << ss.str();
-        r->_update_last_rpc_send_timestamp(rpc_send_time);
-        // prev_log_index and prev_log_term doesn't match
-        r->_reset_next_index();
-        if (response->last_log_index() + 1 < r->_next_index) {
-            BRAFT_VLOG << "Group " << r->_options.group_id
-                       << " last_log_index at peer=" << r->_options.peer_id
-                       << " is " << response->last_log_index();
-            // The peer contains less logs than leader
-            r->_next_index = response->last_log_index() + 1;
-        } else {
-            // The peer contains logs from old term which should be truncated,
-            // decrease _last_log_at_peer by one to test the right index to keep
-            if (BAIDU_LIKELY(r->_next_index > 1)) {
-                BRAFT_VLOG << "Group " << r->_options.group_id
-                           << " log_index=" << r->_next_index << " mismatch";
-                --r->_next_index;
-            } else {
-                LOG(ERROR) << "Group " << r->_options.group_id
-                           << " peer=" << r->_options.peer_id
-                           << " declares that log at index=0 doesn't match,"
-                              " which is not supposed to happen";
-            }
-        }
-        // dummy_id is unlock in _send_heartbeat
-        r->_send_empty_entries(false);
-        return;
-    }
-
-    ss << " success";
-    BRAFT_VLOG << ss.str();
-
-    if (response->term() != r->_options.term) {
-        LOG(ERROR) << "Group " << r->_options.group_id
-                   << " fail, response term " << response->term()
-                   << " mismatch, expect term " << r->_options.term;
-        r->_reset_next_index();
-        CHECK_EQ(0, bthread_id_unlock(r->_id)) << "Fail to unlock " << r->_id;
-        return;
-    }
-    r->_update_last_rpc_send_timestamp(rpc_send_time);
-    const int entries_size = request->entries_size();
-    const int64_t rpc_last_log_index = request->prev_log_index() + entries_size;
-    BRAFT_VLOG_IF(entries_size > 0) << "Group " << r->_options.group_id
-                                    << " replicated logs in ["
-                                    << min_flying_index << ", "
-                                    << rpc_last_log_index
-                                    << "] to peer " << r->_options.peer_id;
-    if (entries_size > 0) {
-        r->_options.ballot_box->commit_at(
-                min_flying_index, rpc_last_log_index,
-                r->_options.peer_id);
-        int64_t rpc_latency_us = cntl->latency_us();
-        if (FLAGS_raft_trace_append_entry_latency &&
-            rpc_latency_us > FLAGS_raft_append_entry_high_lat_us) {
-            LOG(WARNING) << "append entry rpc latency us " << rpc_latency_us
-                         << " greater than "
-                         << FLAGS_raft_append_entry_high_lat_us
-                         << " Group " << r->_options.group_id
-                         << " to peer  " << r->_options.peer_id
-                         << " request entry size " << entries_size
-                         << " request data size "
-                         <<  cntl->request_attachment().size();
-        }
-        g_send_entries_latency << cntl->latency_us();
-        if (cntl->request_attachment().size() > 0) {
-            g_normalized_send_entries_latency <<
-                cntl->latency_us() * 1024 / cntl->request_attachment().size();
-        }
-    }
-    // A rpc is marked as success, means all request before it are success,
-    // erase them sequentially.
-    while (!r->_append_entries_in_fly.empty() &&
-           r->_append_entries_in_fly.front().log_index <= rpc_first_index) {
-        r->_flying_append_entries_size -= r->_append_entries_in_fly.front().entries_size;
-        r->_append_entries_in_fly.pop_front();
-    }
-    r->_has_succeeded = true;
-    r->_notify_on_caught_up(0, false);
-    // dummy_id is unlock in _send_entries
-    if (r->_timeout_now_index > 0 && r->_timeout_now_index < r->_min_flying_index()) {
-        r->_send_timeout_now(false, false);
-    }
-    r->_send_entries();
-    return;
-}
-```
+Follower 收到 `AppendEntries` 请求后，会调用 `handle_append_entries_request` 处理：
 
 ```cpp
 void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
@@ -425,26 +261,86 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                                              google::protobuf::Closure* done,
                                              bool from_append_entries_cache) {
     ...
-    if (request->entries_size() == 0) {  // 响应 send_empty_entries 或心跳
-        response->set_success(true);
-        response->set_term(_current_term);
-        response->set_last_log_index(_log_manager->last_log_index());
+    const int64_t prev_log_index = request->prev_log_index();  // macthIndex
+    const int64_t prev_log_term = request->prev_log_term();   // macthTerm
+    const int64_t local_prev_log_term = _log_manager->get_term(prev_log_index);  // 获取 macthIndex 对应的 term
+    // (1) 如果本地的 term 和请求的 matchTerm 不一致，则代表日志不匹配，返回失败响应
+    if (local_prev_log_term != prev_log_term) {
+        int64_t last_index = _log_manager->last_log_index();
         ...
-        // see the comments at FollowerStableClosure::run()
-        _ballot_box->set_last_committed_index(
-                std::min(request->committed_index(),
-                         prev_log_index));
+        response->set_success(false);  // (1.1) 失败响应
+        response->set_term(_current_term);  // (1.2) 当前 term
+        response->set_last_log_index(last_index);  // (1.3) 携带当前节点的 lastLogIndex
+        ...
+        return;
+    }
+
+    // (2) 本地的 term 和请求的 matchTerm 一致，则代表日志匹配，返回成功响应
+    if (request->entries_size() == 0) {
+        response->set_success(true);  // (2.1) 成功响应
+        response->set_term(_current_term);  // (2.2) 当前 term
+        response->set_last_log_index(_log_manager->last_log_index());  // (2.3) 携带当前节点的 lastLogIndex
+
+        ...
         return;
     }
     ...
 }
 ```
 
-阶段一：
+处理 `AE` 响应
+---
 
+Leader 收到 `AppendEntries` 响应后，调用 `on_rpc_returned` 处理响应：
+
+```cpp
+void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
+                     AppendEntriesRequest* request,
+                     AppendEntriesResponse* response,
+                     int64_t rpc_send_time) {
+    ...
+    // (1) 返回不匹配响应
+    //     注意：matchIndex = nextIndex - 1
+    //         其实代码中都是直接修改的 nextIndex，再在发送请求的时候设置 macthIndex = nextIndex - 1
+    //         但是为了便于理解，下面我们都将由 macthIndex 代替讲解
+    if (!response->success()) {
+        ...
+        // (1.1) 如果 follower 的 lastLogIndex < matchIndex，则回退 matchIndex 到 lastLogIndex
+        if (response->last_log_index() + 1 < r->_next_index) {
+            ...
+            r->_next_index = response->last_log_index() + 1;
+        } else {  // (1.2) 否则，将 macthIndex 设置为 matchIndex - 1
+            // The peer contains logs from old term which should be truncated,
+            // decrease _last_log_at_peer by one to test the right index to keep
+            if (BAIDU_LIKELY(r->_next_index > 1)) {
+                ...
+                --r->_next_index;
+            }
+            ...
+        }
+
+        // (1.3) 再发送空的 `AppendEntries` 请求进行探测
+        r->_send_empty_entries(false);
+        return;
+    }
+
+    // (2) 返回成功响应，那么就代表探测成功，nextIndex 就是之前设置的（如 1.1），无需修改
+    ...
+    return;
+}
+```
+
+这样，经过一轮或多轮协商，Follower 的 `nextIndex` 就确认了。
+
+等待新日志
+---
 
 阶段一：追加日志
 ===
+
+提交任务
+---
+
 ```cpp
 #include <braft/raft.h>
 
@@ -464,24 +360,18 @@ void function(op, callback) {
 }
 ```
 
-客户端需要将操作序列化成 [IOBuf][IOBuf]，并构建一个 *Task* 向 *braft::Node* 提交。
+客户端需要将操作序列化成 [IOBuf][IOBuf]，并构建一个 Task 向 `braft::Node` 提交。
 
 [IOBuf]: https://github.com/apache/brpc/blob/master/src/butil/iobuf.h
 
-
-任务批处理
+放入队列
 ---
 
-该阶段
+Node 在收到 `Task` 后，会将其转换成 `LogEntryAndClosure` 并放入 `ApplyQueue` 中。至此，客户端的 apply 就完成返回了。
 
-* 节点收到 *task* 后，会将其转换成 `LogEntryAndClosure` 并放入 `_apply_queue` 中。至此，客户端的 *apply* 就完成返回了
-* 在队列的消费函数 `execute_applying_tasks` 中，会将这些 *task* 打包成 *tasks* 并交给 *bacth apply* 接口处理。默认 *tasks* 包含 256 个 *task*
-* *bacth apply* 接收到 tasks 后会执行以下这些动作：
-    * 将 *task* 转换成 *LogEntry* 并填充 *term* 和 *type*
-    * **初始化 Ballot**：调用 `BallotBox::append_pending_task` 为每一个 *LogEntry* 添加一个 `Ballot`，该 `Ballot` 主要用于计数，当 *LogEntry* 成功被持久化或每被一个 *Follower* Append 后，都会调用 `BallotBox::commit_at` 将计数加一，当计数达到 `quorum` 后，则会回调 `on_apply`
-    * **追加日志**：调用 `LogManager::append_entries` 接口进行追加日志，在该接口中会对日志进行持久化存储，并唤醒 `Replicator` 将日志发送给 *Follower*
+`ApplyQueue` 也是个串行队列，由 BRPC [ExecutionQueue] 实现。
 
-*apply* 接口：
+[ExecutionQueue]: https://brpc.apache.org/docs/bthread/execution-queue/
 
 ```cpp
 void NodeImpl::apply(const Task& task) {
@@ -496,23 +386,25 @@ void NodeImpl::apply(const Task& task) {
 }
 ```
 
-队列消费函数:
+任务批处理
+---
+
+`ApplyQueue` 的消费函数是 `execute_applying_tasks`，在该函数中主要将 `LogEntryAndClosure` 进行 bacth 打包处理，并调用批量 `apply` 接口来处理：
 
 ```cpp
 int NodeImpl::execute_applying_tasks(void* meta,  bthread::TaskIterator<LogEntryAndClosure>& iter) {
     NodeImpl* m = (NodeImpl*)meta;
     for (; iter; ++iter) {
         if (cur_size == batch_size) {  // batch_size = 256
-            m->apply(tasks, cur_size);
+            m->apply(tasks, cur_size);  // (2) 调用批量 apply 接口处理
             cur_size = 0;
         }
-        tasks[cur_size++] = *iter;
+        tasks[cur_size++] = *iter;  // (1) 批处理
     }
     ...
 }
 ```
-
-批量 *apply* 接口:
+批量 `apply` 接口在接收到这些 `tasks` 后，主要做以下几件事情：
 
 ```cpp
 void NodeImpl::apply(LogEntryAndClosure tasks[], size_t size) {
@@ -520,16 +412,25 @@ void NodeImpl::apply(LogEntryAndClosure tasks[], size_t size) {
     ...
     for (size_t i = 0; i < size; ++i) {
         ...
+        // （1）获取 LogEntryAndClosure 中的 LogEntry，并填充 term 和 type
         entries.push_back(tasks[i].entry);
         entries.back()->id.term = _current_term;
         entries.back()->type = ENTRY_TYPE_DATA;
         ...
-        // (2)
+        // (2) 追加日志对应的回调函数（LogEntryAndClosure 中的 Closure）
+        //     当日志被应用（on_apply）后会调用该回调函数
         _ballot_box->append_pending_task(_conf.conf,
                                          _conf.stable() ? NULL : &_conf.old_conf,
                                          tasks[i].done);
     }
     ...
+
+    // (3)调用 `LogManager::append_entries` 接口进行追加日志，该接口：
+    //    (3.1) 会对日志进行持久化存储，持久化完成后会调用回调函数 LeaderStableClosure，
+    //          LeaderStableClosure 会调用 BallotBox::commit_at 将计数加一
+    //    (3.2) 并唤醒 `Replicator` 将日志发送给 Follower
+    //          每收到一个成功响应，都会调用 BallotBox::commit_at 将计数加一
+    //    (3.3) 待日志复制数达到 `Quorum` 后，会提交该日志，并将其应用
     _log_manager->append_entries(&entries,
                                new LeaderStableClosure(
                                         NodeId(_group_id, _server_id),
@@ -542,39 +443,142 @@ void NodeImpl::apply(LogEntryAndClosure tasks[], size_t size) {
 阶段二：持久化日志
 ===
 
-Leader 追加日志
+追加日志
 ---
 
-*LogManager* 是 *braft* 管理日志的入口，
-
-* 详见[<步骤四: Leader 持久化日志>]()
-* 详见[<步骤五: Leader 发送 AE>]()
-
-所以步骤四、五是并发执行的。
+`LogManager` 在接收到这些日志（`LogEntry`）后会做以下几件事情：
 
 ```cpp
 void LogManager::append_entries(std::vector<LogEntry*> *entries, StableClosure* done) {
     ...
-    // check_and_resolve_conflict 会给每一个 LogEntry 分配 index
+    // (1) 为每一个 LogEntry 分配 index
     if (!entries->empty() && check_and_resolve_conflict(entries, done) != 0) {
         ...
         return;
     }
 
+    // (2) 将日志追加到内存存储中
+    //     注意：这里已经将日志复制一份了
     if (!entries->empty()) {
         _logs_in_memory.insert(_logs_in_memory.end(), entries->begin(), entries->end());
     }
 
     ...
 
+    // (3) 往 DiskQueue 中追加一个持久化的任务
     // done: LeaderStableClosure
+    done->_entries.swap(*entries);
     int ret = bthread::execution_queue_execute(_disk_queue, done);
+
+    // (4) 唤醒所有 Replicator 向 Follower 同步日志
     wakeup_all_waiter(lck);
 }
 ```
 
-唤醒所有 *waiter*：
+分配 `logIndex`
+---
 
+`LogManager` 调用 `check_and_resolve_conflict` 为每一个 `LogEntry` 分配 `index`:
+
+```cpp
+int LogManager::check_and_resolve_conflict(
+            std::vector<LogEntry*> *entries, StableClosure* done) {
+    ...
+    // 这个函数 Leader 和 Follower 都会调用，
+    // Leader 调用时日志的 index 都是没确定的（即是 0）
+    // last_log_index：当前 Leader 最后一条日志的 index
+    if (entries->front()->id.index == 0) {
+        for (size_t i = 0; i < entries->size(); ++i) {
+            (*entries)[i]->id.index = ++_last_log_index;
+        }
+        ...
+        return 0;
+    } else {
+        ...
+    }
+    ...
+}
+```
+
+持久化日志
+---
+
+`DiskQueue` 的消费函数是 `disk_thread`，在该函数中，会利用 `AppendBatcher` 对持久化任务做 Batch 打包处理，最终调用 `AppendBatcher::flush` 将日志写入磁盘：
+
+```cpp
+int LogManager::disk_thread(void* meta,
+                            bthread::TaskIterator<StableClosure*>& iter) {
+    ...
+    LogManager* log_manager = static_cast<LogManager*>(meta);
+    ...
+    StableClosure* storage[256];
+    AppendBatcher ab(storage, ARRAY_SIZE(storage), &last_id, log_manager);
+
+    for (; iter; ++iter) {
+                // ^^^ Must iterate to the end to release to corresponding
+                //     even if some error has occurred
+        StableClosure* done = *iter;
+        ...
+        if (!done->_entries.empty()) {
+            ab.append(done);  // (1) Batch 处理
+        } else {
+            ab.flush();  // (2) 写入磁盘
+            ...
+        }
+    }
+    ...
+    ab.flush();
+    ...
+    return 0;
+}
+```
+
+`AppendBatcher` 负责将数据写入磁盘，并调用最终的回调函数，具体的存储写入我们将在 [<4.3 日志存储>](/ch04/4.3/log_storage.md) 中详细介绍：
+
+```cpp
+class AppendBatcher {
+public:
+    void flush() {
+        // (1) 最终会调用 `SegmentLogStorage::append_entries` 将日志写入磁盘
+        _lm->append_to_storage(&_to_append, _last_id, &metric);
+        for (size_t i = 0; i < _size; ++i) {
+            // (2) 成功持久化后，调用回调函数，即 `LeaderStableClosure`
+            _storage[i]->Run();
+        }
+    }
+
+    void append(LogManager::StableClosure* done) {
+        // FLAGS_raft_max_append_buffer_size 默认 256KB
+        if (_size == _cap ||
+                _buffer_size >= (size_t)FLAGS_raft_max_append_buffer_size) {
+            flush();
+        }
+        _storage[_size++] = done;
+        _to_append.insert(_to_append.end(),
+                         done->_entries.begin(), done->_entries.end());
+        for (size_t i = 0; i < done->_entries.size(); ++i) {
+            _buffer_size += done->_entries[i]->data.length();
+        }
+    }
+    ...
+};
+```
+
+待持久化成功后，会调用之前设置的回调函数 `LeaderStableClosure::Run`，该函数会调用 `BallotBox::commit_at` 将对应日志的计数加一，详见以下小节 <提交日志>：
+```cpp
+void LeaderStableClosure::Run() {
+    if (status().ok()) {
+        ...
+        _ballot_box->commit_at(_first_log_index, _first_log_index + _nentries - 1, _node_id.peer_id);
+    }
+    ...
+}
+```
+
+唤醒 Replicator
+---
+
+`LogManager` 调用 `wakeup_all_waiter` 唤醒所有 `Replicator` 向 Follower 同步日志，`Replicator` 唤醒会调用 `_continue_sending` 继续发送 `AppendEntries` 请求：
 ```cpp
 void LogManager::wakeup_all_waiter(std::unique_lock<raft_mutex_t>& lck) {
     ...
@@ -594,42 +598,14 @@ void* LogManager::run_on_new_log(void *arg) {
 }
 ```
 
-持久化日志
----
-
-```cpp
-int LogManager::disk_thread(void* meta,
-                            bthread::TaskIterator<StableClosure*>& iter) {
-}
-```
-
 阶段三：复制日志
 ===
 
-Leader 发送 AE
+发送 `AE` 请求
 ---
 
-唤醒 Replicator
----
+`Replicator` 被唤醒后，会调用 `_send_entries` 发送 `AppendEntries` 请求：
 
-*Replicator* 被唤醒后会调用 `_continue_sending` 继续发送 *AppendEntries* 请求。在 `_send_entries` 函数中主要做以下几件事情：
-
-* 调用 `_fill_common_fields` 填充 *request*
-```proto
-message AppendEntriesRequest {
-    required string group_id = 1;   // Raft Group Id
-    required string server_id = 2;  // 发送成员 PeerId（即 Leader PeerId)
-    required string peer_id = 3;    // 接受成员 PeerId
-    required int64 term = 4;        // Leader term
-    required int64 prev_log_term = 5;
-    required int64 prev_log_index = 6;
-    repeated EntryMeta entries = 7;
-    required int64 committed_index = 8;
-};
-```
-* 调用 `_wait_more_entries`
-
-*Replicator* 被唤醒的回调函数：
 ```cpp
 int Replicator::_continue_sending(void* arg, int error_code) {
     ...
@@ -638,50 +614,71 @@ int Replicator::_continue_sending(void* arg, int error_code) {
 }
 ```
 
-发送 *AppendEntries* 请求：
-
+在 `_send_entries` 函数中主要做以下几件事情：
 ```cpp
 void Replicator::_send_entries() {
+    // (1) 填充 AppendEntries 请求
     if (_fill_common_fields(request.get(), _next_index - 1, false) != 0) {
         ...
+        // (1.1) 如果发现 Follower 需要的日志（nextIndex）已经被快照压缩了
+        //       则向 Follower 发送安装快照指令
         return _install_snapshot();
     }
     ...
+    //  (2) 填充 AppendEntries 请求中的 entries 字段
+    for (int i = 0; i < max_entries_size; ++i) {
+        // (2.1) 调用 `_prepare_entry` 准备实际的日志数据
+        //      日志数据放在 RPC 请求的 attch 中
+        prepare_entry_rc = _prepare_entry(i, &em, &cntl->request_attachment());
+        if (prepare_entry_rc != 0) {
+            break;
+        }
+        request->add_entries()->Swap(&em);
+    }
+    ...
+    // (3) 先更新 Follower 的 nextIndex
     _next_index += request->entries_size();
     ...
-    google::protobuf::Closure* done = brpc::NewCallback( _on_rpc_returned, ...);
+    // (4) 设置响应回调函数 _on_rpc_returned
+    google::protobuf::Closure* done = brpc::NewCallback(_on_rpc_returned, ...);
+    // (5) 发送 AppendEntries 请求
     RaftService_Stub stub(&_sending_channel);
     stub.append_entries(cntl.release(), request.release(),
                         response.release(), done);
+    // (6) 如果还有日志，则继续发送；否则注册 waiter 后，就在后台等待新日志到来
     _wait_more_entries();
 }
 ```
 
+`_fill_common_fields` 函数负责填充 `AppendEntries` 请求中除 `entries` 的其余字段：
+
 ```cpp
 int Replicator::_fill_common_fields(AppendEntriesRequest* request,
-                                    int64_t prev_log_index,  // leader 中记录该 follower 的 next_log_id
+                                    int64_t prev_log_index  // matchIndex
                                     bool is_heartbeat) {
     const int64_t prev_log_term = _options.log_manager->get_term(prev_log_index);
-    // 查不到对应日志的 term，代表已经被快照压缩了
+    // (1) 查不到对应日志的 term，代表已经被快照压缩了
     if (prev_log_term == 0 && prev_log_index != 0) {
         ...
         return -1;
     }
+    ...
+    // (2) 填充字段
     request->set_term(_options.term);
-    request->set_group_id(_options.group_id);
-    request->set_server_id(_options.server_id.to_string());
-    request->set_peer_id(_options.peer_id.to_string());
     request->set_prev_log_index(prev_log_index);
     request->set_prev_log_term(prev_log_term);
-    request->set_committed_index(_options.ballot_box->last_committed_index());
+    request->set_committed_index(_options.ballot_box->last_committed_index());  // commitIndex
     return 0;
 }
 ```
 
-Follower 处理 AE
+处理 `AE` 请求
 ---
 
-* 当日志被成功持久化后，会调用 `FollowerStableClosure`
+Follower 接收到 `AppendEntries` 请求后，会调用 `handle_append_entries_request` 处理请求。其实 Follower 持久化逻辑和 Leader 是一样的，都是调用 `LogManager::append_entries` 函数进行持久化，只不过在持久化成功后各自的回调函数不一样：
+
+* Leader：回调函数是 `LeaderStableClosure`；该回调函数主要是将 `Quorum` 计数加一
+* Follower：回调函数是 `FollowerStableClosure`；该回调函数主要是发送 `AppendEntries` 响应，并根据请求中携带的 Leader `commitIndex` 更新自身的 `commitIndex` 并应用日志。
 
 ```cpp
 void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
@@ -689,20 +686,17 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                                              AppendEntriesResponse* response,
                                              google::protobuf::Closure* done,
                                              bool from_append_entries_cache) {
-    if (request->term() < _current_term) {
-        const int64_t saved_current_term = _current_term;
-        ...
-        response->set_success(false);
-        response->set_term(saved_current_term);
-        return;
-    }
-
+    ...
+    // (1) 持久化成功后的回调函数
     FollowerStableClosure* c = new FollowerStableClosure(
             cntl, request, response, done_guard.release(),
             this, _current_term);
+    // (2) 追加日志
     _log_manager->append_entries(&entries, c);
 }
 ```
+
+持久化成功后的回调函数：
 
 ```cpp
 class FollowerStableClosure : public LogManager::StableClosure {
@@ -775,7 +769,7 @@ int BallotBox::set_last_committed_index(int64_t last_committed_index) {
 }
 ```
 
-Leader 处理 AE 响应
+处理 `AE` 响应
 ---
 
 Leader 针对不同的响应
