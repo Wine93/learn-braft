@@ -178,12 +178,14 @@ void FSMCaller::do_committed(int64_t committed_index) {
 
 ![图 4.5  持久化日志的串行与并行](image/4.5.png)
 
-在 Raft 的实现中，Leader 需要先在本地持久化日志，再向所有的 Follower 复制日志，显然这样的实现具有较高的时延。特别地客户端的写都要经过 Leader，导致 Leader 的压力会变大，从而导致 IO 延迟变高成为慢节点，而本地持久化会阻塞后续的 Follower 复制。所以在 braft 中，Leader 本地持久化和 Follower 复制是并行的，即 Leader 会先将日志写入内存，同时异步地进行持久化和 Follower 复制。
+在 Raft 的实现中，Leader 需要先在本地持久化日志，再向所有的 Follower 复制日志，显然这样的实现具有较高的时延。特别地客户端的写都要经过 Leader，导致 Leader 的压力会变大，从而导致 `IO` 延迟变高成为慢节点，而本地持久化也会阻塞后续的 Follower 复制。
+
+所以在 braft 中，Leader 本地持久化和 Follower 复制是并行的，即 Leader 会先将日志写入内存，同时异步地进行持久化和 Follower 复制。并且只要大多数节点写入成功就可以应用日志，不必等待 Leader 本地写入成功。
 
 具体实现
 ---
 
-详见[阶段二：持久化日志]() 和 [阶段三：复制日志]()。
+具体的实现我们已经在上一节中详细介绍过了，参见 [<4.1 复制流程>](/ch04/4.1/replicate.md)。
 
 优化 3：流水线复制
 ===
@@ -193,8 +195,9 @@ void FSMCaller::do_committed(int64_t committed_index) {
 
 ![图 4.6  串行与 Pipeline](image/4.6.png)
 
-Raft 默认是串行的复制日志，显然这样是比较低下的；可以采用 `Pipeline` 的优化方式，即 Leader 发送完  `AppendEntries` 完不必等待其响应，立马发送一下批日志。当然，这样的实现对于 Follower 端来说，会带来乱序、空洞等问题，为此，braft 在 Follower 端引入了日志缓存，将不是顺序的日志先缓冲起来，待其前面的日志都接受到后再写入该日志，以达到顺序写入磁盘的目的。
-特别需要注意的是，该优化 braft 默认是关闭的，需要用户通过以下 2 个配置项开启：
+Raft 默认是串行复制日志，显然这样效率是比较低下的。可以采用 `Pipeline` 的复制方式，即 Leader 发送完 `AppendEntries` 请求后不必等待其响应，立马发送一下批日志。当然，这样的实现对于接受端（Follower）来说，可能会带来乱序、空洞等问题，为此，braft 在 Follower 端引入了日志缓存，将不是顺序的日志先缓存起来，待其前面的日志都接受到后再写入该日志，以达到顺序写入磁盘的目的。
+
+特别需要注意的是，`pipeline` 优化默认是关闭的，需要用户通过以下 2 个配置项开启：
 ```cpp
 DEFINE_bool(raft_enable_append_entries_cache, false,
             "enable cache for out-of-order append entries requests, should used when "
@@ -234,7 +237,7 @@ int Replicator::_continue_sending(void* arg, int error_code) {
 Follower 处理 `AppendEntries` 请求：
 
 * 对于到来的日志，如果其前面的日志没有接受到，先将其缓存起来，并要求客户端重发前面的日志
-* 待前面的日志都达到后，再写入缓存中在其之后的日志
+* 待前面的日志都达到后，再将缓存中在其之后的日志写入磁盘
 
 ```cpp
 void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
@@ -282,53 +285,55 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
 控制日志的落盘行为
 ---
 
-braft 在每次 Bacth Write 后都会进行一次 `sync`，显然这会增加时延，所以其提供了一些配置项来控制日志的落盘行为。用户可以根据业务数据丢失的容忍度高低，灵活调整这些配置以达到性能和可靠性之间的权衡。例如对于数据丢失容忍度较高的业务，可以选择将配置项 `raft_sync` 设置为 `flase`这将有助于提升性能。
+日志每次 `Batch Write` 是先将日志写入 `Page Cache`，最后再调用一次 `fsync` 操作。显然 `sync` 操作会增加时延，为此 braft 提供了一些配置项来控制日志的 `sync` 行为。用户可以根据业务数据丢失的容忍度高低，灵活调整这些配置以达到性能和可靠性之间的权衡。例如对于数据丢失容忍度较高的业务，可以选择将配置项 `raft_sync` 设置为 `Flase`，这将有助于提升性能。
 
-以下是控制日志 `sync` 的相关参数，前三项针对的是每次的 Batch Write，最后一项针对的是 `Segment`
+以下是控制日志 `sync` 的相关参数，前三项针对的是每次的 `Batch Write`，最后两项针对的是 `Segment`：
 
-| 配置项                  | 说明                                                                                                         | 默认值                |
-|:------------------------|:-------------------------------------------------------------------------------------------------------------|:----------------------|
-| `raft_sync`             | 每次 Batch Write 后是否需要 `sync`                                                                           | `true`                |
-| `raft_sync_policy`      | 对于每次 Batch Write 的 sync 策略，有立即 sync （RAFT_SYNC_IMMEDIATELY）和按字节数 sync (RAFT_SYNC_BY_BYTES) | RAFT_SYNC_IMMEDIATELY |
-| `raft_sync_per_bytes`   | 在 RAFT_SYNC_BY_BYTES 的同步策略下，满足多少字节需要 sync 一次                                               |
-| `raft_sync_segments`    | 每当日志写满一个 `Segment` 需要切换时是否需要 `sync`，每个 Segment 默认存储 8MB 的日志                       | `false`               |
-| `raft_max_segment_size` | 单个日志 Segment 大小                                                                                        | 8MB                   |
+| 配置项                  | 说明                                                                                                                       | 默认值                  |
+|:------------------------|:---------------------------------------------------------------------------------------------------------------------------|:------------------------|
+| `raft_sync`             | 每次 `Batch Write` 后是否需要 `sync`                                                                                       | `True`                  |
+| `raft_sync_policy`      | 对于每次 `Batch Write` 后的 `sync` 策略，有立即 `sync` （`RAFT_SYNC_IMMEDIATELY`）和按字节数 `sync` (`RAFT_SYNC_BY_BYTES`) | `RAFT_SYNC_IMMEDIATELY` |
+| `raft_sync_per_bytes`   | 在 `RAFT_SYNC_BY_BYTES` 的策略下，每多少字节 `sync` 一次                                                                   | `INT32_MAX`             |
+| `raft_sync_segments`    | 每当日志写满一个 `Segment` 需要切换时是否需要 `sync`，每个 `Segment` 默认存储 `8MB` 的日志                                 | `False`                 |
+| `raft_max_segment_size` | 单个日志 `Segment` 大小                                                                                                    | `8MB`                   |
 
 
 具体实现
 ---
 
-Batch Write 落盘逻辑：
+`Batch Write` 写入 `Page Cache` 后会调用 `Segment::sync` 进行 `sync` 操作：
 
 ```cpp
 int Segment::sync(bool will_sync, bool has_conf) {
-    if (_last_index < _first_index) {
-        return 0;
-    }
-    //CHECK(_is_open);
+    ...
     if (will_sync) {
+        // (1) 如果 `raft_sync` 为 False，则直接返回
         if (!FLAGS_raft_sync) {
             return 0;
         }
+
+        // (2) 如果是按字节 `sync` 并且当前未 `sync` 的字节小于配置值，则直接返回
         if (FLAGS_raft_sync_policy == RaftSyncPolicy::RAFT_SYNC_BY_BYTES
             && FLAGS_raft_sync_per_bytes > _unsynced_bytes
             && !has_conf) {
             return 0;
         }
         _unsynced_bytes = 0;
+
+        // (3) 调用 fsync(fd)
         return raft_fsync(_fd);
     }
     return 0;
 }
 ```
 
+每当一个 `Segment` 文件写完后，都会调用 `Segment::close` 将其转换成 `closed segment`：
+
 ```cpp
 int Segment::close(bool will_sync) {
     ...
-    if (_last_index > _first_index) {
-        if (FLAGS_raft_sync_segments && will_sync) {
-            ret = raft_fsync(_fd);
-        }
+    if (FLAGS_raft_sync_segments && will_sync) {
+        ret = raft_fsync(_fd);
     }
     ...
 }
@@ -360,9 +365,9 @@ void on_apply(braft::Iterator& iter) {
 }
 ```
 
-当日志被提交时，braft 会串行回调用户状态机的 `on_apply`，虽然这里做了 [Batch](#优化-1batch) 优化，但是对于那些不支持批量更新的状态机来说，仍然是低效的。为此，用户可以将那些没有依赖的 `on_apply` 操作做异步操作，使其并行化。
+当日志被提交时，框架会串行调用用户状态机的 `on_apply`，虽然这里做了 Batch 优化，但是对于那些不支持批量更新的状态机来说，仍然是低效的。为此，用户可以将 `on_apply` 函数异步执行，让那些可以并行的操作尽可能并行起来。
 
-特别需要注意的是，当刚成为 Leader 时，需要回放之前任期的日志，这时候需要将这些日志全部 Apply 完才能处理读取操作，不然可能会违背线性一致性。因为这些日志在之前的任期可能被提交了，客户端能读取到，而在新任期回放的时候，由于这些日志是异步执行的（on_apply 返回了，但是还在异步执行中），可能还没应用到状态机，这时候客户端去读取可能是读取不到的。
+需要注意的是，当 `on_apply` 异步后，需要处理好节点成为 Leader 时日志回放的问题。当节点刚成为 Leader 时，需要回放（`on_apply`）之前任期的日志，这时候需要将这些日志全部应用到状态机后才能处理读取操作，不然可能会违背线性一致性。因为这些日志在之前的任期可能被提交了，客户端能读取到，而在新任期回放的时候，由于这些日志是异步执行的（`on_apply` 返回了，但还在异步执行中），可能还没应用到状态机，这时候客户端去读取可能是读取不到的。
 
 参考
 ===
