@@ -54,8 +54,8 @@ Replicator
 节点在刚成为 Leader 时会为每个 Follower 创建一个 `Replicator`，其运行在单独的 `bthread` 上，主要有以下几个作用：
 
 * 记录 Follower 的一些状态，如 `nextIndex`、`flyingAppendEntriesSize` 等
-* 作为 RPC Client，所有从 Leader 发往 Follower 的 RPC 请求都由它发送，包括心跳、`AppendEntriesRequest`、`InstallSnapshotRequest`；
-* 同步日志：`Replicator` 会不断地向 Follower 同步日志，直到 Follower 成功复制了 Leader 的所有日志后 ，将在后台等待新日志的到来。
+* 作为 RPC Client，所有从 Leader 发往 Follower 的 RPC 请求都由它发送，包括心跳、`AppendEntriesRequest`、`InstallSnapshotRequest`
+* 同步日志：`Replicator` 会不断地向 Follower 同步日志，直到 Follower 成功复制了 Leader 的所有日志，之后将在后台等待新日志的到来
 
 nextIndex
 ---
@@ -339,7 +339,7 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
 ```cpp
 void Replicator::_send_entries() {
     ...
-    // (3) 如果已经复制了全部日志，则在后台等待
+    // (3) 如果已经复制了全部日志，调用 _wait_more_entries 后在后台等待
     if (request->entries_size() == 0) {
         ...
         return _wait_more_entries();
@@ -383,6 +383,11 @@ int Replicator::_continue_sending(void* arg, int error_code) {
 }
 ```
 
+整体流程图
+===
+
+![图 4.3  日志复制整体流程图](image/4.3.png)
+
 阶段一：追加日志
 ===
 
@@ -408,14 +413,14 @@ void function(op, callback) {
 }
 ```
 
-客户端需要将操作序列化成 [IOBuf][IOBuf]，并构建一个 Task 向 `braft::Node` 提交。
+客户端需要将操作序列化成 [IOBuf][IOBuf]，并构建一个 `Task` 向 `braft::Node` 提交。
 
 [IOBuf]: https://github.com/apache/brpc/blob/master/src/butil/iobuf.h
 
 放入队列
 ---
 
-Node 在收到 `Task` 后，会将其转换成 `LogEntryAndClosure` 并放入 `ApplyQueue` 中。至此，客户端的 apply 就完成返回了，`ApplyQueue` 也是个串行队列，由 BRPC [ExecutionQueue] 实现：
+Node 在收到 `Task` 后，会将其转换成 `LogEntryAndClosure` 并放入 `ApplyQueue` 中。至此，客户端的 apply 就完成返回了。`ApplyQueue` 也是个串行队列，由 BRPC [ExecutionQueue] 实现：
 
 [ExecutionQueue]: https://brpc.apache.org/docs/bthread/execution-queue/
 
@@ -435,7 +440,7 @@ void NodeImpl::apply(const Task& task) {
 任务批处理
 ---
 
-`ApplyQueue` 的消费函数是 `execute_applying_tasks`，在该函数中主要将 `LogEntryAndClosure` 进行 bacth 打包处理，并调用批量 `apply` 接口来处理：
+`ApplyQueue` 的消费函数是 `execute_applying_tasks`，在该函数中会将 `LogEntryAndClosure` 进行 bacth 打包处理，并调用批量 `apply` 接口来处理：
 
 ```cpp
 int NodeImpl::execute_applying_tasks(void* meta,  bthread::TaskIterator<LogEntryAndClosure>& iter) {
@@ -465,7 +470,7 @@ void NodeImpl::apply(LogEntryAndClosure tasks[], size_t size) {
         entries.back()->type = ENTRY_TYPE_DATA;
         ...
         // (2) 追加日志对应的回调函数（LogEntryAndClosure 中的 Closure）
-        //     当日志被应用（on_apply）后会调用该回调函数
+        //     当日志被应用（on_apply）后会调用该 Closure
         _ballot_box->append_pending_task(_conf.conf,
                                          _conf.stable() ? NULL : &_conf.old_conf,
                                          tasks[i].done);
@@ -474,9 +479,9 @@ void NodeImpl::apply(LogEntryAndClosure tasks[], size_t size) {
 
     // (3)调用 `LogManager::append_entries` 接口进行追加日志，该接口：
     //    (3.1) 会对日志进行持久化存储，持久化完成后会调用回调函数 LeaderStableClosure，
-    //          LeaderStableClosure 会调用 BallotBox::commit_at 将计数加一
-    //    (3.2) 并唤醒 `Replicator` 将日志发送给 Follower
-    //          每收到一个成功响应，都会调用 BallotBox::commit_at 将计数加一
+    //          LeaderStableClosure 会调用 BallotBox::commit_at 将复制计数加一
+    //    (3.2) 唤醒 `Replicator` 将日志发送给 Follower
+    //          每收到一个成功响应，都会调用 BallotBox::commit_at 将复制计数加一
     //    (3.3) 待日志复制数达到 `Quorum` 后，会提交该日志，并将其应用
     _log_manager->append_entries(&entries,
                                new LeaderStableClosure(
@@ -505,7 +510,6 @@ void LogManager::append_entries(std::vector<LogEntry*> *entries, StableClosure* 
     }
 
     // (2) 将日志追加到内存存储中
-    //     注意：这里已经将日志复制一份了
     if (!entries->empty()) {
         _logs_in_memory.insert(_logs_in_memory.end(), entries->begin(), entries->end());
     }
@@ -725,7 +729,7 @@ int Replicator::_fill_common_fields(AppendEntriesRequest* request,
 Follower 接收到 `AppendEntries` 请求后，会调用 `handle_append_entries_request` 处理请求。其实 Follower 持久化逻辑和 Leader 是一样的，都是调用 `LogManager::append_entries` 函数进行持久化，只不过在持久化成功后各自的回调函数不一样：
 
 * Leader：回调函数是 `LeaderStableClosure`；该回调函数主要是将 `Quorum` 计数加一
-* Follower：回调函数是 `FollowerStableClosure`；该回调函数主要是发送 `AppendEntries` 响应，并根据请求中携带的 Leader `commitIndex` 更新自身的 `commitIndex` 并应用日志。
+* Follower：回调函数是 `FollowerStableClosure`；该回调函数主要是发送 `AppendEntries` 响应，并根据请求中携带的 Leader `commitIndex` 更新自身的 `commitIndex` 并应用日志
 
 还有一个小的不同点是，Leader 端日志的 `index` 是自己生成的，而 Follower 中的日志完全来自于 Leader。
 
@@ -759,13 +763,13 @@ public:
 private:
     ...
     void run() {
-        // (1) 发送响应
+        // (3) 发送响应
         brpc::ClosureGuard done_guard(_done);
         ...
         _response->set_success(true);
         _response->set_term(_term);
 
-        // (2) 更新 commitIndex
+        // (1) 计算 commitIndex
         const int64_t committed_index =
                 std::min(_request->committed_index(),
                          // ^^^ committed_index is likely less than the
@@ -775,7 +779,7 @@ private:
                          // untrustable so we can't commit them even if their
                          // indexes are less than request->committed_index()
                         );
-        // (3) 更新 commitIndex，并应用日志
+        // (2) 更新 commitIndex，并应用日志
         //_ballot_box is thread safe and tolerates disorder.
         _node->_ballot_box->set_last_committed_index(committed_index);
     }
@@ -791,6 +795,8 @@ int BallotBox::set_last_committed_index(int64_t last_committed_index) {
         // (1) 更新 `commitIndex`
         _last_committed_index.store(last_committed_index, ...);
         // (2) 调用 FSMCaller::on_committed 应用日志
+        //     注意，这里只是放队列里放入一个任务就返回了，
+        //     最终的 `on_apply` 回调由队列的消费函数调用
         _waiter->on_committed(last_committed_index);
     }
     return 0;
@@ -804,9 +810,9 @@ Leader 在收到 `AppendEntries` 响应后，会根据响应的不同类型对�
 
 * RPC 失败：调用 `_block` 阻塞当前 `Replicator` 一段时间（默认 100 毫秒），超时后调用 `_continue_sending` 重新发送当前 `AppendEntries` 请求。出现这种情况一般是对应的 Follower Crash 了，需要不断重试直到其恢复正常或被剔除集群
 * 响应失败：这里又细分为 2 种情况
-    * Follower 的 `term` 比 `leader` 高：调用 `increase_term_to` 将自己 `step_down` 成 Follower，并以错误状态调用所有日志的回调函数，表明用户 `apply` 失败
+    * Follower 的 `term` 比 `leader` 高：调用 `increase_term_to` 将自己 `step_down` 成 Follower，并以错误状态调用所有日志的回调函数，通知用户 `apply` 失败了
     * 日志不匹配：重新探测 `nextIndex`，待其确认后重新发送日志
-* 响应成功：调用 `BallotBox::commit_at`
+* 响应成功：调用 `BallotBox::commit_at` 对复制计算加一
 
 ```cpp
 void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
@@ -880,7 +886,7 @@ int NodeImpl::increase_term_to(int64_t new_term, const butil::Status& status) {
 }
 ```
 
-在 `step_down` 中会调用 `BallotBox::clear_pending_tasks` 将所有用户 `apply` 的任务都标位失败：
+在 `step_down` 中会调用 `BallotBox::clear_pending_tasks`，该函数将以失败状态调用所有用户任务的 `Closure`：
 
 ```cpp
 void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate,
@@ -900,11 +906,11 @@ int BallotBox::clear_pending_tasks() {
 
 void ClosureQueue::clear() {
     ...
-    // (3) saved_queue 中保存的是用户通过 apply 接口提交任务时设置的调函数
+    // (3) saved_queue 中保存的是用户任务的 Closure
     for (std::deque<Closure*>::iterator
             it = saved_queue.begin(); it != saved_queue.end(); ++it) {
         if (*it) {
-            // (4) 运行回调函数
+            // (4) 运行用户任务的 Closure
             (*it)->status().set_error(EPERM, "leader stepped down");
             run_closure_in_bthread_nosig(*it, _usercode_in_pthread);
             ...
@@ -930,7 +936,7 @@ int BallotBox::commit_at(
     for (int64_t log_index = start_at; log_index <= last_log_index; ++log_index) {
         Ballot& bl = _pending_meta_queue[log_index - _pending_index];
         pos_hint = bl.grant(peer, pos_hint);
-        if (bl.granted()) {  // 该日志已经达到 `Quorum`
+        if (bl.granted()) {  // (2) 该日志已经达到 `Quorum`，保存 commitIndex
             last_committed_index = log_index;
         }
     }
@@ -940,9 +946,9 @@ int BallotBox::commit_at(
     }
     ...
     _pending_index = last_committed_index + 1;
-    // (2) 更新 commitIndex
+    // (3) 更新 commitIndex
     _last_committed_index.store(last_committed_index, butil::memory_order_relaxed);
-    // (3) 调用 FSMCaller::do_committed 开始应用日志
+    // (4) 调用 FSMCaller::do_committed 开始应用日志
     // The order doesn't matter
     _waiter->on_committed(last_committed_index);
     return 0;
@@ -955,9 +961,7 @@ int BallotBox::commit_at(
 放入队列
 ---
 
-当日志复制数已达到 `Quorum`，则调用 `FSMCaller::on_committed` 应用日志，该函数会将应用任务放如串行队列 `ApplyTaskQueue` 当中。
-
-`ApplyTaskQueue` 也是个串行队列，由 BRPC [ExecutionQueue] 实现。
+当日志复制数已达到 `Quorum`，则调用 `FSMCaller::on_committed` 应用日志，该函数会将应用任务放如串行队列 `ApplyTaskQueue` 当中。`ApplyTaskQueue` 也是个串行队列，由 BRPC [ExecutionQueue] 实现：
 
 [ExecutionQueue]: https://brpc.apache.org/docs/bthread/execution-queue/
 
@@ -973,7 +977,7 @@ int FSMCaller::on_committed(int64_t committed_index) {
 批处理
 ---
 
-`ApplyTaskQueue` 的消费函数是 `FSMCaller::run`，在该函数中会对应用任务进行 Bacth 打包后，交给 `FSMCaller::do_committed` 处理：
+`ApplyTaskQueue` 的消费函数是 `FSMCaller::run`，在该函数中会对应用任务进行 Bacth 打包，并调用 `FSMCaller::do_committed` 进行批处理：
 
 ```cpp
 int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
@@ -1033,7 +1037,7 @@ void FSMCaller::do_committed(int64_t committed_index) {
 删除内存日志
 ---
 
-调用 `set_applied_id` 删除内存中的日志。注意，不删除 Leader 未持久化的日志，即使其已经被 `apply`：
+调用 `set_applied_id` 删除内存中的日志。注意，不删除 Leader 未持久化的日志，即使其已被 `apply`：
 
 ```cpp
 void LogManager::set_applied_id(const LogId& applied_id) {
@@ -1045,7 +1049,7 @@ void LogManager::set_applied_id(const LogId& applied_id) {
     // _disk_id：已经持久化的日志 Id
     // _applied_id：已经应用的日志 Id
     // 正常情况下，_applied_id >= _disk_id
-    // 但是为了性能考虑，只要复制数达到 `Quorum` 就可以提交日志，即使 Leader 未持久化
+    // 但是为了性能考虑，实现中只要复制数达到 `Quorum` 就可以提交日志，即使 Leader 未持久化
     // 所以可能出现日志已经被 apply 了，但是 Leader 还没有持久化
     _applied_id = applied_id;
     LogId clear_id = std::min(_disk_id, _applied_id);
@@ -1088,7 +1092,3 @@ TODO(Wine93,P0)
 正常情况下，日志都是会被复制成功的，即使 Follower Crash 了，Leader 也会不断重试直到其恢复正常或被剔除集群。只有当当前 Leader 不再是 Leader 时，日志复制才会失败，框架会调用用户任务的 `Closure`。
 -->
 
-总结
-===
-
-![图 4.3  日志复制整体流程图](image/4.3.png)
