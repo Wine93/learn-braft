@@ -4,17 +4,19 @@
 流程概览
 ---
 
-1. 前置步骤：当节点成为 Leader 时会通过发送空的 `AppendEntries` 请求确认各 Follower 的 `nextIndex`
-2. 客户端通过 `apply` 接口向 Leader 提交操作日志
-2. Leader 向本地追加日志：
-   * 2.1 为日志分配 `index`，并将其追加到内存存储中
-   * 2.2 异步将内存中的日志持久化到磁盘
-3. Leader 将内存中的日志通过 `AppendEntries` 请求并行地发送给所有 Follower
-4. Follower 收到 `AppenEntries` 请求，将日志持久化到本地后返回成功响应
-5. Leader 若收到大多数确定，则提交日志，更新 `commitIndex`
-6. Leader 回调用户状态机的 `on_apply` 应用日志
-7. 待 `on_apply` 返回后，更新 `applyIndex`，并删除内存中的日志
+1. 前情回顾：当节点成为 Leader 时会为每个 Follower 创建 `Replicator`，并通过发送空的 `AppendEntries` 请求确认各 Follower 的 `nextIndex`
+2. 客户端通过 `Node::apply` 接口向 Leader 提交操作日志
+3. Leader 向本地追加日志：
+   * 3.1 为日志分配 `index`，并将其追加到内存存储中
+   * 3.2 异步将内存中的日志持久化到磁盘
+4. Leader 将内存中的日志通过 `AppendEntries` 请求并行地复制给所有 Follower
+5. Follower 收到 `AppenEntries` 请求，将日志持久化到本地后返回成功响应
+6. Leader 若收到大多数确定，则提交日志，更新 `commitIndex` 并应用日志
+7. Leader 调用用户状态机的 `on_apply` 应用日志
+8. 待 `on_apply` 返回后，更新 `applyIndex`，并删除内存中的日志
 
+<!--
+TODO(Wine93)：
 流程注解
 ---
 
@@ -29,35 +31,62 @@
 * 5 Leader 的 `CommitIndex` 由 Quorum 机制决定，Follower 的 `CommitIndex` 由 Leader 在下一次的心跳或 `AppendEntries` 请求中携带的 `committed_index` 告知
 * 6 通常用户的状态机 `on_apply` 实现需要做 2 件事：(1) 将日志应用到状态机；(2) 将 RPC 响应返回给客户端
 * 6 braft 是以串行的方式回调 `on_apply`，所以为了性能，可以
+-->
+
+复制模型
+---
+
+![图 4.1  复制模型](image/4.1.png)
+
+日志复制是树形复制的模型，采用本地写入和复制同时进行的方式，并且只要大多数写入成功就可以应用日志，不必等待 Leader 本地写入成功。
+
+实现利用异步+并行，全程流水线式处理，并且全链路采用了 Batch，整体十分高效：
+
+* Batch：全链路 Batch，包括持久化、复制以及应用
+* 异步：Leader 和 Follower 的日志持久化都是异步的
+* 并行：Leader 本地持久化和复制是并行的，并且开启 `pipeline` 后可以保证复制和复制之间也是并行的
+
+关于性能优化的详情，可参考[<4.2 复制优化>](/ch04/4.2/optimization.md)。
 
 Replicator
 ---
 
-节点刚成为 Leader 时会为每个 Follower 创建一个 `Replicator`，其运行在单独的 `bthread` 上，其主要有以下几个作用：
+节点在刚成为 Leader 时会为每个 Follower 创建一个 `Replicator`，其运行在单独的 `bthread` 上，主要有以下几个作用：
 
-* 记录 Follower 的一些状态，如 `nextIndex`、`flyingAppendEntriesSize`
+* 记录 Follower 的一些状态，如 `nextIndex`、`flyingAppendEntriesSize` 等
 * 作为 RPC Client，所有从 Leader 发往 Follower 的 RPC 请求都会通过它，包括心跳、`AppendEntriesRequest`、`InstallSnapshotRequest`；
-* 同步日志：`Replicator` 会不断地向 Follower 同步日志，直到 Follower 成功复制了 Leader 的所有日志后，其将会后台等待新日志的到来。
+* 同步日志：`Replicator` 会不断地向 Follower 同步日志，直到 Follower 成功复制了 Leader 的所有日志后 ，将在后台等待新日志的到来。
 
 nextIndex
 ---
 
-`nextIndex` 是 Leader 记录下一个要发往 Follower 的日志 `Index`，只有确认了 `nextIndex` 才能给 Follower 发送日志，不然不知道要给 Follower 发送哪些日志。
+`nextIndex` 是 Leader 记录下一个要发往 Follower 的日志 `index`，只有确认了 `nextIndex` 才能给 Follower 发送日志，不然不知道要给 Follower 发送哪些日志。
 
 节点刚成为 Leader 时是不知道每个 Follower 的 `nextIndex` 的，需要通过发送一次或多次探测信息来确认，其探测算法如下：
 
 * (1) `matchIndex` 为最后一条 Leader 与 Follower 匹配的日志，而 `nextIndex=matchIndex+1`
-* (2) 初始化 `matchIndex` 为当前 Leader 的最后一条日志的 `Index`
-* (3) Leader 发送探测请求，携带 `matchIndex` 以及 `matchIndex` 对应的 `Term`
-* (4) Follower 接收请求后，根据自身日志获取 `matchIndex` 对应的 `Term`：
-  * 若和请求中的 `Term` 相等，则代表日志匹配，返回成功响应；
-  * 若日志不存在或者 `Term` 不匹配，则返回失败响应；
-  * 不管成功失败，响应中都携带 `lastLogIndex`
-* (5) Leader 接收到成功响应，则表示探测成功；否则回退 `matchIndex` 并重复步骤 2：
+* (2) 初始化 `matchIndex` 为当前 Leader 的最后一条日志的 `index`
+* (3) Leader 发送探测请求，携带 `matchIndex` 以及 `matchIndex` 日志对应的 `term`
+* (4) Follower 接收请求后，根据自身日志获取 `matchIndex` 对应的 `term`：
+  * 若和请求中的 `term` 相等，则代表日志匹配，返回成功响应；
+  * 若日志不存在或者 `term` 不匹配，则返回失败响应；
+  * 不管成功失败，响应中都携自身的 `lastLogIndex`
+* (5) Leader 接收到成功响应，则表示探测成功，确定 `nextIndex`；否则回退 `matchIndex` 并重复步骤 (3)：
     * 若 Follower 的 `lastLogIndex<matchIndex`，则回退 `matchIndex` 为 `lastLogIndex`
     * 否则回退 `matchIndex` 为 `matchIndex-1`
 
-![图 4.1  探测 nextIndex](image/next_index.png)
+> 下图展示的是一次探测过程，图中的数字代表的是日志的 `term`
+
+![图 4.2  探测过程](image/4.2.png)
+
+日志生命周期
+---
+
+* 2.1 日志的 Term 由 Leader 设置为当前的 `Term`；节点刚成为 Leader 时本身拥有的最后一条日志的 `Index` 作为 `LastLogIndex`，往后 Leader 每追加一条日志都将 `++LastLogIndex` 作为该日志的 `Index`
+* 2.2 日志的持久化是由管理磁盘的 `bthread` 负责，
+
+commitIndex
+---
 
 
 相关 RPC
@@ -117,6 +146,7 @@ service RaftService {
 相关接口
 ---
 
+用户提交任务：
 ```cpp
 class Node {
 public:
@@ -134,6 +164,8 @@ public:
     void apply(const Task& task);
 };
 ```
+
+应用日志：
 
 ```cpp
 class StateMachine {
