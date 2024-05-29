@@ -6,7 +6,7 @@
 介绍
 ---
 
-![图 4.2  Batch 优化](image/batch.png)
+![图 4.4  Batch 优化](image/4.4.png)
 
 从客户端调用 `apply` 接口提交 Task 到日志成功复制，并回调用户状态机的 `on_apply` 接口，日志依次经过了 `Apply Queue`、`Disk Queue`、`Apply Task Queue` 这 3 个队列。这些队列都是 brpc 的 [ExecutionQueue][ExecutionQueue] 实现，其消费函数都做了 `batch` 优化：
 
@@ -176,7 +176,7 @@ void FSMCaller::do_committed(int64_t committed_index) {
 本地持久化与复制
 ---
 
-![图 4.3  持久化日志的串行与并行](image/append_parallel.svg)
+![图 4.5  持久化日志的串行与并行](image/4.5.png)
 
 在 Raft 的实现中，Leader 需要先在本地持久化日志，再向所有的 Follower 复制日志，显然这样的实现具有较高的时延。特别地客户端的写都要经过 Leader，导致 Leader 的压力会变大，从而导致 IO 延迟变高成为慢节点，而本地持久化会阻塞后续的 Follower 复制。所以在 braft 中，Leader 本地持久化和 Follower 复制是并行的，即 Leader 会先将日志写入内存，同时异步地进行持久化和 Follower 复制。
 
@@ -191,7 +191,7 @@ void FSMCaller::do_committed(int64_t committed_index) {
 复制的串行与并行
 ---
 
-![图 4.4  串行与 Pipeline](image/pipeline.png)
+![图 4.6  串行与 Pipeline](image/4.6.png)
 
 Raft 默认是串行的复制日志，显然这样是比较低下的；可以采用 `Pipeline` 的优化方式，即 Leader 发送完  `AppendEntries` 完不必等待其响应，立马发送一下批日志。当然，这样的实现对于 Follower 端来说，会带来乱序、空洞等问题，为此，braft 在 Follower 端引入了日志缓存，将不是顺序的日志先缓冲起来，待其前面的日志都接受到后再写入该日志，以达到顺序写入磁盘的目的。
 特别需要注意的是，该优化 braft 默认是关闭的，需要用户通过以下 2 个配置项开启：
