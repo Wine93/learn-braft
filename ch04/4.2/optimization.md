@@ -1,27 +1,32 @@
-优化 0：nextIndex 的探测
-
 优化 1：Batch
 ===
 
-介绍
+Batch 队列
 ---
 
 ![图 4.4  Batch 优化](image/4.4.png)
 
-从客户端调用 `apply` 接口提交 Task 到日志成功复制，并回调用户状态机的 `on_apply` 接口，日志依次经过了 `Apply Queue`、`Disk Queue`、`Apply Task Queue` 这 3 个队列。这些队列都是 brpc 的 [ExecutionQueue][ExecutionQueue] 实现，其消费函数都做了 `batch` 优化：
+从客户端调用 `apply` 接口提交 `Task` 到日志成功复制，并回调用户状态机的 `on_apply` 接口，日志依次经过了 `Apply Queue`、`Disk Queue`、`Apply Task Queue` 这 3 个队列。这些队列都是 brpc 的 [ExecutionQueue][ExecutionQueue] 实现，其消费函数都做了 `batch` 优化：
 
-* **Apply Queue**: 用户提交的 Task 会进入该队列，在该队列的消费函数中会将这些 Task 对应的日志进行打包，并调用 `LogManager` 的 `append_entries` 函数进行追加日志。默认一次最多打包 256 条日志。
-* **Disk Queue**: `LogManager` 在接收到这批日志后，需对其进行持久化处理，故会往该队列中提交一个持久化任务（一个任务对应一批日志）；在该队列的消费函数中会将这些任务进行打包，将这批任务对应的所有日志写入磁盘，并在全部写入成功后会做一次 `sync` 操作。默认一次最多打包 256 个持久化任务，而每个任务最多包含 256 条日志，所以其一次 Bacth Write 最多会写入 `256 * 256` 条日志对应的数据。
-* **Apply Task Queue**：当日志的复制数（包含持久化）达到 Quorum 后，会调用 `on_committed` 往 `Apply Task Queue` 中提交一个 ApplyTask（每个任务对应一批已提交的日志）；在该队列的消费函数中会将这些 ApplyTask 打包成 `Iterator`，并作为参数回调用户状态机的 `on_apply` 函数。 默认一次最多打包 512 个 ApplyTask，而每个 ApplyTask 最多包含 256 条日志，所以每一次 `on_apply` 参数中的 `Iterator` 最多包含 `512 * 256` 条日志。
+* **ApplyQueue**: 用户提交的 `Task` 会进入该队列，在该队列的消费函数中会将这些 `Task` 对应的日志进行打包，并调用 `LogManager` 的 `append_entries` 函数进行追加日志，打包的日志既用于持久化，也用于复制。默认一次最多打包 256 条日志。
+* **DiskQueue**: `LogManager` 在接收到这批日志后，需对其进行持久化处理，故会往该队列中提交一个持久化任务（一个任务对应一批日志）；在该队列的消费函数中会将这些任务进行打包，将这批任务对应的所有日志写入磁盘。默认一次最多打包 256 个持久化任务，而每个任务最多包含 256 条日志，所以其一次 `Bacth Write` 最多会写入 `256 * 256` 条日志对应的数据。
+* **ApplyTaskQueue**：当日志的复制数（包含持久化）达到 `Quorum` 后，会调用 `on_committed` 往 `ApplyTaskQueue` 中提交一个 `ApplyTask`（每个任务对应一批已提交的日志）；在该队列的消费函数中会将这些 ApplyTask 打包成 `Iterator`，并作为参数回调用户状态机的 `on_apply` 函数。 默认一次最多打包 512 个 `ApplyTask`，而每个 `ApplyTask` 最多包含 256 条日志，所以每一次 `on_apply` 参数中的 `Iterator` 最多包含 `512 * 256` 条日志。
+
+从以上看出，日志的复制、持久化、应用，全链路都是经过 `Batch` 优化的。
+
+相关配置
+---
+
+| 作用队列 |
 
 [ExecutionQueue]: https://brpc.apache.org/docs/bthread/execution-queue
 
 > **Follower 的 Batch**
 >
-> 以上讨论的是节点作为 Leader 时的 Batch 优化，当节点为 Follower 时，其优化也是一样的，因为其用的是相同的代码逻辑，唯一的区别在于：
-> * **Apply Queue**: Follower 不会接受用户提交的 Task，其日志来源于 Leader 的复制
-> * **Disk Queue**: 日志批量落盘的逻辑是一样的，Follower 在接收到 Leader 的一批日志之后也是直接调用 `LogManager` 的 `append_entries` 函数
-> * **Apply Task Queue**: 批量 apply 的逻辑是一样的，区别在于调用 `on_committed` 的时机来源于 Leader 在 RPC 中携带的 `committed_index`，并不通过自身的 Quorum 计算
+> 以上讨论的是节点作为 Leader 时的 `Batch` 优化，当节点为 Follower 时，其优化也是一样的，因为其用的是相同的代码逻辑，唯一的区别在于：
+> * **ApplyQueue**: Follower 不会接受用户提交的日志（`Task`），其批量日志来源于 Leader 的复制
+> * **DiskQueue**: 日志批量落盘的逻辑是一样的，Follower 在接收到 Leader 的一批日志之后也是直接调用 `LogManager` 的 `append_entries` 函数
+> * **ApplyTaskQueue**: 批量 `on_apply` 的逻辑是一样的，区别在于 Follower 的 `commitIndex` 来源于 Leader 在 RPC 中携带的 `commitIndex`，并非通过自身的 `Quorum` 计算
 
 具体实现
 ---
@@ -31,23 +36,20 @@
 int NodeImpl::execute_applying_tasks(
         void* meta, bthread::TaskIterator<LogEntryAndClosure>& iter) {
     ...
-    // TODO: the batch size should limited by both task size and the total log
-    // size
-    // 定义一个 tasks 数组，数组大小 = min(batch_size, 256)
+    // (1) FLAGS_raft_apply_batch 默认为 32
     const size_t batch_size = FLAGS_raft_apply_batch;
+    // (2) 定义一个 tasks 数组，数组大小 = min(batch_size, 256)
     DEFINE_SMALL_ARRAY(LogEntryAndClosure, tasks, batch_size, 256);
     size_t cur_size = 0;
     NodeImpl* m = (NodeImpl*)meta;
     for (; iter; ++iter) {
         if (cur_size == batch_size) {
-            m->apply(tasks, cur_size);
+            m->apply(tasks, cur_size);  // (4) 调用批量 apply 函数
             cur_size = 0;
         }
-        tasks[cur_size++] = *iter;
+        tasks[cur_size++] = *iter;  // (3) batch 打包
     }
-    if (cur_size > 0) {
-        m->apply(tasks, cur_size);
-    }
+    ...
     return 0;
 }
 ```
@@ -58,9 +60,7 @@ int NodeImpl::execute_applying_tasks(
 int LogManager::disk_thread(void* meta,
                             bthread::TaskIterator<StableClosure*>& iter) {
     ...
-    LogManager* log_manager = static_cast<LogManager*>(meta);
-    // FIXME(chenzhangyi01): it's buggy
-    LogId last_id = log_manager->_disk_id;
+    // (1) 定义 AppendBatcher 的 Batch 大小为 256
     StableClosure* storage[256];
     AppendBatcher ab(storage, ARRAY_SIZE(storage), &last_id, log_manager);
 
@@ -70,14 +70,12 @@ int LogManager::disk_thread(void* meta,
         StableClosure* done = *iter;
         ...
         if (!done->_entries.empty()) {
-            ab.append(done);
+            ab.append(done);  // (2) batch 打包持久化任务
         } else {
-            ab.flush();
+            ab.flush();  // (3) 批量持久化
             ...
         }
     }
-    ...
-    ab.flush();
     ...
     return 0;
 }
@@ -95,6 +93,7 @@ public:
     }
 
     void append(LogManager::StableClosure* done) {
+        // FLAGS_raft_max_append_buffer_size 默认为 256KB
         if (_size == _cap ||
                 _buffer_size >= (size_t)FLAGS_raft_max_append_buffer_size) {
             flush();
@@ -111,12 +110,14 @@ public:
 
 `ApplyTaskQueue` 消费函数：
 
+
 ```cpp
 int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
     FSMCaller* caller = (FSMCaller*)meta;
     ...
     int64_t max_committed_index = -1;
     int64_t counter = 0;
+    // FLAGS_raft_fsm_caller_commit_batch 默认为 512
     size_t  batch_size = FLAGS_raft_fsm_caller_commit_batch;
     for (; iter; ++iter) {
         if (iter->type == COMMITTED && counter < batch_size) {
@@ -132,24 +133,10 @@ int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
                 counter = 0;
                 batch_size = FLAGS_raft_fsm_caller_commit_batch;
             }
-            switch (iter->type) {
-            case COMMITTED:
-                if (iter->committed_index > max_committed_index) {
-                    max_committed_index = iter->committed_index;
-                    counter++;
-                }
-                break;
             ...
-            }
         }
     }
-    if (max_committed_index >= 0) {
-        caller->_cur_task = COMMITTED;
-        caller->do_committed(max_committed_index);
-        g_commit_tasks_batch_counter << counter;
-        counter = 0;
-    }
-    caller->_cur_task = IDLE;
+    ...
     return 0;
 }
 
@@ -169,18 +156,17 @@ void FSMCaller::do_committed(int64_t committed_index) {
 }
 ```
 
-
 优化 2：并行持久化日志
 ===
 
-本地持久化与复制
+持久化与复制
 ---
 
 ![图 4.5  持久化日志的串行与并行](image/4.5.png)
 
 在 Raft 的实现中，Leader 需要先在本地持久化日志，再向所有的 Follower 复制日志，显然这样的实现具有较高的时延。特别地客户端的写都要经过 Leader，导致 Leader 的压力会变大，从而导致 `IO` 延迟变高成为慢节点，而本地持久化也会阻塞后续的 Follower 复制。
 
-所以在 braft 中，Leader 本地持久化和 Follower 复制是并行的，即 Leader 会先将日志写入内存，同时异步地进行持久化和 Follower 复制。并且只要大多数节点写入成功就可以应用日志，不必等待 Leader 本地写入成功。
+所以在 braft 中，Leader 本地持久化和 Follower 复制是并行的，即 Leader 会先将日志写入内存，同时异步地进行持久化和向 Follower 复制。并且只要大多数节点写入成功就可以应用日志，不必等待 Leader 本地持久化成功。
 
 具体实现
 ---
@@ -190,7 +176,7 @@ void FSMCaller::do_committed(int64_t committed_index) {
 优化 3：流水线复制
 ===
 
-复制的串行与并行
+pipeline
 ---
 
 ![图 4.6  串行与 Pipeline](image/4.6.png)
@@ -282,7 +268,7 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
 优化 4：raft sync
 ===
 
-控制日志的落盘行为
+sync 配置
 ---
 
 日志每次 `Batch Write` 是先将日志写入 `Page Cache`，最后再调用一次 `fsync` 操作。显然 `sync` 操作会增加时延，为此 braft 提供了一些配置项来控制日志的 `sync` 行为。用户可以根据业务数据丢失的容忍度高低，灵活调整这些配置以达到性能和可靠性之间的权衡。例如对于数据丢失容忍度较高的业务，可以选择将配置项 `raft_sync` 设置为 `Flase`，这将有助于提升性能。
@@ -365,7 +351,7 @@ void on_apply(braft::Iterator& iter) {
 }
 ```
 
-当日志被提交时，框架会串行调用用户状态机的 `on_apply`，虽然这里做了 Batch 优化，但是对于那些不支持批量更新的状态机来说，仍然是低效的。为此，用户可以将 `on_apply` 函数异步执行，让那些可以并行的操作尽可能并行起来。
+当日志被提交时，框架会串行调用用户状态机的 `on_apply`，虽然这里做了 `Batch` 优化，但是对于那些不支持批量更新的状态机来说，仍然是低效的。为此，用户可以将 `on_apply` 函数异步执行，让那些可以并行的操作尽可能并行起来。
 
 需要注意的是，当 `on_apply` 异步后，需要处理好节点成为 Leader 时日志回放的问题。当节点刚成为 Leader 时，需要回放（`on_apply`）之前任期的日志，这时候需要将这些日志全部应用到状态机后才能处理读取操作，不然可能会违背线性一致性。因为这些日志在之前的任期可能被提交了，客户端能读取到，而在新任期回放的时候，由于这些日志是异步执行的（`on_apply` 返回了，但还在异步执行中），可能还没应用到状态机，这时候客户端去读取可能是读取不到的。
 
