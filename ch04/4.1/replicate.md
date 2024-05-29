@@ -54,7 +54,7 @@ Replicator
 节点在刚成为 Leader 时会为每个 Follower 创建一个 `Replicator`，其运行在单独的 `bthread` 上，主要有以下几个作用：
 
 * 记录 Follower 的一些状态，如 `nextIndex`、`flyingAppendEntriesSize` 等
-* 作为 RPC Client，所有从 Leader 发往 Follower 的 RPC 请求都会通过它，包括心跳、`AppendEntriesRequest`、`InstallSnapshotRequest`；
+* 作为 RPC Client，所有从 Leader 发往 Follower 的 RPC 请求都由它发送，包括心跳、`AppendEntriesRequest`、`InstallSnapshotRequest`；
 * 同步日志：`Replicator` 会不断地向 Follower 同步日志，直到 Follower 成功复制了 Leader 的所有日志后 ，将在后台等待新日志的到来。
 
 nextIndex
@@ -71,7 +71,7 @@ nextIndex
   * 若和请求中的 `term` 相等，则代表日志匹配，返回成功响应；
   * 若日志不存在或者 `term` 不匹配，则返回失败响应；
   * 不管成功失败，响应中都携自身的 `lastLogIndex`
-* (5) Leader 接收到成功响应，则表示探测成功，确定 `nextIndex`；否则回退 `matchIndex` 并重复步骤 (3)：
+* (5) Leader 接收到成功响应，则表示探测成功；否则回退 `matchIndex` 并重复步骤 (3)：
     * 若 Follower 的 `lastLogIndex<matchIndex`，则回退 `matchIndex` 为 `lastLogIndex`
     * 否则回退 `matchIndex` 为 `matchIndex-1`
 
@@ -82,12 +82,32 @@ nextIndex
 日志生命周期
 ---
 
-* 2.1 日志的 Term 由 Leader 设置为当前的 `Term`；节点刚成为 Leader 时本身拥有的最后一条日志的 `Index` 作为 `LastLogIndex`，往后 Leader 每追加一条日志都将 `++LastLogIndex` 作为该日志的 `Index`
-* 2.2 日志的持久化是由管理磁盘的 `bthread` 负责，
+<!--
+TODO(Wine93,P0)
+**1. 日志诞生**
 
-commitIndex
----
+日志由 `index` 和 `term` 组成：
 
+* term：由 Leader 设置为当前的 `term`
+* index：节点刚成为 Leader 时本身拥有的最后一条日志的 `index` 作为 `lastLogIndex`，往后 Leader 每追加一条日志都将 `++lastLogIndex` 作为该日志的 `index`
+
+**2. 复制日志：** Leader 开始复制日志，包括本地持久化和复制给 Follower
+
+**3. 提交日志**
+
+当日志复制数达到 `Quorum` 后，就会提交日志，更新 `commitIndex`。
+
+这里需要重新提一下的是，Leader 的 `commitIndex` 并不是都是由 `Quorum` 机制决定的，具体来说：
+
+* Leader
+
+* Follower：
+
+**4. 应用日志：** 当日志被提交后，就会立马调用用户状态机的 `on_apply` 接口来应用日志。
+
+**5. 销毁日志：** 待日志被应用后，内存中的日志将被销毁，其内存将被释放。
+
+-->
 
 相关 RPC
 ---
@@ -133,13 +153,13 @@ service RaftService {
 };
 ```
 
-需要注意的是，探测 `nextIndex`、心跳、复制日志都是用的 `append_entries`，区别在于其请求中携带的参数不同：
+需要注意的是，探测 `nextIndex`、心跳、复制日志都是用的 `append_entries` 方法，区别在于其请求中携带的参数不同：
 
-| 作用     | entries  | committed_index              |
+| 用途     | entries  | committed_index              |
 |:---------|:---------|:-----------------------------|
 | 探测     | 空       | 0                            |
-| 心跳     | 空       | 当前 Leader 的 `CommitIndex` |
-| 复制日志 | 携带日志 | 当前 Leader 的 `CommitIndex` |
+| 心跳     | 空       | 当前 Leader 的 `commitIndex` |
+| 复制日志 | 携带日志 | 当前 Leader 的 `commitIndex` |
 
 > 除以上 2 个参数不同外，其余的参数都是一样的
 
