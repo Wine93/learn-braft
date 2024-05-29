@@ -15,7 +15,7 @@
 7. Leader 调用用户状态机的 `on_apply` 应用日志
 8. 待 `on_apply` 返回后，更新 `applyIndex`，并删除内存中的日志
 
-![图 4.3  日志复制整体流程图](image/4.3.png)
+> 备注：文章的结尾有一张整体流程图
 
 <!--
 TODO(Wine93)：
@@ -1080,6 +1080,10 @@ void LogManager::clear_memory_logs(const LogId& id) {
     } while (nentries == ARRAY_SIZE(entries_to_clear));
 }
 ```
+
+结尾
+===
+![图 4.3  日志复制整体流程图](image/4.3.png)
 
 <!--
 TODO(Wine93,P0)
