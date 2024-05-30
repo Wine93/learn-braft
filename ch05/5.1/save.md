@@ -8,19 +8,23 @@
 
 1. 当快照定时器超时或用户手动调用接口，会触发节点执行创建快照的任务
 2. 节点会将任务放进 [ApplyTaskQueue][ApplyTaskQueue]，等待其被执行
-3. 当任务执行时，会创建一个 `temp` 目录来保存临时快照，并返回一个 `SnapshotWriter`
+3. 当任务被执行时，会创建一个 `temp` 目录来保存临时快照，并返回一个 `SnapshotWriter`
 4. 以 `SnapshotWriter` 和 `Closure` 做为参数回调用户状态机的 `on_snapshot_save`
 5. 用户需通过 `SnapshotWriter` 将状态数据写入到临时快照中
+    * 5.1 调用 `SnapshotWriter::get_path` 获得快照目录路径，并将快照文件写入该目录
+    * 5.2 调用 `SnapshotWriter::add_file` 将快照文件相对路径添加至快照元数据中
 6. 待数据写入完成，用户需回调 `Closure` 将其转换为正式快照：
-    * 6.1 将快照元数据写入文件
+    * 6.1 将快照元数据持久化到文件
     * 6.2 通过 `rename()` 将临时快照转换为正式快照
     * 6.3 删除上一个快照
     * 6.4 删除上一个快照对应的日志
 7. 至此，快照创建完成
 
-流程整体分为以下 3 个阶段：创建临时快照（1-2），用户写入数据（3-4），转为正式快照（5-6）
+流程整体分为以下 3 个阶段：创建临时快照（1-3），用户写入数据（4-5），转为正式快照（6-7）
 
-![图 5.1  创建快照整体流程](image/save.png)
+[ApplyTaskQueue]: /ch02/2.1/init.md#applytaskqueue
+
+![图 5.1  创建快照整体流程](image/5.1.png)
 
 流程注解
 ---
@@ -49,9 +53,21 @@ do_real_snapshot() {
 ```
 -->
 
-
-快照组织
+快照结构
 ---
+
+![图 5.2  快照结构](image/5.2.png)
+
+正常情况下用户指定的快照存储目录下只会有一个快照目录。当创建快照时，会创建一个 `temp` 目录来保存临时快照，待创建完成后，通过 `rename` 将其转换为正式快照。
+
+正式快照目录以当时创建快照时的 `applyIndex` 命名，如 `snapshot_00000000000000002000`。
+
+快照目录下除了用户写入的快照文件集外，还有一个框架写入的元数据文件 `__raft_snapshot_meta`，元数据主要保存以下 2 部分信息：
+
+* 快照中每一个文件的相对路径，以及其 `CRC` 校验值
+* 快照中包含的最后日志的 `index` 和 `term`，以及集群配置
+
+参见以下元数据 `proto`：
 
 ```proto
 enum FileSource {
@@ -77,13 +93,15 @@ message LocalSnapshotPbMeta {
         required string name = 1;
         optional LocalFileMeta meta = 2;
     };
-    optional SnapshotMeta meta = 1;
-    repeated File files = 2;
+    optional SnapshotMeta meta = 1;  // (1) 快照元数据
+    repeated File files = 2;  // (2) 用户快照文件列表
 }
 ```
 
 相关接口
 ---
+
+用户手动触发快照：
 
 ```cpp
 class Node {
@@ -93,6 +111,8 @@ public:
     void snapshot(Closure* done);
 };
 ```
+
+用户需要实现的快照函数：
 
 ```cpp
 class StateMachine {
@@ -106,6 +126,8 @@ public:
                                                ::braft::Closure* done);
 };
 ```
+
+`SnapshotWriter` 相关接口：
 
 ```cpp
 class SnapshotWriter : public Snapshot {
@@ -122,6 +144,28 @@ public:
     // Note that whether the file will be removed from the backing storage is
     // implementation-defined.
     virtual int remove_file(const std::string& filename) = 0;
+};
+
+class Snapshot : public butil::Status {
+public:
+    Snapshot() {}
+    virtual ~Snapshot() {}
+
+    // Get the path of the Snapshot
+    virtual std::string get_path() = 0;
+
+    // List all the existing files in the Snapshot currently
+    virtual void list_files(std::vector<std::string> *files) = 0;
+
+    // Get the implementation-defined file_meta
+    virtual int get_file_meta(const std::string& filename,
+                              ::google::protobuf::Message* file_meta) {
+        (void)filename;
+        if (file_meta != NULL) {
+            file_meta->Clear();
+        }
+        return 0;
+    }
 };
 ```
 
@@ -603,5 +647,3 @@ void LogManager::set_snapshot(const SnapshotMeta* meta) {
 ===
 
 用户可以在 `on_snapshot_save` 中返回失败
-
-[ApplyTaskQueue]: /ch02/2.1/initialization.md#applytaskqueue

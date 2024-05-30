@@ -4,6 +4,7 @@
 流程概览
 ---
 
+// Follower 落后太多，新节点加入
 1. 当 Leader 已经压缩了 Follower 需要复制的日志，Leader 就需要将快照发送给 Follower
 2. Leader 向 Follower 发送 `InstallSnapshot` 请求
 3. Follower 根据请求中的 `URI` 分批次向 Leader 下载快照对应的文件集：
