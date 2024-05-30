@@ -409,7 +409,8 @@ public:
 
 写入数据
 ---
-`get_path` 接口会返回临时快照（`temp`）目录 的绝对路径：
+
+`get_path` 接口会返回临时快照（`temp`）目录 的绝对路径，用户需要在该目录中写入快照文件：
 
 ```cpp
 class LocalSnapshotWriter : public SnapshotWriter {
