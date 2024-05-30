@@ -10,7 +10,7 @@ Batch 队列
 
 * **ApplyQueue**: 用户提交的 `Task` 会进入该队列，在该队列的消费函数中会将这些 `Task` 对应的日志进行打包，并调用 `LogManager` 的 `append_entries` 函数进行追加日志，打包的日志既用于持久化，也用于复制。默认一次打包 32 条日志。
 * **DiskQueue**: `LogManager` 在接收到这批日志后，需对其进行持久化处理，故会往该队列中提交一个持久化任务（一个任务对应一批日志）；在该队列的消费函数中会将这些任务进行打包，将这批任务对应的所有日志写入磁盘。默认一次最多打包 256 个持久化任务，而每个任务最多包含 32 条日志，所以其一次 `Bacth Write` 最多会写入 `256 * 32 = 8192` 条日志对应的数据。当然其也受字节数限制，默认每次 `Batch Write` 最多写入 `256KB`。
-* **ApplyTaskQueue**：当日志的复制数（包含持久化）达到 `Quorum` 后，会调用 `on_committed` 往 `ApplyTaskQueue` 中提交一个 `ApplyTask`（每个 `ApplyTask` 对应一批已提交的日志）；在该队列的消费函数中会将这些 `ApplyTask` 打包成 `Iterator`，并作为参数回调用户状态机的 `on_apply` 函数。 默认一次最多打包 512 个 `ApplyTask`，而每个 `ApplyTask` 最多包含 32 条日志，所以每一次 `on_apply` 参数中的 `Iterator` 最多包含 `512 * 32 = 16672` 条日志。
+* **ApplyTaskQueue**：当日志的复制数（包含持久化）达到 `Quorum` 后，会调用 `on_committed` 往 `ApplyTaskQueue` 中提交一个 `ApplyTask`（每个 `ApplyTask` 对应一批已提交的日志）；在该队列的消费函数中会将这些 `ApplyTask` 打包成 `Iterator`，并作为参数回调用户状态机的 `on_apply` 函数。 默认一次最多打包 512 个 `ApplyTask`，而每个 `ApplyTask` 最多包含 32 条日志，所以每一次 `on_apply` 参数中的 `Iterator` 最多包含 `512 * 32 = 16384` 条日志。
 
 从以上看出，日志的复制、持久化、应用，全链路都是经过 `Batch` 优化的。
 
@@ -46,6 +46,7 @@ int NodeImpl::execute_applying_tasks(
         void* meta, bthread::TaskIterator<LogEntryAndClosure>& iter) {
     ...
     // (1) FLAGS_raft_apply_batch 默认为 32
+    // TODO: the batch size should limited by both task size and the total log size
     const size_t batch_size = FLAGS_raft_apply_batch;
     // (2) 定义一个 tasks 数组，数组大小 = min(batch_size, 256)
     DEFINE_SMALL_ARRAY(LogEntryAndClosure, tasks, batch_size, 256);
@@ -150,7 +151,7 @@ int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
     return 0;
 }
 
-// 生产 Iterator，调用用户状态机的 `on_apply`
+// 生成 Iterator，调用用户状态机的 `on_apply`
 void FSMCaller::do_committed(int64_t committed_index) {
     ...
     IteratorImpl iter_impl(_fsm, _log_manager, &closure, first_closure_index,
