@@ -91,7 +91,7 @@ Segment 文件
 
 > **获取日志的 term**
 >
-> 特别需要注意的是，在算法的执行过程中经常要获取日志的 `term`，如 Follower 在接收到 `AppendEntries` 请求时需要获取自身最后一条日志的 `term`，与请求中携带的 Leader 的 `term` 进行对比，以此来判断日志是否连续。如果每次都从文件中读取，显然是低效的，为此将日志的 `term` 也保存到了内存中，就是我们上述提到的 `offset_and_term` 映射表，其实该表映射的值不是 `offset`，而是 `<offset,term>` 的 `pair。
+> 特别需要注意的是，在算法的执行过程中经常要获取日志的 `term`，如 Follower 在接收到 `AppendEntries` 请求时需要获取自身最后一条日志的 `term`，与请求中携带的 Leader 的 `term` 进行对比，以此来判断日志是否连续。如果每次都从文件中读取，显然是低效的，为此将日志的 `term` 也保存到了内存中，就是我们上述提到的 `offset_and_term` 映射表，其实该表映射的值不是 `offset`，而是 `<offset,term>` 的 `pair`。
 
 具体实现
 ===
@@ -118,7 +118,7 @@ int SegmentLogStorage::append_entries(const std::vector<LogEntry*>& entries, IOM
         // (2) 获取 open segment，如果不存在或已经写满则重新创建一个
         scoped_refptr<Segment> segment = open_segment();
         ...
-        // (3) 将每一个 LogEntry 追加到 open segment
+        // (3) 将每一条 LogEntry 追加到 open segment
         int ret = segment->append(entry);
         ...
         // (4) 每成功写入一个 LogEntry，则将 lastLogIndex+1
@@ -138,13 +138,12 @@ int SegmentLogStorage::append_entries(const std::vector<LogEntry*>& entries, IOM
 // serialize entry, and append to open segment
 int Segment::append(const LogEntry* entry) {
     ...
-    // (1) 准备一个 IOBuf
+    // (1) 准备一个 IOBuf 存储日志实际数据 data
     butil::IOBuf data;
     ...
-    // (2) 追加日志实际数据
     data.append(entry->data);
     ...
-    // (3) 准备 Header
+    // (2) 准备 Header
     char header_buf[ENTRY_HEADER_SIZE];
     const uint32_t meta_field = (entry->type << 24 ) | (_checksum_type << 16);
     RawPacker packer(header_buf);
@@ -155,11 +154,11 @@ int Segment::append(const LogEntry* entry) {
     packer.pack32(get_checksum(
                   _checksum_type, header_buf, ENTRY_HEADER_SIZE - 4));
 
-    // (4) 追加 Header
+    // (3) 准备另外一个 IOBuf 存储日志 Header
     butil::IOBuf header;
     header.append(header_buf, ENTRY_HEADER_SIZE);
 
-    // (5) 将数据写入 Segment 文件
+    // (4) 将日志 Header 和 data 写入 Segment 文件
     const size_t to_write = header.length() + data.length();
     butil::IOBuf* pieces[2] = { &header, &data };
     size_t start = 0;
@@ -172,16 +171,16 @@ int Segment::append(const LogEntry* entry) {
         for (;start < ARRAY_SIZE(pieces) && pieces[start]->empty(); ++start) {}
     }
 
-    // (6) 插入 offset 索引，便于读取
+    // (5) 插入 offset 索引，便于读取
     _offset_and_term.push_back(std::make_pair(_bytes, entry->id.term));
     ...
-    // (7) 累加未 sync 的字节数
+    // (6) 累加未 sync 的字节数
     _unsynced_bytes += to_write;
     return 0;
 }
 ```
 
-`sync` 操作根据相关配置来判断是不是需要执行：
+`sync` 操作会根据相关配置来判断是不是需要执行：
 ```cpp
 int Segment::sync(bool will_sync, bool has_conf) {
     //CHECK(_is_open);
@@ -205,7 +204,7 @@ int Segment::sync(bool will_sync, bool has_conf) {
 获取 term
 ---
 
-获取日志的 `term` 直接从我们上述提到的 `offset_and_term` 映射表中获取即可：
+日志的 `term` 将直接从我们上述提到的 `offset_and_term` 映射表中获取即可，没有 `IO` 操作：
 
 ```cpp
 int64_t Segment::get_term(const int64_t index) const {
@@ -277,7 +276,7 @@ int SegmentLogStorage::get_segment(int64_t index, scoped_refptr<Segment>* ptr) {
 
 ```
 
-`Segment::get` 会现在我们上述提到的 `offset_and_term` 表中找到日志对应的 `offset` 和 `length`，之后再调用 `_load_entry` 读取日志，并对日志的 `Header` 和 `data` 做 `CRC` 校验：
+`Segment::get` 会先在我们上述提到的 `offset_and_term` 表中找到日志对应的 `offset` 和 `length`，之后再调用 `_load_entry` 读取日志，并对日志的 `Header` 和 `data` 做 `CRC` 校验：
 
 ```cpp
 LogEntry* Segment::get(const int64_t index) const {
@@ -309,6 +308,7 @@ LogEntry* Segment::get(const int64_t index) const {
     } while (0);
 }
 
+// 获取日志的 `offset` 和 `length`
 int Segment::_get_meta(int64_t index, LogMeta* meta) const {
     ...
         ...
@@ -326,6 +326,7 @@ int Segment::_get_meta(int64_t index, LogMeta* meta) const {
     return 0;
 }
 
+// 读取日志并校验
 int Segment::_load_entry(off_t offset, EntryHeader* head, butil::IOBuf* data, size_t size_hint) const {
     // (1) 一次性读取完整日志，包括 Header 和 data
     size_t to_read = std::max(size_hint, ENTRY_HEADER_SIZE);
@@ -361,11 +362,12 @@ int SegmentLogStorage::truncate_prefix(const int64_t first_index_kept)
 int SegmentLogStorage::truncate_suffix(const int64_t last_index_kept)
 ```
 
-`truncate_prefix` 会先将 `firstLogIndex` 保存到元数据文件中，然后删除所有小于 `firstLogIndex` 的 `Segment` 文件。需要注意的是，先保存 `firstLogIndex` 再删除文件主要是为了保证原子性，即使删除到一半 Crash 了，在节点重启的时候也会根据 `firstLogIndex` 继续删除剩余的文件：
+`truncate_prefix` 会先将 `firstLogIndex` 保存到元数据文件中，然后删除所有小于 `firstLogIndex` 的 `Segment` 文件。需要注意的是，先保存 `firstLogIndex` 再删除文件主要是为了保证原子性，即使删除到一半节点 Crash 了，在节点重启的时候也可以根据 `firstLogIndex` 继续删除剩余的文件：
 
 ```cpp
 int SegmentLogStorage::truncate_prefix(const int64_t first_index_kept) {
     ...
+    // (1) 先保存元数据
     // NOTE: truncate_prefix is not important, as it has nothing to do with
     // consensus. We try to save meta on the disk first to make sure even if
     // the deleting fails or the process crashes (which is unlikely to happen).
@@ -375,6 +377,7 @@ int SegmentLogStorage::truncate_prefix(const int64_t first_index_kept) {
         return -1;
     }
 
+    // (2) 再获取需要删除的 Segment 文件，并将其删除
     std::vector<scoped_refptr<Segment> > popped;
     pop_segments(first_index_kept, &popped);
     for (size_t i = 0; i < popped.size(); ++i) {
@@ -384,7 +387,7 @@ int SegmentLogStorage::truncate_prefix(const int64_t first_index_kept) {
     return 0;
 }
 
-// (1) 先保存元数据
+// 保存元数据
 int SegmentLogStorage::save_meta(const int64_t log_index) {
     ...
     std::string meta_path(_path);
@@ -398,12 +401,12 @@ int SegmentLogStorage::save_meta(const int64_t log_index) {
     return ret;
 }
 
-// (2) 再获取需要删除的 Segment 文件
+// 获取需要删除的 Segment 文件
 void SegmentLogStorage::pop_segments(
         const int64_t first_index_kept,
         std::vector<scoped_refptr<Segment> >* popped) {
     _first_log_index.store(first_index_kept, butil::memory_order_release);
-    // (2.1) 先删除 closed segment
+    // (1) 先获取 closed segment
     for (SegmentMap::iterator it = _segments.begin(); it != _segments.end();) {
         scoped_refptr<Segment>& segment = it->second;
         if (segment->last_index() < first_index_kept) {
@@ -413,7 +416,7 @@ void SegmentLogStorage::pop_segments(
             return;
         }
     }
-    // (2.2) 再删除 open segment
+    // (2) 再获取 open segment
     if (_open_segment) {
         if (_open_segment->last_index() < first_index_kept) {
             popped->push_back(_open_segment);
@@ -454,9 +457,9 @@ int SegmentLogStorage::truncate_suffix(const int64_t last_index_kept) {
 日志恢复
 ---
 
-节点在启动时会重建日志存储，其主要为了完成以下 2 件事：
+节点在启动时会重建日志存储，其主要为了完成以下 2 件事情：
 
-* 重建我们上述提到的内存索引，包括文件索引和 `offset` 索引（即 `offset_and_term` 映射表）
+* 重建我们上述提到的内存索引用于读取，包括文件索引和 `offset` 索引（即 `offset_and_term` 映射表）
 * 加载日志元数据（即 `firstLogIndex`），删除 `firstLogIndex` 之前的 `Segment` 文件
 
 ```cpp
@@ -472,7 +475,7 @@ int SegmentLogStorage::init(ConfigurationManager* configuration_manager) {
         ret = list_segments(is_empty);
         ...
         // (3) 加载 `Segment` 文件，遍历其中的日志，
-        //     读取每条日志的 Header（24）字节用来构建 offset 索引
+        //     读取每条日志的 Header（24 字节）用来构建 offset 索引
         ret = load_segments(configuration_manager);
         ...
     } while (0);
@@ -554,7 +557,7 @@ int Segment::load(ConfigurationManager* configuration_manager) {
     // (1) 打开 segment 文件
     _fd = ::open(path.c_str(), O_RDWR);
 
-    // (2) 读取每个 LogEntry 的 Header，构建o ffset_and_term
+    // (2) 读取每个 LogEntry 的 Header，构建 offset_and_term
     int64_t entry_off = 0;
     for (int64_t i = _first_index; entry_off < file_size; i++) {
         // (2.1) 读取 Header
