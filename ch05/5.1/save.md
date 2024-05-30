@@ -384,6 +384,9 @@ void FSMCaller::do_snapshot_save(SaveSnapshotClosure* done) {
 阶段二：用户写入数据
 ===
 
+`on_snapshot_save`
+---
+
 用户需要实现状态机的 `on_snapshot_save` 函数，在该函数中用户需要做以下 3 件事：
 * 调用 `writer->get_path` 获取临时快照的目录路径，并将快照文件写入到该目录下
 * 调用 `write->add` 将快照中每一个文件的相对路径加入到快照元数据中
@@ -402,7 +405,7 @@ public:
 };
 ```
 
-写入数据
+get_path
 ---
 
 `get_path` 接口会返回临时快照（`temp`）目录的绝对路径，用户需要在该目录中写入快照文件：
