@@ -273,7 +273,6 @@ int SegmentLogStorage::get_segment(int64_t index, scoped_refptr<Segment>* ptr) {
     }
     return 0;
 }
-
 ```
 
 `Segment::get` 会先在我们上述提到的 `offset_and_term` 表中找到日志对应的 `offset` 和 `length`，之后再调用 `_load_entry` 读取日志，并对日志的 `Header` 和 `data` 做 `CRC` 校验：
@@ -576,5 +575,4 @@ int Segment::load(ConfigurationManager* configuration_manager) {
 
 参考
 ===
-
 * [Braft详解](https://github.com/kasshu/braft-docs/blob/master/cn/Braft%20detailed%20explanation.md)

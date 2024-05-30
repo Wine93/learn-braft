@@ -366,7 +366,6 @@ sync 配置
 | `raft_sync_segments`    | 每当日志写满一个 `Segment` 需要切换时是否需要 `sync`，每个 `Segment` 默认存储 `8MB` 的日志                                 | `False`                 |
 | `raft_max_segment_size` | 单个日志 `Segment` 大小                                                                                                    | `8MB`                   |
 
-
 具体实现
 ---
 
