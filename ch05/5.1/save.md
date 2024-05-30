@@ -405,7 +405,7 @@ public:
 写入数据
 ---
 
-`get_path` 接口会返回临时快照（`temp`）目录 的绝对路径，用户需要在该目录中写入快照文件：
+`get_path` 接口会返回临时快照（`temp`）目录的绝对路径，用户需要在该目录中写入快照文件：
 
 ```cpp
 class LocalSnapshotWriter : public SnapshotWriter {
@@ -435,7 +435,12 @@ public:
     // no error can be raised.
     // Note that whether the file will be created onto the backing storage is
     // implementation-defined.
-    virtual int add_file(const std::string& filename);
+    virtual int add_file(const std::string& filename) {
+        return add_file(filename, NULL);
+    }
+
+    virtual int add_file(const std::string& filename,
+                         const ::google::protobuf::Message* file_meta) = 0;
 };
 ```
 
@@ -486,7 +491,7 @@ void* SaveSnapshotDone::continue_run(void* arg) {
         self->status(), self->_meta, self->_writer);
     }
 
-    // (2) self->_done：用户手动调用 snapshot 传入的 Closure
+    // (2) 如果是用户手动触发快照，这时候会回调用户传入的 Closure
     if (self->_done) {
         run_closure_in_bthread(self->_done, true);
     }
