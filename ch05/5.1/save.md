@@ -529,7 +529,7 @@ int SnapshotExecutor::on_snapshot_save_done(
 }
 ```
 
-`save_meta` 将元数据保存到 `LocalSnapshotMetaTable` 中：
+`save_meta` 会将元数据保存到 `LocalSnapshotMetaTable` 中：
 
 ```cpp
 int LocalSnapshotWriter::save_meta(const SnapshotMeta& meta) {
@@ -594,8 +594,9 @@ int LocalSnapshotStorage::close(SnapshotWriter* writer_base,
         }
         // unref old_index, ref new_index
 
-        // (3) 删除上一个快照。特别需要注意的时，这里有一个引用
-        //     需要注意的是，当前节点可能是 Leader，而该快照可能正用于下载给 Follower
+        // (3) 删除上一个快照。
+        //     需要注意的是，这里有一个引用判断
+        //     因为当前节点可能是 Leader，而该快照可能正用于下载给 Follower
         unref(old_index);
     } while (0);
     ...
@@ -672,7 +673,7 @@ int LocalSnapshotStorage::destroy_snapshot(const std::string& path) {
 删除上一个快照对应日志
 ---
 
-调用 `set_snapshot` 删除上一个快照的日志，之所以只删除上一个快照的日志，而不立马删除快照的日志，主要考虑到有些 Follower 还没有同步完日志，如果删除了当前的日志，只能发送快照进行同步，见以下注释：
+调用 `set_snapshot` 删除上一个快照的日志，之所以只删除上一个快照的日志，而不立即删除当前快照的日志，主要考虑到有些 Follower 还没有同步完日志，如果删除了当前的日志，只能发送快照进行同步，见以下注释：
 
 ```cpp
 void LogManager::set_snapshot(const SnapshotMeta* meta) {
