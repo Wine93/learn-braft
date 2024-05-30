@@ -8,18 +8,11 @@ Batch 队列
 
 从客户端调用 `apply` 接口提交 `Task` 到日志成功复制，并回调用户状态机的 `on_apply` 接口，日志依次经过了 `Apply Queue`、`Disk Queue`、`Apply Task Queue` 这 3 个队列。这些队列都是 brpc 的 [ExecutionQueue][ExecutionQueue] 实现，其消费函数都做了 `batch` 优化：
 
-* **ApplyQueue**: 用户提交的 `Task` 会进入该队列，在该队列的消费函数中会将这些 `Task` 对应的日志进行打包，并调用 `LogManager` 的 `append_entries` 函数进行追加日志，打包的日志既用于持久化，也用于复制。默认一次最多打包 256 条日志。
-* **DiskQueue**: `LogManager` 在接收到这批日志后，需对其进行持久化处理，故会往该队列中提交一个持久化任务（一个任务对应一批日志）；在该队列的消费函数中会将这些任务进行打包，将这批任务对应的所有日志写入磁盘。默认一次最多打包 256 个持久化任务，而每个任务最多包含 256 条日志，所以其一次 `Bacth Write` 最多会写入 `256 * 256` 条日志对应的数据。
-* **ApplyTaskQueue**：当日志的复制数（包含持久化）达到 `Quorum` 后，会调用 `on_committed` 往 `ApplyTaskQueue` 中提交一个 `ApplyTask`（每个任务对应一批已提交的日志）；在该队列的消费函数中会将这些 ApplyTask 打包成 `Iterator`，并作为参数回调用户状态机的 `on_apply` 函数。 默认一次最多打包 512 个 `ApplyTask`，而每个 `ApplyTask` 最多包含 256 条日志，所以每一次 `on_apply` 参数中的 `Iterator` 最多包含 `512 * 256` 条日志。
+* **ApplyQueue**: 用户提交的 `Task` 会进入该队列，在该队列的消费函数中会将这些 `Task` 对应的日志进行打包，并调用 `LogManager` 的 `append_entries` 函数进行追加日志，打包的日志既用于持久化，也用于复制。默认一次打包 32 条日志。
+* **DiskQueue**: `LogManager` 在接收到这批日志后，需对其进行持久化处理，故会往该队列中提交一个持久化任务（一个任务对应一批日志）；在该队列的消费函数中会将这些任务进行打包，将这批任务对应的所有日志写入磁盘。默认一次最多打包 256 个持久化任务，而每个任务最多包含 32 条日志，所以其一次 `Bacth Write` 最多会写入 `256 * 32 = 8192` 条日志对应的数据。当然其也受字节数限制，默认每次 `Batch Write` 最多写入 `256KB`。
+* **ApplyTaskQueue**：当日志的复制数（包含持久化）达到 `Quorum` 后，会调用 `on_committed` 往 `ApplyTaskQueue` 中提交一个 `ApplyTask`（每个 `ApplyTask` 对应一批已提交的日志）；在该队列的消费函数中会将这些 `ApplyTask` 打包成 `Iterator`，并作为参数回调用户状态机的 `on_apply` 函数。 默认一次最多打包 512 个 `ApplyTask`，而每个 `ApplyTask` 最多包含 32 条日志，所以每一次 `on_apply` 参数中的 `Iterator` 最多包含 `512 * 32 = 16672` 条日志。
 
 从以上看出，日志的复制、持久化、应用，全链路都是经过 `Batch` 优化的。
-
-相关配置
----
-
-| 作用队列 |
-
-[ExecutionQueue]: https://brpc.apache.org/docs/bthread/execution-queue
 
 > **Follower 的 Batch**
 >
@@ -27,6 +20,22 @@ Batch 队列
 > * **ApplyQueue**: Follower 不会接受用户提交的日志（`Task`），其批量日志来源于 Leader 的复制
 > * **DiskQueue**: 日志批量落盘的逻辑是一样的，Follower 在接收到 Leader 的一批日志之后也是直接调用 `LogManager` 的 `append_entries` 函数
 > * **ApplyTaskQueue**: 批量 `on_apply` 的逻辑是一样的，区别在于 Follower 的 `commitIndex` 来源于 Leader 在 RPC 中携带的 `commitIndex`，并非通过自身的 `Quorum` 计算
+
+相关配置
+---
+
+当然，框架也提供了一些配置项来调整这些 `Batch` 大小：
+
+| 作用队列       | 配置项                         | 默认值   | 说明                                                                              |
+|:---------------|:-------------------------------|:---------|:----------------------------------------------------------------------------------|
+| ApplyQueue     | `raft_apply_batch`             | 32       | 该打包大小影响持久化、落盘以及`on_apply`；上限为 512                              |
+| DiskQueue      | `raft_max_append_buffer_size`  | `256 KB` | 每次 `Batch Write` 最大的字节数                                                   |
+| ApplyTaskQueue | `raft_fsm_caller_commit_batch` | 512      | 每次 `on_apply` 的最大日志数为 `raft_apply_batch * raft_fsm_caller_commit_batch ` |
+
+
+[ExecutionQueue]: https://brpc.apache.org/docs/bthread/execution-queue
+
+
 
 具体实现
 ---
@@ -94,6 +103,7 @@ public:
 
     void append(LogManager::StableClosure* done) {
         // FLAGS_raft_max_append_buffer_size 默认为 256KB
+        // 一次 Batch Write 写入的字节数不能超过该配置值
         if (_size == _cap ||
                 _buffer_size >= (size_t)FLAGS_raft_max_append_buffer_size) {
             flush();
@@ -140,6 +150,7 @@ int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
     return 0;
 }
 
+// 生产 Iterator，调用用户状态机的 `on_apply`
 void FSMCaller::do_committed(int64_t committed_index) {
     ...
     IteratorImpl iter_impl(_fsm, _log_manager, &closure, first_closure_index,
