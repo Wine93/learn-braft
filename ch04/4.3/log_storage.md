@@ -57,7 +57,7 @@ Segment 文件
 | reserved        | 16       | 保留字段                                   |
 | data len        | 32       | 日志实际数据的长度                         |
 | data_checksum   | 32       | 日志实际数据的校验值                       |
-| header checksum | 32       | Header（前 20 字节） 的校验值              |
+| header checksum | 32       | `Header`（前 20 字节） 的校验值            |
 
 
 内存索引
@@ -67,7 +67,7 @@ Segment 文件
 
 **1. 文件索引**
 
-由于每个 `Segment` 文件保存的是一段连续的日志，可以构建 `firstIndex` 到 `Segment` 文件的映射。这样需要就可以根据日志的 `logIndex` 可以快速定位到其属于哪个 `Segment` 文件：
+由于每个 `Segment` 文件保存的是一段连续的日志，可以构建每个 `Segment` 的 `firstIndex` 到 `Segment` 文件的映射。这样就可以根据日志的 `logIndex` 可以快速定位到其属于哪个 `Segment` 文件：
 
 | firstIndex | Segment 指针                   |
 |:-----------|:-------------------------------|
@@ -78,17 +78,16 @@ Segment 文件
 
 **2. offset 索引**
 
-找到指定的 `Segment` 文件后，需要知道日志在该文件具体的 `offset` 和 `length`，才可以一次性读取出来。为此为每个 `Segment` 文件构建了 `logIndex` 到文件 `offset` 的映射（即 `offset_and_term`），而日志的 `length` 可以通过 `logIndex+1` 日志的 `offset` 减去当前的 `offset` 算出来。
+找到指定的 `Segment` 文件后，需要知道日志在该文件的 `offset` 以及 `length`，才可以一次性读取出来。为此为每个 `Segment` 文件构建了 `logIndex` 到文件 `offset` 的映射（即 `offset_and_term`），而日志的 `length` 可以通过 `logIndex+1` 日志的 `offset` 减去当前的 `offset` 算出来。
 
-举个例子，下表为某个 `Segment` 的 `offset_and_term` 映射表。从表中可以得知 `logIndex=1001` 这条日志的 `offset` 是 `1100`，而其 `lengh` 为 `1200-1100=100`。
+举个例子，下表为某个 `Segment` 的 `offset_and_term` 映射表。从表中可以得知 `logIndex=1001` 这条日志的 `offset` 是 `1100`，而其 `length` 可通过计算得到，为 `1200-1100=100`。
 
 | logIndex | offset |
 |:---------|:-------|
 | 1001     | 1100   |
 | 1002     | 1200   |
 
-有这 2 层索引，我们就可以快速定位到某一个日志属于哪个文件，并且也可以迅速获得其在该文件中的 `offset` 和 `length`。
-
+有了这 2 层索引，我们就可以快速定位到某一条日志属于哪个文件，并且也可以迅速获得其在该文件中的 `offset` 和 `length`。
 
 具体实现
 ===
