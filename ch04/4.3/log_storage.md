@@ -574,4 +574,4 @@ int Segment::load(ConfigurationManager* configuration_manager) {
 参考
 ===
 
-* [Braft详解](https://github.com/kasshu/braft-docs)
+* [Braft详解](https://github.com/kasshu/braft-docs/blob/master/cn/Braft%20detailed%20explanation.md)
