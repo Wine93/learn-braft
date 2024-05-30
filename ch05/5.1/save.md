@@ -309,7 +309,7 @@ int LocalSnapshotWriter::init() {
 调用 `on_snapshot_save`
 ---
 
-创建好 `temp` 目录后，会调用 `FSMCaller::on_snapshot_save` 将快照任务放入 [ApplyTaskQueue][applytaskqueue]，待其被执行时：
+创建好 `temp` 目录后，会调用 `FSMCaller::on_snapshot_save` 将快照任务放入 [ApplyTaskQueue][applytaskqueue]，等待其被执行：
 
 ```cpp
 int FSMCaller::on_snapshot_save(SaveSnapshotClosure* done) {
@@ -320,7 +320,8 @@ int FSMCaller::on_snapshot_save(SaveSnapshotClosure* done) {
 }
 ```
 
-队列消费函数调用 `FSMCaller::do_snapshot_save`：
+队列消费函数会调用 `FSMCaller::do_snapshot_save` 执行快照任务：
+
 ```cpp
 int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
     ...
@@ -340,9 +341,9 @@ int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
 }
 ```
 
-`FSMCaller::do_snapshot_save` 函数主要做 2 件事：
+在 `FSMCaller::do_snapshot_save` 函数中主要做以下 2 件事：
 * 准备好元数据，将其保存在 `Closure` 中
-* 将 上述创建的 `SnapshotWriter` 和 `Closure` 作为参数调用用户状态机的 `on_snapshot_save`
+* 将上述创建的 `SnapshotWriter` 和 `Closure` 作为参数调用用户状态机的 `on_snapshot_save`
 
 ```cpp
 void FSMCaller::do_snapshot_save(SaveSnapshotClosure* done) {
@@ -350,9 +351,9 @@ void FSMCaller::do_snapshot_save(SaveSnapshotClosure* done) {
     int64_t last_applied_index = _last_applied_index.load(butil::memory_order_relaxed);  // applyIndex
 
     SnapshotMeta meta;
-    // (1.1) 最后一条应用日志的 Index
+    // (1.1) 最后一条应用日志的 index
     meta.set_last_included_index(last_applied_index);
-    // (1.2) 最后一条应用日志的 Term
+    // (1.2) 最后一条应用日志的 term
     meta.set_last_included_term(_last_applied_term);
 
     // (1.3) 当前节点的配置
