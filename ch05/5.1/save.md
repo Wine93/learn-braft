@@ -50,21 +50,26 @@ do_real_snapshot() {
 -->
 
 
-快照元数据
+快照组织
 ---
 
 ```proto
-message SnapshotMeta {
-    required int64 last_included_index = 1;
-    required int64 last_included_term = 2;
-    repeated string peers = 3;
-    repeated string old_peers = 4;
+enum FileSource {
+    FILE_SOURCE_LOCAL = 0;
+    FILE_SOURCE_REFERENCE = 1;
 }
 
 message LocalFileMeta {
     optional bytes user_meta   = 1;
     optional FileSource source = 2;
     optional string checksum   = 3;
+}
+
+message SnapshotMeta {
+    required int64 last_included_index = 1;
+    required int64 last_included_term = 2;
+    repeated string peers = 3;
+    repeated string old_peers = 4;
 }
 
 message LocalSnapshotPbMeta {
