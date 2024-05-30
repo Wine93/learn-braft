@@ -64,7 +64,7 @@ do_real_snapshot() {
 
 快照目录下除了用户写入的快照文件集外，还有一个框架写入的元数据文件 `__raft_snapshot_meta`，元数据主要保存以下 2 部分信息：
 
-* 快照中每一个文件的相对路径，以及其 `CRC` 校验值
+* 快照中每一个文件的相对路径
 * 快照中包含的最后日志的 `index` 和 `term`，以及集群配置
 
 参见以下元数据 `proto`：
@@ -204,11 +204,10 @@ void NodeImpl::snapshot(Closure* done) {
 执行快照任务
 ---
 
-在正式创建快照前会做一些判断，决定是否要创建快照；若确定要创建快照，则：
+`NodeImpl::do_snapshot` 会调用 `SnapshotExecutor::do_snapshot` 执行快照任务。在正式创建快照前会做一些判断，决定是否要创建快照；若确定要创建快照，则：
 * 创建 `temp` 目录用于保存临时快照
 * 将创建快照任务放入 [ApplyTaskQueue][ApplyTaskQueue] 中等待被执行
 
-执行快照任务：
 ```cpp
 void NodeImpl::do_snapshot(Closure* done) {
     ...
@@ -217,9 +216,7 @@ void NodeImpl::do_snapshot(Closure* done) {
     }
     ...
 }
-```
 
-```cpp
 void SnapshotExecutor::do_snapshot(Closure* done) {
     ...
     // (1) 判断 1：正在从 Leader 下载快照
@@ -250,7 +247,8 @@ void SnapshotExecutor::do_snapshot(Closure* done) {
         return;
     }
 
-    // (4) 创建 temp 目录用于保存临时快照，并返回 SnapshotWriter
+    // (4) 调用 `LocalSnapshotStorage::create` 创建 temp 目录用于保存临时快照
+    //     并返回 SnapshotWriter
     SnapshotWriter* writer = _snapshot_storage->create();
     ...
     _saving_snapshot = true;
@@ -269,7 +267,7 @@ void SnapshotExecutor::do_snapshot(Closure* done) {
 创建临时目录
 ---
 
-创建 `temp` 目录，若已存在则先将其删除，并返回 `SnapshotWriter`：
+`LocalSnapshotStorage::create` 会创建 `temp` 目录，若事先已存在 `temp` 目录，则先将其删除后再创建，并返回 `SnapshotWriter`：
 
 ```cpp
 SnapshotWriter* LocalSnapshotStorage::create() {
@@ -280,7 +278,7 @@ SnapshotWriter* LocalSnapshotStorage::create(bool from_empty) {
     LocalSnapshotWriter* writer = NULL;
 
     do {
-        std::string snapshot_path(_path);  // _path 为用户配置的快照目录
+        std::string snapshot_path(_path);  // _path 为用户配置的快照存储目录
         snapshot_path.append("/");
         snapshot_path.append(_s_temp_path);  // e.g. data/temp
 
@@ -293,8 +291,9 @@ SnapshotWriter* LocalSnapshotStorage::create(bool from_empty) {
             }
         }
 
+        // (2) 调用 `LocalSnapshotWriter::init` 创建 temp 目录
         writer = new LocalSnapshotWriter(snapshot_path, _fs.get());
-        if (writer->init() != 0) {  // (2) 创建 temp 目录
+        if (writer->init() != 0) {
             ...
             break;
         }
@@ -302,16 +301,22 @@ SnapshotWriter* LocalSnapshotStorage::create(bool from_empty) {
 
     return writer;
 }
+
+int LocalSnapshotWriter::init() {
+    butil::File::Error e;
+    // (3) 创建 temp 目录
+    if (!_fs->create_directory(_path, &e, false)) {
+        return EIO;
+    }
+    ...
+}
 ```
 
-回调 on_snapshot_save
+调用 `on_snapshot_save`
 ---
 
-将创建快照任务放入 `ApplyTaskQueue`，待其被执行时：
-* 准备好元数据，将其保存在 `Closure` 中
-* 将 `Closure` 和 上述创建的 `SnapshotWriter` 作为参数回调用户状态机的 `on_snapshot_save`。
+创建好 `temp` 目录后，会调用 `FSMCaller::on_snapshot_save` 将快照任务放入 [ApplyTaskQueue][applytaskqueue]，待其被执行时：
 
-将任务放入队列：
 ```cpp
 int FSMCaller::on_snapshot_save(SaveSnapshotClosure* done) {
     ApplyTask task;
@@ -321,7 +326,7 @@ int FSMCaller::on_snapshot_save(SaveSnapshotClosure* done) {
 }
 ```
 
-队列消费函数：
+队列消费函数调用 `FSMCaller::do_snapshot_save`：
 ```cpp
 int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
     ...
@@ -341,17 +346,22 @@ int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
 }
 ```
 
-回调状态机 `on_snapshot_save`:
+`FSMCaller::do_snapshot_save` 函数主要做 2 件事：
+* 准备好元数据，将其保存在 `Closure` 中
+* 将 上述创建的 `SnapshotWriter` 和 `Closure` 作为参数调用用户状态机的 `on_snapshot_save`
+
 ```cpp
 void FSMCaller::do_snapshot_save(SaveSnapshotClosure* done) {
     //（1）准备快照元数据
-    int64_t last_applied_index = _last_applied_index.load(butil::memory_order_relaxed);
+    int64_t last_applied_index = _last_applied_index.load(butil::memory_order_relaxed);  // applyIndex
 
     SnapshotMeta meta;
-    meta.set_last_included_index(last_applied_index);  // (1.1) 最后一条应用日志的 Index
-    meta.set_last_included_term(_last_applied_term);   // (1.2) 最后一条应用日志的 Term
+    // (1.1) 最后一条应用日志的 Index
+    meta.set_last_included_index(last_applied_index);
+    // (1.2) 最后一条应用日志的 Term
+    meta.set_last_included_term(_last_applied_term);
 
-    // (1.3) 当前集群的配置
+    // (1.3) 当前节点的配置
     //       若 old_peers 不为空，则为配置变更的 C{old,new}
     //       否则为当前集群的配置，即 C{new}
     ConfigurationEntry conf_entry;
@@ -367,22 +377,22 @@ void FSMCaller::do_snapshot_save(SaveSnapshotClosure* done) {
         *meta.add_old_peers() = iter->to_string();
     }
 
-    // (2) 回调 on_snapshot_save
+    // (1.4) 将元数据保存在 `Closure` 中
     SnapshotWriter* writer = done->start(meta);
     ...
+    // (2) 调用用户状态机 on_snapshot_save
     _fsm->on_snapshot_save(writer, done);
     return;
 }
 ```
 
-阶段二：用户写入数据
+阶段二：`on_snapshot_save`
 ===
 
-写入数据
----
-
-用户需要实现 `on_snapshot_save`，在该函数中需要执行实际的创建快照任务，并通过 `add_file` 将所有文件逐一加入到快照中，待全部完成后，调用 `done->Run()` 将其转换为正式快照：
-
+用户需要实现状态机的 `on_snapshot_save` 函数，在该函数中用户需要做以下 3 件事：
+* 调用 `writer->get_path` 获取临时快照的目录路径，并将快照文件写入到该目录下
+* 调用 `write->add` 将快照中每一个文件的相对路径加入到快照元数据中
+* 待以上全部完成后，调用 `done->Run` 将临时快照转换为正式快照
 
 ```cpp
 class StateMachine {
@@ -397,6 +407,29 @@ public:
 };
 ```
 
+写入数据
+---
+`get_path` 接口会返回临时快照（`temp`）目录 的绝对路径：
+
+```cpp
+class LocalSnapshotWriter : public SnapshotWriter {
+public:
+    ...
+    virtual std::string get_path() { return _path; }
+    ...
+private:
+    // Users shouldn't create LocalSnapshotWriter Directly
+    LocalSnapshotWriter(const std::string& path,
+                        FileSystemAdaptor* fs);
+    ...
+    std::string _path;
+    ...
+};
+```
+
+add_file
+---
+
 ```cpp
 class SnapshotWriter : public Snapshot {
 public:
@@ -407,20 +440,35 @@ public:
     // Note that whether the file will be created onto the backing storage is
     // implementation-defined.
     virtual int add_file(const std::string& filename);
-
-    // Remove a file from the snapshot
-    // Note that whether the file will be removed from the backing storage is
-    // implementation-defined.
-    virtual int remove_file(const std::string& filename) = 0;
 };
+```
+
+`add_file` 接口只是将文件路径添加到元数据中而已：
+
+```cpp
+int LocalSnapshotWriter::add_file(
+        const std::string& filename,
+        const ::google::protobuf::Message* file_meta) {
+    ...
+    return _meta_table.add_file(filename, meta);
+}
+
+int LocalSnapshotMetaTable::add_file(const std::string& filename,
+                                const LocalFileMeta& meta) {
+    Map::value_type value(filename, meta);
+    std::pair<Map::iterator, bool> ret = _file_map.insert(value);
+    ...
+    return ret.second ? 0 : -1;
+}
 ```
 
 阶段三：转为正式快照
 ===
 
-用户完成快照的创建后，会回调 `SaveSnapshotDone::Run()`，而该函数会将临时快照 `rename` 成正式快照，并删除上一个快照，以及删除上一个快照对应的日志。
+用户完成快照的创建后，会调用 `Closure` 即 `SaveSnapshotDone::Run()`，而该函数会将临时快照 `rename` 成正式快照，并删除上一个快照，以及删除上一个快照对应的日志。
 
-用户回调的 `done->Run()`：
+用户调用 `SaveSnapshotDone::Run`，该函数主要执行以下 2 件事：
+
 ```cpp
 void SaveSnapshotDone::Run() {
     // Avoid blocking FSMCaller
@@ -438,7 +486,7 @@ void* SaveSnapshotDone::continue_run(void* arg) {
     SaveSnapshotDone* self = (SaveSnapshotDone*)arg;
     ...
     // Must call on_snapshot_save_done to clear _saving_snapshot
-    // (1)
+    // (1) 调用 `SnapshotExecutor::on_snapshot_save_done` 执行实际的收尾动作
     int ret = self->_se->on_snapshot_save_done(
         self->status(), self->_meta, self->_writer);
     }
@@ -450,6 +498,8 @@ void* SaveSnapshotDone::continue_run(void* arg) {
     return NULL;
 }
 ```
+
+`on_snapshot_save_done` 会
 
 ```cpp
 int SnapshotExecutor::on_snapshot_save_done(
@@ -505,6 +555,53 @@ int SnapshotExecutor::on_snapshot_save_done(
 
 写入元数据
 ---
+
+```cpp
+int LocalSnapshotWriter::save_meta(const SnapshotMeta& meta) {
+    _meta_table.set_meta(meta);
+    return 0;
+}
+
+class LocalSnapshotMetaTable {
+public:
+    ...
+    void set_meta(const SnapshotMeta& meta) { _meta = meta; }
+    ...
+private:
+    ...
+    SnapshotMeta _meta;
+};
+```
+
+将元数据写入 `__raft_snapshot_meta` 文件：
+```cpp
+int LocalSnapshotWriter::sync() {
+    const int rc = _meta_table.save_to_file(_fs, _path + "/" BRAFT_SNAPSHOT_META_FILE);
+    ...
+    return rc;
+}
+```
+
+```cpp
+int LocalSnapshotMetaTable::save_to_file(FileSystemAdaptor* fs, const std::string& path) const {
+    LocalSnapshotPbMeta pb_meta;
+    if (_meta.IsInitialized()) {
+        *pb_meta.mutable_meta() = _meta;
+    }
+    for (Map::const_iterator
+            iter = _file_map.begin(); iter != _file_map.end(); ++iter) {
+        LocalSnapshotPbMeta::File *f = pb_meta.add_files();
+        f->set_name(iter->first);
+        *f->mutable_meta() = iter->second;
+    }
+    ProtoBufFile pb_file(path, fs);
+    int ret = pb_file.save(&pb_meta, raft_sync_meta());
+    PLOG_IF(ERROR, ret != 0) << "Fail to save meta to " << path;
+    return ret;
+}
+```
+
+
 删除上一个快照
 ---
 
