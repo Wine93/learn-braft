@@ -673,7 +673,7 @@ int LocalSnapshotStorage::destroy_snapshot(const std::string& path) {
 删除上一个快照对应日志
 ---
 
-调用 `set_snapshot` 删除上一个快照的日志，之所以只删除上一个快照的日志，而不立即删除当前快照的日志，主要考虑到有些 Follower 还没有同步完日志，如果删除了当前的日志，只能发送快照进行同步，见以下注释：
+调用 `set_snapshot` 删除上一个快照的日志，之所以只删除上一个快照的日志，而不立即删除当前快照的日志，主要考虑到有些 Follower 还没有同步完日志，如果删除了当前的日志，哪怕只差几条日志也只能发送快照进行同步，见以下注释：
 
 ```cpp
 void LogManager::set_snapshot(const SnapshotMeta* meta) {
