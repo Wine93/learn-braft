@@ -14,6 +14,8 @@ Batch 队列
 
 从以上看出，日志的复制、持久化、应用，全链路都是经过 `Batch` 优化的。
 
+[ExecutionQueue]: https://brpc.apache.org/docs/bthread/execution-queue
+
 > **Follower 的 Batch**
 >
 > 以上讨论的是节点作为 Leader 时的 `Batch` 优化，当节点为 Follower 时，其优化也是一样的，因为其用的是相同的代码逻辑，唯一的区别在于：
@@ -28,14 +30,11 @@ Batch 队列
 
 | 作用队列       | 配置项                         | 默认值   | 说明                                                                              |
 |:---------------|:-------------------------------|:---------|:----------------------------------------------------------------------------------|
-| ApplyQueue     | `raft_apply_batch`             | 32       | 该打包大小影响持久化、落盘以及`on_apply`；上限为 512                              |
+| ApplyQueue     | `raft_apply_batch`             | 32       | 该打包大小影响复制、持久化以及`on_apply`；上限为 512                              |
 | DiskQueue      | `raft_max_append_buffer_size`  | `256 KB` | 每次 `Batch Write` 最大的字节数                                                   |
 | ApplyTaskQueue | `raft_fsm_caller_commit_batch` | 512      | 每次 `on_apply` 的最大日志数为 `raft_apply_batch * raft_fsm_caller_commit_batch ` |
 
-
-[ExecutionQueue]: https://brpc.apache.org/docs/bthread/execution-queue
-
-
+> 另外，配置 `raft_max_entries_size` 也会影响每次复制（`AppendEntries` 请求）携带的日志数量，其默认值为 1024
 
 具体实现
 ---
@@ -193,7 +192,7 @@ pipeline
 
 ![图 4.6  串行与 Pipeline](image/4.6.png)
 
-Raft 默认是串行复制日志，显然这样效率是比较低下的。可以采用 `Pipeline` 的复制方式，即 Leader 发送完 `AppendEntries` 请求后不必等待其响应，立马发送一下批日志。当然，这样的实现对于接受端（Follower）来说，可能会带来乱序、空洞等问题，为此，braft 在 Follower 端引入了日志缓存，将不是顺序的日志先缓存起来，待其前面的日志都接受到后再写入该日志，以达到顺序写入磁盘的目的。
+Raft 默认是串行复制日志，需要等待一个 `AppendEntries` 发送成功后再发送下一个，显然这样不是最高效的。可以采用 `Pipeline` 的复制方式，即 Leader 发送完 `AppendEntries` 请求后不必等待其响应，立马发送一下批日志。当然，这样的实现对于接受端（Follower）来说，可能会带来乱序、空洞等问题，为此，braft 在 Follower 端引入了日志缓存，将不是顺序的日志先缓存起来，待其前面的日志都接受到后再写入该日志，以达到日志连续的目的。
 
 特别需要注意的是，`pipeline` 优化默认是关闭的，需要用户通过以下 2 个配置项开启：
 ```cpp
@@ -208,23 +207,90 @@ DEFINE_int32(raft_max_parallel_append_entries_rpc_num, 1,
 具体实现
 ---
 
-Leader 发送 `AppendEntries`：
+Leader 端 `pipeline` 的流程如下：
+* (1) 发送 `AppendEntries` 请求时会判断并行的请求数（`flying`）是否达到并行上限
+    * (1.1) 如果是的话，直接返回；等待收到响应后回调 `_on_rpc_returned` 将 `flying` 计数减一
+    * (1.2) 否则继续发送 `AppendEntries` 请求，并将 `flying` 计数加一
+* (2) 发送完后，继续判断 `flying` 数是否已达限，是的话如同步骤（1.1）
+* (3) 否则，判断是否还有日志可以发送：
+  * (3.1) 有的话，重复步骤（1）
+  * (3.2) 否则注册 `waiter` 等待新日志到来
+
+具体流程见下面代码解析:
 
 ```cpp
 void Replicator::_send_entries() {
+    // (1) 如果已经发送的 AppendEntries 请求数大于等于 `raft_max_parallel_append_entries_rpc_num`，
+    //     则返回等待 `_on_rpc_returned`
+    if (_flying_append_entries_size >= FLAGS_raft_max_entries_size ||
+        _append_entries_in_fly.size() >= (size_t)FLAGS_raft_max_parallel_append_entries_rpc_num ||
+        _st.st == BLOCKING) {
+        ...
+        return;
+    }
     ...
-    // 发送 AppendEntries
+    // (2) 否则发送 AppendEntries 请求
     google::protobuf::Closure* done = brpc::NewCallback(
                 _on_rpc_returned, _id.value, cntl.get(),
                 request.get(), response.get(), butil::monotonic_time_ms());
     RaftService_Stub stub(&_sending_channel);
     stub.append_entries(cntl.release(), request.release(),
                         response.release(), done);
-    // 注册 waiter 等待新日志的到来，如果目前还有日志未发送，会立马唤醒 waiter 继续发送日志
+    // (3) 发送完后调用 `_wait_more_entries`
     _wait_more_entries();
 }
 
-// waiter 被唤醒会调用 _continue_sending 继续发送日志
+// (4) `_wait_more_entries` 首先判断已经并行的 `AppendEntries` 请求数是否已达上限
+//     (4.1) 如果已达上限，则直接返回，等待收到响应后回调 `_on_rpc_returned` 即可
+//     (4.2) 否则调用 LogManager::wait 判断是否还有日志没同步
+//           如果还有日志，则继续发送；否则创建 waiter 在后台等待新日志到来
+void Replicator::_wait_more_entries() {
+    if (_wait_id == 0 && FLAGS_raft_max_entries_size > _flying_append_entries_size &&
+        (size_t)FLAGS_raft_max_parallel_append_entries_rpc_num > _append_entries_in_fly.size()) {
+        _wait_id = _options.log_manager->wait(
+                _next_index - 1, _continue_sending, (void*)_id.value);
+        ...
+    }
+    ...
+}
+
+// (5) LogManager::wait 会调用 LogManager::notify_on_new_log
+LogManager::WaitId LogManager::wait(
+        int64_t expected_last_log_index,
+        int (*on_new_log)(void *arg, int error_code), void *arg) {
+    ...
+    return notify_on_new_log(expected_last_log_index, wm);
+}
+
+// (6) 判断是否还有日志没同步：
+LogManager::WaitId LogManager::notify_on_new_log(
+        int64_t expected_last_log_index, WaitMeta* wm) {
+    // (6.1) 如果有的话，调用 run_on_new_log 继续发送
+    if (expected_last_log_index != _last_log_index || _stopped) {
+        ...
+        if (bthread_start_urgent(&tid, NULL, run_on_new_log, wm) != 0) {
+            ...
+        }
+        return 0;  // Not pushed into _wait_map
+    }
+    // (6.2) 没有可发送的日志，创建 waiter 在后台等待新日志
+    if (_next_wait_id == 0) {  // skip 0
+        ++_next_wait_id;
+    }
+    const int wait_id = _next_wait_id++;
+    _wait_map[wait_id] = wm;
+    return wait_id;
+}
+
+// (7) run_on_new_log 会调用 `_continue_sending`
+void* LogManager::run_on_new_log(void *arg) {
+    WaitMeta* wm = (WaitMeta*)arg;
+    wm->on_new_log(wm->arg, wm->error_code);  // on_new_log: _continue_sending
+    ...
+    return NULL;
+}
+
+// (8) 而 _continue_sending 则调用 `_send_entries` 继续发送日志
 int Replicator::_continue_sending(void* arg, int error_code) {
     ...
     r->_send_entries();
@@ -232,10 +298,10 @@ int Replicator::_continue_sending(void* arg, int error_code) {
 }
 ```
 
-Follower 处理 `AppendEntries` 请求：
+Follower 接收到 `AppendEntries` 请求后，其处理逻辑如下：
 
-* 对于到来的日志，如果其前面的日志没有接受到，先将其缓存起来，并要求客户端重发前面的日志
-* 待前面的日志都达到后，再将缓存中在其之后的日志写入磁盘
+* 对于到来的日志，如果其前面的日志没有接受到，先将其缓存起来，并要求 Leader 重发前面的日志
+* 待前面的日志都达到后，再将缓存中在其之后的顺序的日志一起写入磁盘
 
 ```cpp
 void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
@@ -243,12 +309,13 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                                              AppendEntriesResponse* response,
                                              google::protobuf::Closure* done,
                                              bool from_append_entries_cache) {
-    // 当到来的日志的前面的日志没有接受到时，将其缓存起来
+    // (1) 当到来的日志的前面的日志没有接受到时，先将其缓存起来
     if (local_prev_log_term != prev_log_term) {
         int64_t last_index = _log_manager->last_log_index();
         int64_t saved_term = request->term();
         int     saved_entries_size = request->entries_size();
         std::string rpc_server_id = request->server_id();
+        // (1.1) 调用 handle_out_of_order_append_entries 将日志缓存起来
         if (!from_append_entries_cache &&
             handle_out_of_order_append_entries(
                     cntl, request, response, done, last_index)) {
@@ -258,18 +325,22 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
             return;
         }
 
-        // 设为 false, 要求 Leader 重发前面的日志
+        // (1.2) 并将响应设为 False, 要求 Leader 重发前面的日志
         response->set_success(false);
         response->set_term(_current_term);
-        response->set_last_log_index(last_index);  // 响应当前 follower 的最后一条日志的 index
+        response->set_last_log_index(last_index);  // follower 的 lastLogIndex
         ...
         return;
     }
 
-    // (2) 当前的日志前面的日志都已达到，可以追加，这时候查看缓存中是否还有之后的日志，如果是顺序的，将以缓存的内容调用 handle_append_entries_request，将这些日志一并写入磁盘
+    // (2) 当前的日志前面的日志都已达到（即日志是顺序的）
+    //     这时候查看缓存中是否还有连续的日志，如果有的话，
+    //     将以缓存的日志调用再次调用 handle_append_entries_request，
+    //     并将这些日志一并写入磁盘
     // check out-of-order cache
     check_append_entries_cache(index);
 
+    // (3) 将日志持久化
     FollowerStableClosure* c = new FollowerStableClosure(
             cntl, request, response, done_guard.release(),
             this, _current_term);

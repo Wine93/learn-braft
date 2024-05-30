@@ -336,7 +336,7 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
 等待新日志
 ---
 
-确定 `nextIndex` 后，`Replicator` 就会调用 `_send_entries` 向 Follower 同步日志，直至 Follower 成功复制了 Leader 的所有日志后，将会注册一个 `waiter`，在后台等待新日志的到来，其整体流水线如下：
+确定 `nextIndex` 后，`Replicator` 就会调用 `_send_entries` 向 Follower 同步日志，直至 Follower 成功复制了 Leader 的所有日志后，将会注册一个 `waiter`，在后台等待新日志的到来，其整体流程如下：
 
 ```cpp
 void Replicator::_send_entries() {
