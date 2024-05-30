@@ -17,20 +17,8 @@
     * [5.1 创建快照](ch05/5.1/save.md)
     * [5.2 安装快照](ch05/5.2/install.md)
     * [5.3 加载快照](ch05/5.3/load.md)
-<!--
-TODO(Wine93, P1):
-    * [5.4 快照优化](ch05/5.4/optimization.md)
--->
 * [6. 控制节点](ch06/README.md)
     * [6.1 节点配置变更](ch06/6.1/configuration_change.md)
     * [6.2 重置节点列表](ch06/6.2/reset_peer.md)
     * [6.3 转移 Leader](ch06/6.3/change_leader.md)
-<!--
-TODO(Wine93, P1):
-* [7. 其他](ch07/README.md)
-    * [7.1 使用指南](ch07/use.md)
-    * [7.2 性能分析](ch07/perf.md)
-    * [7.3 可观测性](ch07/trace.md)
-    * [7.4 超时时间](ch07/timeout.md)
--->
 * [附录](appendix.md)

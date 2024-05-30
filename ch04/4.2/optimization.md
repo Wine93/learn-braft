@@ -335,7 +335,7 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
 
     // (2) 当前的日志前面的日志都已达到（即日志是顺序的）
     //     这时候查看缓存中是否还有连续的日志，如果有的话，
-    //     将以缓存的日志调用再次调用 handle_append_entries_request，
+    //     将以缓存的日志再次调用 handle_append_entries_request，
     //     并将这些日志一并写入磁盘
     // check out-of-order cache
     check_append_entries_cache(index);
