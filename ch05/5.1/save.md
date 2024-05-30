@@ -465,17 +465,16 @@ int LocalSnapshotMetaTable::add_file(const std::string& filename,
 阶段三：转为正式快照
 ===
 
+调用 `Closure`
+---
+
 用户完成快照的创建后，会调用 `Closure` 即 `SaveSnapshotDone::Run()`，而该函数会将临时快照 `rename` 成正式快照，并删除上一个快照，以及删除上一个快照对应的日志。
 
 用户调用 `SaveSnapshotDone::Run`，该函数主要执行以下 2 件事：
 
 ```cpp
 void SaveSnapshotDone::Run() {
-    // Avoid blocking FSMCaller
-    // This continuation of snapshot saving is likely running inplace where the
-    // on_snapshot_save is called (in the FSMCaller thread) and blocks all the
-    // following on_apply. As blocking is not necessary and the continuation is
-    // not important, so we start a bthread to do this.
+    ...
     bthread_t tid;
     if (bthread_start_urgent(&tid, NULL, continue_run, this) != 0) {
         ...
@@ -499,62 +498,37 @@ void* SaveSnapshotDone::continue_run(void* arg) {
 }
 ```
 
-`on_snapshot_save_done` 会
+`on_snapshot_save_done` 会完成以下几项工作：
 
 ```cpp
 int SnapshotExecutor::on_snapshot_save_done(
     const butil::Status& st, const SnapshotMeta& meta, SnapshotWriter* writer) {
-    std::unique_lock<raft_mutex_t> lck(_mutex);
-    int ret = st.error_code();
-    // InstallSnapshot can break SaveSnapshot, check InstallSnapshot when SaveSnapshot
-    // because upstream Snapshot maybe newer than local Snapshot.
-    if (st.ok()) {
-        if (meta.last_included_index() <= _last_snapshot_index) {
-            ret = ESTALE;
-            LOG_IF(WARNING, _node != NULL) << "node " << _node->node_id()
-                << " discards an stale snapshot "
-                << " last_included_index " << meta.last_included_index()
-                << " last_snapshot_index " << _last_snapshot_index;
-            writer->set_error(ESTALE, "Installing snapshot is older than local snapshot");
-        }
-    }
-    lck.unlock();
-
-    if (ret == 0) {
-        if (writer->save_meta(meta)) {
-            LOG(WARNING) << "node " << _node->node_id() << " fail to save snapshot";
-            ret = EIO;
-        }
-    } else {
-        if (writer->ok()) {
-            writer->set_error(ret, "Fail to do snapshot");
-        }
-    }
-
-    if (_snapshot_storage->close(writer) != 0) {
+    ...
+    // (1) 将快照元数据保存到 `LocalSnapshotMetaTable`，等待持久化
+    if (writer->save_meta(meta)) {
+        LOG(WARNING) << "node " << _node->node_id() << " fail to save snapshot";
         ret = EIO;
-        LOG(WARNING) << "node " << _node->node_id() << " fail to close writer";
     }
 
+    // (2) 调用 LocalSnapshotStorage::close 写入元数据和将快照转换成正式快照等工作
+    if (_snapshot_storage->close(writer) != 0) {
+        ...
+    }
 
+    // (3) 调用 LogManager::set_snapshot 删除上一个快照对应的日志
     if (ret == 0) {
         _last_snapshot_index = meta.last_included_index();
         _last_snapshot_term = meta.last_included_term();
-        lck.unlock();
-        ss << "snapshot_save_done, last_included_index=" << meta.last_included_index()
-           << " last_included_term=" << meta.last_included_term();
-        LOG(INFO) << ss.str();
+        ...
         _log_manager->set_snapshot(&meta);
-        lck.lock();
     }
-
+    ...
     _saving_snapshot = false;
     return ret;
 }
 ```
 
-写入元数据
----
+`save_meta` 将元数据保存到 `LocalSnapshotMetaTable` 中：
 
 ```cpp
 int LocalSnapshotWriter::save_meta(const SnapshotMeta& meta) {
@@ -573,42 +547,13 @@ private:
 };
 ```
 
-将元数据写入 `__raft_snapshot_meta` 文件：
-```cpp
-int LocalSnapshotWriter::sync() {
-    const int rc = _meta_table.save_to_file(_fs, _path + "/" BRAFT_SNAPSHOT_META_FILE);
-    ...
-    return rc;
-}
-```
-
-```cpp
-int LocalSnapshotMetaTable::save_to_file(FileSystemAdaptor* fs, const std::string& path) const {
-    LocalSnapshotPbMeta pb_meta;
-    if (_meta.IsInitialized()) {
-        *pb_meta.mutable_meta() = _meta;
-    }
-    for (Map::const_iterator
-            iter = _file_map.begin(); iter != _file_map.end(); ++iter) {
-        LocalSnapshotPbMeta::File *f = pb_meta.add_files();
-        f->set_name(iter->first);
-        *f->mutable_meta() = iter->second;
-    }
-    ProtoBufFile pb_file(path, fs);
-    int ret = pb_file.save(&pb_meta, raft_sync_meta());
-    PLOG_IF(ERROR, ret != 0) << "Fail to save meta to " << path;
-    return ret;
-}
-```
-
-
-删除上一个快照
+写入元数据
 ---
 
 在 `close` 函数中主要以下做三件事：
-* (1) 将元数据写入到文件
+* (1) 将元数据持久化到文件
 * (2) 删除上一个快照
-* (2) 调用 `LogManager::set_snapshot` 删除上一个快照对应的日志
+* (3) 调用 `LogManager::set_snapshot` 删除上一个快照对应的日志
 
 ```cpp
 int LocalSnapshotStorage::close(SnapshotWriter* writer_base,
@@ -623,7 +568,7 @@ int LocalSnapshotStorage::close(SnapshotWriter* writer_base,
         int old_index = _last_snapshot_index;
         int64_t new_index = writer->snapshot_index();
 
-
+        // (2) 将临时快照 rename 成正式快照
         // rename temp to new
         std::string temp_path(_path);
         temp_path.append("/");
@@ -648,99 +593,109 @@ int LocalSnapshotStorage::close(SnapshotWriter* writer_base,
         }
         // unref old_index, ref new_index
 
-        // (2) 删除上一个快照。特别需要注意的时，这里有一个引用
-        //     特别需要注意的时，当前节点可能是 Leader，而该快照可能正用于同步给其他 Follower
+        // (3) 删除上一个快照。特别需要注意的时，这里有一个引用
+        //     需要注意的是，当前节点可能是 Leader，而该快照可能正用于下载给 Follower
         unref(old_index);
     } while (0);
     ...
 }
 ```
 
-将元数据写入 `__raft_snapshot_meta` 文件：
+`sync` 会调用 `save_to_file` 将元数据填充到 `proto`（`LocalSnapshotPbMeta`）中，并将其序列化，最终持久化到文件：
+
 ```cpp
 int LocalSnapshotWriter::sync() {
+    // BRAFT_SNAPSHOT_META_FILE: __raft_snapshot_meta
     const int rc = _meta_table.save_to_file(_fs, _path + "/" BRAFT_SNAPSHOT_META_FILE);
     ...
     return rc;
+}
+
+int LocalSnapshotMetaTable::save_to_file(FileSystemAdaptor* fs, const std::string& path) const {
+    // (1) _meta 中保存的是 lastIncludeIndex，lastIncludedTerm 以及集群配置
+    LocalSnapshotPbMeta pb_meta;
+    if (_meta.IsInitialized()) {
+        *pb_meta.mutable_meta() = _meta;
+    }
+
+    // (2) 将所有文件列表加入到 proto
+    for (Map::const_iterator
+            iter = _file_map.begin(); iter != _file_map.end(); ++iter) {
+        LocalSnapshotPbMeta::File *f = pb_meta.add_files();
+        f->set_name(iter->first);
+        *f->mutable_meta() = iter->second;
+    }
+
+    // (3) 序列化并持久化到文件
+    ProtoBufFile pb_file(path, fs);
+    int ret = pb_file.save(&pb_meta, raft_sync_meta());
+    ...
+    return ret;
+}
+```
+
+删除上一个快照
+---
+
+调用 `unref` 删除上一个快照。需要注意的是，当前节点可能是 Leader，而该快照可能正用于下载给其他 Follower，所以需要判断其引用计数，若引用计数为 0，则删除其目录：
+
+```cpp
+// (1) index 为上一个快照的 lastIncludeIndex
+void LocalSnapshotStorage::unref(const int64_t index) {
+    std::unique_lock<raft_mutex_t> lck(_mutex);
+    std::map<int64_t, int>::iterator it = _ref_map.find(index);
+    // (2) 找到上一个快照
+    if (it != _ref_map.end()) {
+        // (3) 将其引用计数减一
+        it->second--;
+        // (4) 如果减到 0，则将其删除
+        if (it->second == 0) {
+            _ref_map.erase(it);
+            std::string old_path(_path);
+            butil::string_appendf(&old_path, "/" BRAFT_SNAPSHOT_PATTERN, index);
+            destroy_snapshot(old_path);
+        }
+    }
+}
+
+// (5) 删除上一个快照的目录
+int LocalSnapshotStorage::destroy_snapshot(const std::string& path) {
+    if (!_fs->delete_file(path, true)) {
+        ...
+        return -1;
+    }
+    return 0;
 }
 ```
 
 删除上一个快照对应日志
 ---
 
-为了避免有些 Follower
-
-考虑到仍有 Follower 可能需要
-
-* 删除倒数第二个快照（即当前快照的前一个快照）对应的日志。考虑到仍有 *Follower* 可能仍需要，避免为了几条日志而发送快照，*braft* 并不会立即删除当前快照对应的日志，而是等到下一次快照生成时，再删除本次快照对应的日志：
+调用 `set_snapshot` 删除上一个快照的日志，之所以只删除上一个快照的日志，而不立马删除快照的日志，主要考虑到有些 Follower 还没有同步完日志，如果删除了当前的日志，只能发送快照进行同步，见以下注释：
 
 ```cpp
 void LogManager::set_snapshot(const SnapshotMeta* meta) {
-    BRAFT_VLOG << "Set snapshot last_included_index="
-              << meta->last_included_index()
-              << " last_included_term=" <<  meta->last_included_term();
-    std::unique_lock<raft_mutex_t> lck(_mutex);
-    if (meta->last_included_index() <= _last_snapshot_id.index) {
-        return;
-    }
-    Configuration conf;
-    for (int i = 0; i < meta->peers_size(); ++i) {
-        conf.add_peer(meta->peers(i));
-    }
-    Configuration old_conf;
-    for (int i = 0; i < meta->old_peers_size(); ++i) {
-        old_conf.add_peer(meta->old_peers(i));
-    }
-    ConfigurationEntry entry;
-    entry.id = LogId(meta->last_included_index(), meta->last_included_term());
-    entry.conf = conf;
-    entry.old_conf = old_conf;
-    _config_manager->set_snapshot(entry);
-    int64_t term = unsafe_get_term(meta->last_included_index());
-
+    ...
+    // (1) last_but_one_snapshot_id 是上一个快照的 Id
     const LogId last_but_one_snapshot_id = _last_snapshot_id;
-    _last_snapshot_id.index = meta->last_included_index();
-    _last_snapshot_id.term = meta->last_included_term();
-    if (_last_snapshot_id > _applied_id) {  // 从 leader 下载 snapshot 可能会出现
-        _applied_id = _last_snapshot_id;
-    }
-    // NOTICE: not to update disk_id here as we are not sure if this node really
-    // has these logs on disk storage. Just leave disk_id as it was, which can keep
-    // these logs in memory all the time until they are flushed to disk. By this
-    // way we can avoid some corner cases which failed to get logs.
 
-    // last_included_index > last_index
-    // 快照包含的日志长度比当前节点日志长度大，这种情况只可能发生在从 leader 下载过来的 snapshot
-    if (term == 0) {
-        // last_included_index is larger than last_index
-        // FIXME: what if last_included_index is less than first_index?
-        _virtual_first_log_id = _last_snapshot_id;
-        truncate_prefix(meta->last_included_index() + 1, lck);
-        return;
-    } else if (term == meta->last_included_term()) {  // last_index >= last_included_index
-        // Truncating log to the index of the last snapshot.
-        // We don't truncate log before the latest snapshot immediately since
-        // some log around last_snapshot_index is probably needed by some
-        // followers
-        if (last_but_one_snapshot_id.index > 0) {
-            // We have last snapshot index
-            _virtual_first_log_id = last_but_one_snapshot_id;
-            truncate_prefix(last_but_one_snapshot_id.index + 1, lck);
-        }
-        return;
-    } else {
-        // TODO: check the result of reset.
-        _virtual_first_log_id = _last_snapshot_id;
-        reset(meta->last_included_index() + 1, lck);
-        return;
+    // Truncating log to the index of the last snapshot.
+    // We don't truncate log before the latest snapshot immediately since
+    // some log around last_snapshot_index is probably needed by some
+    // followers
+    if (last_but_one_snapshot_id.index > 0) {
+        // We have last snapshot index
+        _virtual_first_log_id = last_but_one_snapshot_id;
+        // (2) 删除上一个快照对应的日志
+        truncate_prefix(last_but_one_snapshot_id.index + 1, lck);
     }
-    CHECK(false) << "Cannot reach here";
+    return;
+    ...
 }
-
 ```
 
-
+<!--
 其他：创建快照失败
 ===
-
 用户可以在 `on_snapshot_save` 中返回失败
+-->
