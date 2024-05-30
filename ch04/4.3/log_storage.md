@@ -244,7 +244,7 @@ int Segment::_get_meta(int64_t index, LogMeta* meta) const {
 
 当 `LogManager` 需要读取日志时，会优先从内存中读取，如果内存中不存在，则调用 `SegmentLogStorage::get_entry` 从磁盘读取日志。特别地，当节点重启回放日志时，需要从磁盘读取日志。
 
-`get_entry` 会先根据日志的 `index` 找到对应的 `Segment`，在调用 `Segment::get` 读取对应的日志：
+`get_entry` 会先根据日志的 `index` 找到对应的 `Segment`，再调用 `Segment::get` 读取对应的日志：
 
 ```cpp
 LogEntry* SegmentLogStorage::get_entry(const int64_t index) {
