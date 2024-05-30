@@ -8,10 +8,10 @@
 
 1. 当快照定时器超时或用户手动调用接口，会触发节点执行创建快照的任务
 2. 节点会将任务放进 [ApplyTaskQueue][ApplyTaskQueue]，等待其被执行
-3. 当任务被执行时，会创建一个 `temp` 目录来保存临时快照，并返回一个 `SnapshotWriter`
-4. 以 `SnapshotWriter` 和 `Closure` 做为参数回调用户状态机的 `on_snapshot_save`
+3. 当任务被执行时，会创建一个 `temp` 目录用来保存临时快照，并返回一个 `SnapshotWriter`
+4. 以 `SnapshotWriter` 和 `Closure` 做为参数调用用户状态机的 `on_snapshot_save`
 5. 用户需通过 `SnapshotWriter` 将状态数据写入到临时快照中
-    * 5.1 调用 `SnapshotWriter::get_path` 获得快照目录路径，并将快照文件写入该目录
+    * 5.1 调用 `SnapshotWriter::get_path` 获得快照目录绝对路径，并将快照文件写入该目录
     * 5.2 调用 `SnapshotWriter::add_file` 将快照文件相对路径添加至快照元数据中
 6. 待数据写入完成，用户需回调 `Closure` 将其转换为正式快照：
     * 6.1 将快照元数据持久化到文件
@@ -25,12 +25,6 @@
 [ApplyTaskQueue]: /ch02/2.1/init.md#applytaskqueue
 
 ![图 5.1  创建快照整体流程](image/5.1.png)
-
-流程注解
----
-
-* 1：Leader 和 Follower 各自执行快照任务
-* 5.2 正式的快照目录名以当时创建快照时的 `ApplyIndex` 命名，例如 `snapshot_00000000000000001000`
 
 <!--
 异步快照
@@ -386,7 +380,7 @@ void FSMCaller::do_snapshot_save(SaveSnapshotClosure* done) {
 }
 ```
 
-阶段二：`on_snapshot_save`
+阶段二：用户写入数据
 ===
 
 用户需要实现状态机的 `on_snapshot_save` 函数，在该函数中用户需要做以下 3 件事：
