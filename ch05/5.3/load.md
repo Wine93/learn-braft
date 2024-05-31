@@ -8,10 +8,12 @@
 1. 节点会将加载快照任务放进 [ApplyTaskQueue][ApplyTaskQueue]，等待其被执行
 2. 当任务被执行时，会打开本地快照目录，返回 `SnapshotReader`
 3. 将 `SnapshotReader` 作为参数调用用户状态机的 `on_snapshot_load`
-4. 节点等待快照加载完成（同步操作）
+4. 等待快照加载完成
+   * 4.1
+   * 4.2
 5. 根据快照元数据中的节点配置，调用用户状态机的 `on_configuration_committed`
 6. 更新 `applyIndex` 为快照元数据中的 `lastIncludedIndex`
-7. 若快照元数据中有集群配置，将则其设置为当前集群配置？若？
+7. 将快照元数据中的节点配置设为当前节点配置
 
 [ApplyTaskQueue]: /ch02/2.1/init.md#applytaskqueue
 
@@ -127,7 +129,7 @@ int SnapshotExecutor::init(const SnapshotExecutorOptions& options) {
 
 **场景 2：安装快照**
 
-当节点下载完 Leader 的快照时，会调用 `load_downloading_snapshot` 加载快照：
+当节点下载完 Leader 的快照时，会调用 `load_downloading_snapshot` 加载快照。关于安装快照触发的加载快照，我们已在[<5.2 安装快照>](/ch05/5.2/install.md) 中详细介绍。
 
 ```cpp
 void SnapshotExecutor::load_downloading_snapshot(DownloadingSnapshot* ds,
@@ -141,7 +143,7 @@ void SnapshotExecutor::load_downloading_snapshot(DownloadingSnapshot* ds,
     // (2) 生成快照加载完毕后的回调函数
     InstallSnapshotDone* install_snapshot_done =
             new InstallSnapshotDone(this, reader);
-    // (6) 调用 `FSMCaller::on_snapshot_load` 加载快照
+    // (3) 调用 `FSMCaller::on_snapshot_load` 加载快照
     int ret = _fsm_caller->on_snapshot_load(install_snapshot_done);
     ...
 }
@@ -254,17 +256,103 @@ public:
 get_path
 ---
 
+用户需要调用 `get_path` 接口获取快照目录的绝对路径，所有快照的文件集都位于该目录下：
+
+```cpp
+class SnapshotReader : public Snapshot {
+public:
+    ...
+};
+
+class Snapshot : public butil::Status {
+public:
+    virtual std::string get_path() = 0;
+};
+```
+
+```cpp
+class LocalSnapshotReader: public SnapshotReader {
+friend class LocalSnapshotStorage;
+public:
+    ...
+    // Get the path of the Snapshot
+    virtual std::string get_path() { return _path; }
+```
+
 load_meta
 ---
 
+用户可调用 `load_meta` 函数获取快照的元数据：
+
+```cpp
+class SnapshotReader : public Snapshot {
+public:
+    // Load meta from
+    virtual int load_meta(SnapshotMeta* meta) = 0;
+};
+```
+
+该函数会将已经加载过保存在内存中的快照元数据返回给用户：
+
+```cpp
+int LocalSnapshotReader::load_meta(SnapshotMeta* meta) {
+    if (!_meta_table.has_meta()) {
+        return -1;
+    }
+    *meta = _meta_table.meta();
+    return 0;
+}
+```
+
 list_files
 ---
+
+用户可以调用 `list_files` 接口获取当前快照下的所有文件列表：
+
+```cpp
+class SnapshotReader : public Snapshot {
+public:
+    ...
+};
+
+class Snapshot : public butil::Status {
+public:
+    // List all the existing files in the Snapshot currently
+    virtual void list_files(std::vector<std::string> *files) = 0;
+};
+```
+
+`list_files` 函数会从快照元数据中返回快照中所有文件的相对路径：
+
+```cpp
+void LocalSnapshotReader::list_files(std::vector<std::string> *files) {
+    return _meta_table.list_files(files);
+}
+
+void LocalSnapshotMetaTable::list_files(std::vector<std::string>* files) const {
+    if (!files) {
+        return;
+    }
+    files->clear();
+    files->reserve(_file_map.size());
+    for (Map::const_iterator
+            iter = _file_map.begin(); iter != _file_map.end(); ++iter) {
+        files->push_back(iter->first);
+    }
+}
+```
 
 
 阶段三：完成快照加载
 ===
 
+调用 `Closure`
+---
+
+我们上面提到了，对于节点重启和安装快照这两种不同的加载快照场景，会设置不同的回调函数，但是其最终都会调用 `SnapshotExecutor::on_snapshot_load_done` 来做收尾工作：
+
 ```cpp
+// 场景 1：节点重启时
 class FirstSnapshotLoadDone : public LoadSnapshotClosure {
 public:
     ...
@@ -274,40 +362,37 @@ public:
     ...
 };
 
+// 场景 2：安装快照时
 void InstallSnapshotDone::Run() {
-    _se->on_snapshot_load_done(status());
-    delete this;
+    _se->on_snapshot_load_done(status());  // _se: SnapshotExecutor
+    ...
 }
 ```
 
+`on_snapshot_load_done` 会做以下几件事：
+
 ```cpp
 void SnapshotExecutor::on_snapshot_load_done(const butil::Status& st) {
-    std::unique_lock<raft_mutex_t> lck(_mutex);
-
-    CHECK(_loading_snapshot);
+    ...
     DownloadingSnapshot* m = _downloading_snapshot.load(butil::memory_order_relaxed);
 
+    // (1) 调用 LogManager::set_snapshot 删除快照已经覆盖的日志
     if (st.ok()) {
         _last_snapshot_index = _loading_snapshot_meta.last_included_index();
         _last_snapshot_term = _loading_snapshot_meta.last_included_term();
         _log_manager->set_snapshot(&_loading_snapshot_meta);
     }
-    std::stringstream ss;
-    if (_node) {
-        ss << "node " << _node->node_id() << ' ';
-    }
-    ss << "snapshot_load_done, "
-              << _loading_snapshot_meta.ShortDebugString();
-    LOG(INFO) << ss.str();
-    lck.unlock();
+
+    ...
+    // (2) 调用 NodeImpl::update_configuration_after_installing_snapshot
+    //     将快照元数据中的节点配置设为当前节点配置
     if (_node) {
         // FIXME: race with set_peer, not sure if this is fine
         _node->update_configuration_after_installing_snapshot();
     }
-    lck.lock();
-    _loading_snapshot = false;
-    _downloading_snapshot.store(NULL, butil::memory_order_release);
-    lck.unlock();
+
+    // (3) 如果当前是安装快照下的回调函数，则设置 InstallSnapshotResponse 相应字段
+    //     并发送响应
     if (m) {
         // Respond RPC
         if (!st.ok()) {
@@ -322,5 +407,95 @@ void SnapshotExecutor::on_snapshot_load_done(const butil::Status& st) {
 }
 ```
 
+删除日志
+---
+
+根据
+
+```cpp
+void LogManager::set_snapshot(const SnapshotMeta* meta) {
+    ...
+    // (1) 将快照元数据中的节点配置保存在 `_config_manager` 中，
+    //     为之后应用该配置做准备
+    Configuration conf;
+    for (int i = 0; i < meta->peers_size(); ++i) {
+        conf.add_peer(meta->peers(i));
+    }
+    Configuration old_conf;
+    for (int i = 0; i < meta->old_peers_size(); ++i) {
+        old_conf.add_peer(meta->old_peers(i));
+    }
+    ConfigurationEntry entry;
+    entry.id = LogId(meta->last_included_index(), meta->last_included_term());
+    entry.conf = conf;
+    entry.old_conf = old_conf;
+    _config_manager->set_snapshot(entry);
+
+    // (2) 获取快照 lastIncludedIndex 对应的 term
+    int64_t term = unsafe_get_term(meta->last_included_index());
+
+    // (3) 上一个快照
+    const LogId last_but_one_snapshot_id = _last_snapshot_id;
+
+    // (4) 开始删除日志
+    // (4.1) 快照包含的日志长度比当前节点日志长度大，
+    //       这种情况只可能发生在从 Leader 下载过来的 snapshot
+    //       将当前节点的所有日志都删除掉
+    // last_included_index > last_index
+    if (term == 0) {
+        // last_included_index is larger than last_index
+        // FIXME: what if last_included_index is less than first_index?
+        _virtual_first_log_id = _last_snapshot_id;
+        truncate_prefix(meta->last_included_index() + 1, lck);
+        return;
+    // (4.2) 快照包含的日志长度比当前节点日志长度小
+    //       这种情况发生在节点重启时
+    //       删除上一个快照的日志
+    } else if (term == meta->last_included_term()) {
+        // Truncating log to the index of the last snapshot.
+        // We don't truncate log before the latest snapshot immediately since
+        // some log around last_snapshot_index is probably needed by some
+        // followers
+        if (last_but_one_snapshot_id.index > 0) {
+            // We have last snapshot index
+            _virtual_first_log_id = last_but_one_snapshot_id;
+            truncate_prefix(last_but_one_snapshot_id.index + 1, lck);
+        }
+        return;
+    } else {
+        // TODO: check the result of reset.
+        _virtual_first_log_id = _last_snapshot_id;
+        reset(meta->last_included_index() + 1, lck);
+        return;
+    }
+    CHECK(false) << "Cannot reach here";
+}
+```
+
+设置节点配置
+---
+
+将快照元数据中的节点配置设置为当前节点配置。快照中的节点配置我们已经在 `LogManager::set_snapshot` 将其保存在 `_config_manager` 中了：
+
+```cpp
+void NodeImpl::update_configuration_after_installing_snapshot() {
+    ...
+    // _conf 为当前节点配置
+    _log_manager->check_and_set_configuration(&_conf);
+}
+
+bool LogManager::check_and_set_configuration(ConfigurationEntry* current) {
+    ...
+    const ConfigurationEntry& last_conf = _config_manager->last_configuration();
+    if (current->id != last_conf.id) {
+        *current = last_conf;
+        return true;
+    }
+    return false;
+}
+```
+
+<!---
 其他：加载失败
 ===
+--->
