@@ -630,6 +630,14 @@ void LeaderStableClosure::Run() {
 ```cpp
 void LogManager::wakeup_all_waiter(std::unique_lock<raft_mutex_t>& lck) {
     ...
+    // (1) 清空 `wait_map`
+    for (butil::FlatMap<int64_t, WaitMeta*>::const_iterator
+            iter = _wait_map.begin(); iter != _wait_map.end(); ++iter) {
+        wm[nwm++] = iter->second;
+    }
+    _wait_map.clear();
+    ...
+    // (2) 唤醒所有 `Replicator`
     for (size_t i = 0; i < nwm; ++i) {
         ...
         if (bthread_start_background( &tid, &attr, run_on_new_log, wm[i]) != 0) { ...

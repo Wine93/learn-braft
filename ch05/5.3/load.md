@@ -15,7 +15,6 @@
 6. 更新 `applyIndex` 为快照元数据中的 `lastIncludedIndex`
 7. 将快照元数据中的节点配置设为当前节点配置
 
-[ApplyTaskQueue]: /ch02/2.1/init.md#applytaskqueue
 
 相关接口
 ---
@@ -129,7 +128,7 @@ int SnapshotExecutor::init(const SnapshotExecutorOptions& options) {
 
 **场景 2：安装快照**
 
-当节点下载完 Leader 的快照时，会调用 `load_downloading_snapshot` 加载快照。关于安装快照触发的加载快照，我们已在[<5.2 安装快照>](/ch05/5.2/install.md) 中详细介绍。
+当节点下载完 Leader 的快照时，会调用 `load_downloading_snapshot` 加载快照。关于安装快照相关流程，可以参考[<5.2 安装快照>](/ch05/5.2/install.md)。
 
 ```cpp
 void SnapshotExecutor::load_downloading_snapshot(DownloadingSnapshot* ds,
@@ -494,6 +493,8 @@ bool LogManager::check_and_set_configuration(ConfigurationEntry* current) {
     return false;
 }
 ```
+
+[ApplyTaskQueue]: /ch02/2.1/init.md#applytaskqueue
 
 <!---
 其他：加载失败

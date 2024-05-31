@@ -303,6 +303,7 @@ int LocalSnapshotWriter::init() {
         return EIO;
     }
     ...
+    return 0;
 }
 ```
 
@@ -554,10 +555,13 @@ private:
 写入元数据
 ---
 
-在 `close` 函数中主要以下做三件事：
+rename 成正式快照
+---
+
+在 `close` 函数中主要以下做四件事：
 * (1) 将元数据持久化到文件
-* (2) 删除上一个快照
-* (3) 调用 `LogManager::set_snapshot` 删除上一个快照对应的日志
+* (2) 通过 `rename()` 将临时快照变为正式快照
+* (3) 删除上一个快照
 
 ```cpp
 int LocalSnapshotStorage::close(SnapshotWriter* writer_base,
@@ -581,12 +585,10 @@ int LocalSnapshotStorage::close(SnapshotWriter* writer_base,
         butil::string_appendf(&new_path, "/" BRAFT_SNAPSHOT_PATTERN, new_index);
         if (!_fs->delete_file(new_path, true)) {
             ...
-            break;
         }
         ...
         if (!_fs->rename(temp_path, new_path)) {
             ...
-            break;
         }
 
         ref(new_index);
@@ -676,7 +678,7 @@ int LocalSnapshotStorage::destroy_snapshot(const std::string& path) {
 删除上一个快照对应日志
 ---
 
-调用 `set_snapshot` 删除上一个快照的日志，之所以只删除上一个快照的日志，而不立即删除当前快照的日志，主要考虑到有些 Follower 还没有同步完日志，如果删除了当前的日志，哪怕只差几条日志也只能发送快照进行同步，见以下注释：
+在 `Closure` 中最后会调用 `set_snapshot` 删除上一个快照的日志，之所以只删除上一个快照的日志，而不立即删除当前快照的日志，主要考虑到有些 Follower 还没有同步完日志，如果删除了当前的日志，哪怕只差几条日志也只能发送快照进行同步，见以下注释：
 
 ```cpp
 void LogManager::set_snapshot(const SnapshotMeta* meta) {

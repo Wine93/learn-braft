@@ -4,57 +4,65 @@
 流程概览
 ---
 
-// Follower 落后太多，新节点加入
-1. 当 Leader 已经压缩了 Follower 需要复制的日志，Leader 就需要将快照发送给 Follower
-2. Leader 向 Follower 发送 `InstallSnapshot` 请求
-3. Follower 根据请求中的 `URI` 分批次向 Leader 下载快照对应的文件集：
-   * 3.1 创建连接 Leader 的客户端
-   * 3.2 发送 `GetFileRequest` 请求获取 Leader 快照的元数据
-   * 3.3 创建 `temp` 目录保存用于保存下载的临时快照
-   * 3.3 根据元数据中的文件列表对比本地快照与远程快照的差异，获得下载文件列表
-   * 3.4 根据文件列表，逐一发送 `GetFileRequest` 请求获得文件保存至临时快照中
-   * 3.5 待快照下载完成后，删除本地快照，并将临时快照 `rename()` 成正式快照
-4. Follower 回调用户状态机的 `on_snapshot_load` 加载快照
-5. 等待快照加载完毕后：
-    * 5.1 更新 ApplyIndex 为快照的 `lastIncludedIndex`
-    * 5.2 删除 `Index` 小于 `lastIncludedIndex` 的日志
-6. Follower 向 Leader 发送成功的 `InstallSnapshot` 响应
-7. Leader 收到成功响应后更新 Follower 的 `nextIndex` 为快照的 `lastIncludedIndex` + 1
-8. Leader 从 `nextIndex` 开始继续向 Follower 发送日志
+当 Follower 落后太多或新节点加入集群时，就会触发安装快照，其流程如下：
+1. Leader 向 Follower 发送 `InstallSnapshot` 请求，并停止向 Follower 同步日志
+2. Follower 根据请求中的 `URI` 分批次向 Leader 下载快照对应的文件集：
+   * 2.1 创建连接 Leader 的客户端
+   * 2.2 发送 `GetFileRequest` 请求获取 Leader 快照的元数据
+   * 2.3 创建 `temp` 目录保存用于保存下载的临时快照
+   * 2.3 根据元数据中的文件列表对比本地快照与远程快照的差异，获得下载文件列表
+   * 2.4 根据文件列表，逐一发送 `GetFileRequest` 请求获得文件保存至临时快照中
+   * 2.5 待快照下载完成后，删除本地快照，并将临时快照 `rename()` 成正式快照
+3. Follower 回调用户状态机的 `on_snapshot_load` 加载快照
+4. 等待快照加载完毕后：
+    * 4.1 更新 `applyIndex` 为快照的 `lastIncludedIndex`
+    * 4.2 删除 `index` 小于 `lastIncludedIndex` 的日志（即全部日志）
+5. Follower 向 Leader 发送成功的 `InstallSnapshot` 响应
+6. Leader 收到成功响应后更新 Follower 的 `nextIndex` 为快照的 `lastIncludedIndex` + 1
+7. Leader 从 `nextIndex` 开始继续向 Follower 发送日志
 
-![图 5.2  安装快照 RPC 交互](image/install_snapshot.png)
-
-流程注解
----
-
-1. 正常情况下不会触发快照，例如节点故障下线后重启
-
-快照互斥
----
-
-* 各自打快照
+![图 5.3  安装快照 RPC 交互](image/5.3.png)
 
 快照属性
 ---
 
-* 各自打快照
-* 各自互斥
-
 大文件下载
 ---
+
+```proto
+message GetFileRequest {
+    required int64 reader_id = 1;
+    required string filename = 2;
+    required int64 count = 3;   // 分片下载 length
+    required int64 offset = 4;  // 分片下载 offset
+    optional bool read_partly = 5;
+}
+```
+
+Follower 通过发送 `GetFileRequest` 从 Leader 下载文件，而有时间快照的文件较大，这时候就会开启分片下载。每次通过设置 `GetFileRequest` 中的 `count` 和 `offset` 来实现分片下载，默认每个分片为 `128KB`，其受配置项 `raft_max_byte_count_per_rpc` 控制：
+
+```cpp
+DEFINE_int32(raft_max_byte_count_per_rpc, 1024 * 128 /*128K*/,
+             "Maximum of block size per RPC");
+BRPC_VALIDATE_GFLAG(raft_max_byte_count_per_rpc, brpc::PositiveInteger);
+```
+
 
 断点续传
 ---
 
 Follwer 从 Leader 下载的快照文件会保存在临时快照 `temp` 目录中，如果 Follower 下载了一部分后挂掉，在其重启后重新接收 `InstallSnapshot` 开始下载快照时，其不会删除 `temp` 目录，而是对比本地和远程的快照元数据，对于那些本地已经存在且 CRC 一样的文件，则无需重复下载:
 
-![图 5.3  断点续传](image/diff_1.png)
+![图 5.3  断点续传](image/5.4.png)
 
 进一步地，对于本地快照已经存在的文件也无需重复下载：
 
-![图 5.4  断点续传](image/diff_2.png)
+![图 5.4  断点续传](image/5.5.png)
 
-总的来说，为了减少网络的传输，只要本地存在的文件，其文件名和 CRC 和 Leader 的一样就无需重复下载，详见以下[过滤文件列表](#过滤文件列表)。
+总的来说，为了减少网络的传输，只要本地存在的文件，其文件名和 CRC 和 Leader 的一样就无需重复下载，详见以下<过滤下载列表>。
+
+下载限流
+---
 
 相关 RPC
 ---
@@ -158,37 +166,124 @@ public:
 };
 ```
 
-
-
-```cpp
-```
-
-阶段一：Leader 下发命令
+阶段一：Leader 下发指令
 ===
 
-Follower 处理 `InstallSnapshot`
+触发安装快照
 ---
 
+Leader 在给 Follower 同步日志时，发现 Follower 需要的日志已经被压缩掉了，就会调用 `_install_snapshot` 向 Follower 下发安装快照的指令：
+
 ```cpp
-void RaftServiceImpl::install_snapshot(google::protobuf::RpcController* cntl_base,
-                              const InstallSnapshotRequest* request,
-                              InstallSnapshotResponse* response,
-                              google::protobuf::Closure* done) {
+// (1) 正常同步日志会调用 `_send_entries`
+void Replicator::_send_entries() {
+    // (2) 调用  _fill_common_fields 判断 Follower 需要的日志是否还存在
+    //     `_next_index` 为下一条需要同步给 Follower 的日志
+    if (_fill_common_fields(request.get(), _next_index - 1, false) != 0) {
+        ...
+        // (4) 调用 `_install_snapshot` 下发安装快照指令
+        return _install_snapshot();
+    }
     ...
-    node->handle_install_snapshot_request(cntl, request, response, done);
 }
 
+int Replicator::_fill_common_fields(AppendEntriesRequest* request,
+                                    int64_t prev_log_index,
+                                    bool is_heartbeat) {
+    // (3) 获取 index 日志对应的 term
+    const int64_t prev_log_term = _options.log_manager->get_term(prev_log_index);
+    // (4) 如果 term 不存在则代表该日志已经被压缩，返回 -1
+    if (prev_log_term == 0 && prev_log_index != 0) {
+        if (!is_heartbeat) {
+            ...
+            return -1;
+        } else {
+        }
+    }
+    ...
+    return 0;
+}
+```
+
+发送请求
+---
+
+`_install_snapshot` 会向 Follower 发送 `InstallSnapshot` 请求，详见以下注释：
+
+```cpp
+void Replicator::_install_snapshot() {
+    ...
+    // (1) 打开本地最新快照，并获得快照元数据
+    _reader = _options.snapshot_storage->open();
+    ...
+    std::string uri = _reader->generate_uri_for_copy();
+    ...
+    SnapshotMeta meta;
+    // report error on failure
+    if (_reader->load_meta(&meta) != 0) {
+        ...
+    }
+
+    // (2) 设置 `InstallSnapshot` 中的 meta 和 URI 等字段
+    brpc::Controller* cntl = new brpc::Controller;
+    InstallSnapshotRequest* request = new InstallSnapshotRequest();
+    InstallSnapshotResponse* response = new InstallSnapshotResponse();
+    ...
+    request->mutable_meta()->CopyFrom(meta);
+    request->set_uri(uri);
+
+    // (3) 发送 `InstallSnapshot` 请求
+    RaftService_Stub stub(&_sending_channel);
+    stub.install_snapshot(cntl, request, response, done);
+    CHECK_EQ(0, bthread_id_unlock(_id)) << "Fail to unlock " << _id;
+}
+```
+
+`generate_uri_for_copy` 会返回下载的 `URI`，其格式为 `remote://ip:port/reader_id`：
+```cpp
+std::string LocalSnapshotReader::generate_uri_for_copy() {
+    if (_addr == butil::EndPoint()) {
+        LOG(ERROR) << "Address is not specified, path:" << _path;
+        return std::string();
+    }
+    if (_reader_id == 0) {
+        // TODO: handler referenced files
+        scoped_refptr<SnapshotFileReader> reader(
+                new SnapshotFileReader(_fs.get(), _path, _snapshot_throttle.get()));
+        reader->set_meta_table(_meta_table);
+        if (!reader->open()) {
+            ...
+            return std::string();
+        }
+        if (file_service_add(reader.get(), &_reader_id) != 0) {
+            ...
+            return std::string();
+        }
+    }
+    oss << "remote://" << _addr << "/" << _reader_id;
+    return oss.str();
+}
+```
+
+处理请求
+---
+
+Follower 在接收到 `InstallSnapshot` 请求后，会调用 `handle_install_snapshot_request` 处理，而该处理函数最终会调用 `SnapshotExecutor::install_snapshot` 来安装快照：
+
+```cpp
 void NodeImpl::handle_install_snapshot_request(brpc::Controller* cntl,
                                     const InstallSnapshotRequest* request,
                                     InstallSnapshotResponse* response,
                                     google::protobuf::Closure* done) {
     ...
-    clear_append_entries_cache();
-    ...
     return _snapshot_executor->install_snapshot(
             cntl, request, response, done_guard.release());
 }
+```
 
+`install_snapshot` 主要执行以下几件事：
+
+```cpp
 void SnapshotExecutor::install_snapshot(brpc::Controller* cntl,
                                         const InstallSnapshotRequest* request,
                                         InstallSnapshotResponse* response,
@@ -196,11 +291,13 @@ void SnapshotExecutor::install_snapshot(brpc::Controller* cntl,
     ...
     std::unique_ptr<DownloadingSnapshot> ds(new DownloadingSnapshot);
     ...
+    // (1) 调用 register_downloading_snapshot 从 Leader 下载快照
     ret = register_downloading_snapshot(ds.get());
     ...
+    // (2) 等待快照下载完成；下载快照为单独的 bthread
     _cur_copier->join();
-
     ...
+    // (3) 调用 load_downloading_snapshot 加载快照
     return load_downloading_snapshot(ds.release(), meta);
 }
 ```
@@ -208,45 +305,48 @@ void SnapshotExecutor::install_snapshot(brpc::Controller* cntl,
 阶段二：Follower 下载快照
 ===
 
+准备下载快照
+---
 
-创建下载快照的任务：
+`register_downloading_snapshot` 会创建客户端，并启动客户端来下载快照：
+
 ```cpp
 int SnapshotExecutor::register_downloading_snapshot(DownloadingSnapshot* ds) {
     ...
+    // (1) 如果当前正在创建快照，返回 `EBUSY`
     if (_saving_snapshot) {
-        LOG(WARNING) << "Register failed: is saving snapshot.";
+        ...
         ds->cntl->SetFailed(EBUSY, "Is saving snapshot");
         return -1;
     }
-
     ...
-
     DownloadingSnapshot* m = _downloading_snapshot.load(
             butil::memory_order_relaxed);
     if (!m) {
         _downloading_snapshot.store(ds, butil::memory_order_relaxed);
+        // (2) 调用 `LocalSnapshotStorage::start_to_copy_from` 开始下载快照
         // _cur_copier: LocalSnapshotCopier
         _cur_copier = _snapshot_storage->start_to_copy_from(ds->request->uri());
     }
 }
-```
 
-```cpp
 SnapshotCopier* LocalSnapshotStorage::start_to_copy_from(const std::string& uri) {
+    // (3) 调用 LocalSnapshotCopier::init 初始化客户端
     LocalSnapshotCopier* copier = new LocalSnapshotCopier(_copy_file);
     if (copier->init(uri) != 0) {  // copier: LocalSnapshotCopier
     }
-
+    ...
+    // (4) 调用 `LocalSnapshotCopier::start` 启动客户端，开始下载
     copier->start();
     return copier;
 }
 ```
 
-
 初始化客户端
 ---
 
-初始化下载文件的客户端 `RemoteFileCopier`：
+`LocalSnapshotCopier::init` 会初始化一个 RPC Client 用于下载快照：
+
 ```cpp
 int LocalSnapshotCopier::init(const std::string& uri) {
     return _copier.init(uri, _fs, _throttle);  // _copier: RemoteFileCopier
@@ -254,42 +354,37 @@ int LocalSnapshotCopier::init(const std::string& uri) {
 
 int RemoteFileCopier::init(const std::string& uri, FileSystemAdaptor* fs,
         SnapshotThrottle* throttle) {
+    // (1) 根据 InstallSnapshotRequest 中 uri，解析出 Leader 的 RPC 服务地址
     // Parse uri format: remote://ip:port/reader_id
     static const size_t prefix_size = strlen("remote://");
     butil::StringPiece uri_str(uri);
-    if (!uri_str.starts_with("remote://")) {
-        LOG(ERROR) << "Invalid uri=" << uri;
-        return -1;
-    }
-    uri_str.remove_prefix(prefix_size);
-    size_t slash_pos = uri_str.find('/');
+    ... // 这里忽略解析过程
     butil::StringPiece ip_and_port = uri_str.substr(0, slash_pos);
-    uri_str.remove_prefix(slash_pos + 1);
-    if (!butil::StringToInt64(uri_str, &_reader_id)) {
-        LOG(ERROR) << "Invalid reader_id_format=" << uri_str
-                   << " in " << uri;
-        return -1;
-    }
+    ...
+
+    // (2) 根据解析出来的 Leader 的 RPC 服务地址，初始化连接其的 `channel`
+    //     该 channel 用于从 Leader 下载快照文件
     brpc::ChannelOptions channel_opt;
-    channel_opt.connect_timeout_ms = FLAGS_raft_rpc_channel_connect_timeout_ms;
+    ...
     if (_channel.Init(ip_and_port.as_string().c_str(), &channel_opt) != 0) {
-        LOG(ERROR) << "Fail to init Channel to " << ip_and_port;
+        ...
         return -1;
     }
-    _fs = fs;
-    _throttle = throttle;
+    ...
     return 0;
 }
 ```
 
 启动客户端
 ---
+
+`LocalSnapshotCopier::start` 会创建单独的 `bthread` 来运行 `LocalSnapshotCopier::copy`，而该函数就正式开始下载快照：
+
 ```cpp
 void LocalSnapshotCopier::start() {
     if (bthread_start_background(
                 &_tid, NULL, start_copy, this) != 0) {
-        PLOG(ERROR) << "Fail to start bthread";
-        copy();
+        ...
     }
 }
 
@@ -300,227 +395,174 @@ void *LocalSnapshotCopier::start_copy(void* arg) {
 }
 ```
 
-Follower 下载流程
+下载快照流程
 ---
+
+`copy` 函数中描述的是整个下载流程，待全部下载完毕后，会调用 `LocalSnapshotStorage::close` 将临时快照转为正式快照，其中的每一个步骤，我们都将在下面一一介绍：
 
 ```cpp
 void LocalSnapshotCopier::copy() {
+    // (1) 下载步骤
     do {
+        // (1.1) 首先下载快照元数据，保存在 _remote_snapshot
         load_meta_table();
-        if (!ok()) {
-            break;
-        }
+        ...
+        // (1.2) 过滤掉没必要下载的文件
         filter();
-        if (!ok()) {
-            break;
-        }
-        if (!_copy_file) {
-            break;
-        }
+        ...
+        // (1.3) 根据元数据中的文件列表，调用 `copy_file` 逐一下载保存至本地临时快照
         std::vector<std::string> files;
         _remote_snapshot.list_files(&files);
         for (size_t i = 0; i < files.size() && ok(); ++i) {
             copy_file(files[i]);
         }
     } while (0);
-    if (!ok() && _writer && _writer->ok()) {
-        LOG(WARNING) << "Fail to copy, error_code " << error_code()
-                     << " error_msg " << error_cstr()
-                     << " writer path " << _writer->get_path();
-        _writer->set_error(error_code(), error_cstr());
-    }
+    ...
+    // (2) 下载完成后，调用 `LocalSnapshotStorage::close` 将临时快照转为正式快照
+    //     详见以下 <阶段三：转为正式快照>
     if (_writer) {
-        // set_error for copier only when failed to close writer and copier was
-        // ok before this moment
         if (_storage->close(_writer, _filter_before_copy_remote) != 0 && ok()) {
-            set_error(EIO, "Fail to close writer");
+            ...
         }
-        _writer = NULL;
     }
-    if (ok()) {
-        _reader = _storage->open();
-    }
+    ...
 }
 ```
 
 下载快照元数据
 ---
 
+调用 `RemoteFileCopier::start_to_copy_to_iobuf` 下载快照元数据，等待其下载完成后，保存至 `_remote_snapshot`：
+
 ```cpp
 void LocalSnapshotCopier::load_meta_table() {
     butil::IOBuf meta_buf;
-    std::unique_lock<raft_mutex_t> lck(_mutex);
-    if (_cancelled) {
-        set_error(ECANCELED, "%s", berror(ECANCELED));
-        return;
-    }
+    ...
+    // (1) 开始下载快照元数据
+    //     BRAFT_SNAPSHOT_META_FILE: __raft_snapshot_meta
     scoped_refptr<RemoteFileCopier::Session> session
             = _copier.start_to_copy_to_iobuf(BRAFT_SNAPSHOT_META_FILE,
                                             &meta_buf, NULL);
+    ...
+    // (2) 等待下载完成
     _cur_session = session.get();
-    lck.unlock();
     session->join();
-    lck.lock();
     _cur_session = NULL;
-    lck.unlock();
-    if (!session->status().ok()) {
-        LOG(WARNING) << "Fail to copy meta file : " << session->status();
-        set_error(session->status().error_code(), session->status().error_cstr());
-        return;
-    }
+
+    // (3) 将元数据保存在 `_remote_snapshot`
     if (_remote_snapshot._meta_table.load_from_iobuf_as_remote(meta_buf) != 0) {
-        LOG(WARNING) << "Bad meta_table format";
-        set_error(-1, "Bad meta_table format");
+        ..
+        ..
         return;
     }
-    CHECK(_remote_snapshot._meta_table.has_meta());
 }
 ```
 
-过滤文件列表
+安装快照流程中的所有下载操作都会调用 `start_to_copy_to_iobuf`，该函数接受一个 `source`，向 Leader 发送 `GetFile` 请求，将下载的内容保存在 `dest_buf` 中。特别地，针对大文件，会采用分片的方式进行传输：
+
+```cpp
+scoped_refptr<RemoteFileCopier::Session>
+RemoteFileCopier::start_to_copy_to_iobuf(
+                      const std::string& source,
+                      butil::IOBuf* dest_buf,
+                      const CopyOptions* options) {
+    ...
+    // (1) 准备好请求
+    scoped_refptr<Session> session(new Session());
+    ...
+    session->_buf = dest_buf;
+    session->_request.set_filename(source);
+    ...
+    session->_channel = &_channel;
+    ...
+
+    // (2) 发送 `GetFile` 请求
+    session->send_next_rpc();
+    return session;
+}
+
+/*
+ * message GetFileRequest {
+ *   required int64 reader_id = 1;
+ *   required string filename = 2;
+ *   required int64 count = 3;
+ *   required int64 offset = 4;
+ *   optional bool read_partly = 5;
+ * }
+ */
+void RemoteFileCopier::Session::send_next_rpc() {
+    // (3) 设置 offset
+    //     _request.offset() 是上一次发送的 offset
+    // Not clear request as we need some fields of the previous RPC
+    off_t offset = _request.offset() + _request.count();
+
+    // (4) FLAGS_raft_max_byte_count_per_rpc 默认是 128KB
+    //     如果文件大小超过 128KB，则重新计算 count
+    const size_t max_count =
+            (!_buf) ? FLAGS_raft_max_byte_count_per_rpc : UINT_MAX;
+    _cntl.set_timeout_ms(_options.timeout_ms);
+    _request.set_offset(offset);
+
+    ...
+    size_t new_max_count = max_count;
+    ...
+    _request.set_count(new_max_count);
+
+    // (5) 发送 `GetFile` 请求
+    _rpc_call = _cntl.call_id();
+    FileService_Stub stub(_channel);
+    AddRef();  // Release in on_rpc_returned
+    return stub.get_file(&_cntl, &_request, &_response, &_done);
+}
+```
+
+过滤下载列表
 ---
+
+在正式下载文件前，我们会过滤掉本地拥有的文件，具体规则详见以上<断点续传>。
 
 ```cpp
 void LocalSnapshotCopier::filter() {
     _writer = (LocalSnapshotWriter*)_storage->create(!_filter_before_copy_remote);
-    if (_writer == NULL) {
-        set_error(EIO, "Fail to create snapshot writer");
-        return;
-    }
+    ...
 
     if (_filter_before_copy_remote) {  // true
         SnapshotReader* reader = _storage->open();
         if (filter_before_copy(_writer, reader) != 0) {
-            LOG(WARNING) << "Fail to filter writer before copying"
-                            ", path: " << _writer->get_path()
-                         << ", destroy and create a new writer";
-            _writer->set_error(-1, "Fail to filter");
-            _storage->close(_writer, false);
-            _writer = (LocalSnapshotWriter*)_storage->create(true);
+            ...
         }
-        if (reader) {
-            _storage->close(reader);
-        }
-        if (_writer == NULL) {
-            set_error(EIO, "Fail to create snapshot writer");
-            return;
-        }
+        ...
     }
     _writer->save_meta(_remote_snapshot._meta_table.meta());
     if (_writer->sync() != 0) {
-        set_error(EIO, "Fail to sync snapshot writer");
+        ...
         return;
     }
 }
 ```
 
-`from_empty` 为 False，不删除 `temp` 目录
 ```cpp
-SnapshotWriter* LocalSnapshotStorage::create(bool from_empty) {
-    LocalSnapshotWriter* writer = NULL;
-
-    do {
-        std::string snapshot_path(_path);  // ./data/temp
-        snapshot_path.append("/");
-        snapshot_path.append(_s_temp_path);
-
-        // delete temp
-        // TODO: Notify watcher before deleting
-        if (_fs->path_exists(snapshot_path) && from_empty) {
-            if (destroy_snapshot(snapshot_path) != 0) {
-                break;
-            }
-        }
-
-        writer = new LocalSnapshotWriter(snapshot_path, _fs.get());
-        if (writer->init() != 0) {
-            LOG(ERROR) << "Fail to init writer in path " << snapshot_path
-                       << ", " << *writer;
-            delete writer;
-            writer = NULL;
-            break;
-        }
-        BRAFT_VLOG << "Create writer success, path: " << snapshot_path;
-    } while (0);
-
-    return writer;
-}
-```
-
-遍历用户指定的快照目录，保存最近的一个快照，删除其余全部快照：
-
-```cpp
-int LocalSnapshotWriter::init() {
-    butil::File::Error e;
-    if (!_fs->create_directory(_path, &e, false)) {
-        LOG(ERROR) << "Fail to create directory " << _path << ", " << e;
-        set_error(EIO, "CreateDirectory failed with path: %s", _path.c_str());
-        return EIO;
-    }
-    std::string meta_path = _path + "/" BRAFT_SNAPSHOT_META_FILE;
-    if (_fs->path_exists(meta_path) &&
-                _meta_table.load_from_file(_fs, meta_path) != 0) {
-        LOG(ERROR) << "Fail to load meta from " << meta_path;
-        set_error(EIO, "Fail to load metatable from %s", meta_path.c_str());
-        return EIO;
-    }
-
-    // remove file if meta_path not exist or it's not in _meta_table
-    // to avoid dirty data
-    {
-        std::vector<std::string> to_remove;
-        DirReader* dir_reader = _fs->directory_reader(_path);
-        if (!dir_reader->is_valid()) {
-            LOG(ERROR) << "Invalid directory reader, maybe NOEXIST or PERMISSION,"
-                       << " path: " << _path;
-            set_error(EIO, "Invalid directory reader in path: %s", _path.c_str());
-            delete dir_reader;
-            return EIO;
-        }
-        while (dir_reader->next()) {
-            std::string filename = dir_reader->name();
-            if (filename != BRAFT_SNAPSHOT_META_FILE) {
-                if (get_file_meta(filename, NULL) != 0) {
-                    to_remove.push_back(filename);
-                }
-            }
-        }
-        delete dir_reader;
-        for (size_t i = 0; i < to_remove.size(); ++i) {
-            std::string file_path = _path + "/" + to_remove[i];
-            _fs->delete_file(file_path, false);
-            LOG(WARNING) << "Snapshot file exist but meta not found so delete it,"
-                << " path: " << file_path;
-        }
-    }
-
-    return 0;
-}
-```
-
-```cpp
-// write: temp 目录的 SnapshotWrite ? 自己打的快照还是下载的？
-// last_snapshot: 最新的快照
 int LocalSnapshotCopier::filter_before_copy(LocalSnapshotWriter* writer,
                                             SnapshotReader* last_snapshot) {
+    // (1) 首先获取本地临时快照 temp 目录中的文件列表
     std::vector<std::string> existing_files;
     writer->list_files(&existing_files);
     std::vector<std::string> to_remove;
 
     for (size_t i = 0; i < existing_files.size(); ++i) {
+        // (2) 如果远程（Leader）快照不存在该文件，则将该文件从 temp 目录中移除
         if (_remote_snapshot.get_file_meta(existing_files[i], NULL) != 0) {
             to_remove.push_back(existing_files[i]);
             writer->remove_file(existing_files[i]);  // 将文件名从元数据表中移除
         }
     }
 
+    // (3) 从元数据中获取远程快照的文件列表
     std::vector<std::string> remote_files;
     _remote_snapshot.list_files(&remote_files);
     for (size_t i = 0; i < remote_files.size(); ++i) {
         const std::string& filename = remote_files[i];
         LocalFileMeta remote_meta;
-        CHECK_EQ(0, _remote_snapshot.get_file_meta(
-                filename, &remote_meta));
         if (!remote_meta.has_checksum()) {
             // Redownload file if this file doen't have checksum
             writer->remove_file(filename);
@@ -528,13 +570,12 @@ int LocalSnapshotCopier::filter_before_copy(LocalSnapshotWriter* writer,
             continue;
         }
 
+        // (3.2) temp 目录已经存在
         LocalFileMeta local_meta;
         if (writer->get_file_meta(filename, &local_meta) == 0) {  // temp 目录有
             if (local_meta.has_checksum() &&
                 local_meta.checksum() == remote_meta.checksum()) {
-                LOG(INFO) << "Keep file=" << filename
-                          << " checksum=" << remote_meta.checksum()
-                          << " in " << writer->get_path();
+                ...
                 continue;
             }
             // Remove files from writer so that the file is to be copied from
@@ -543,6 +584,7 @@ int LocalSnapshotCopier::filter_before_copy(LocalSnapshotWriter* writer,
             to_remove.push_back(filename);
         }
 
+        // (3.3) 再在本地的上一个快照中找
         // Try find files in last_snapshot
         if (!last_snapshot) {
             continue;
@@ -553,9 +595,7 @@ int LocalSnapshotCopier::filter_before_copy(LocalSnapshotWriter* writer,
         if (!local_meta.has_checksum() || local_meta.checksum() != remote_meta.checksum()) {
             continue;
         }
-        LOG(INFO) << "Found the same file=" << filename
-                  << " checksum=" << remote_meta.checksum()
-                  << " in last_snapshot=" << last_snapshot->get_path();
+        ...
         if (local_meta.source() == braft::FILE_SOURCE_LOCAL) {
             std::string source_path = last_snapshot->get_path() + '/'
                                       + filename;
@@ -563,8 +603,6 @@ int LocalSnapshotCopier::filter_before_copy(LocalSnapshotWriter* writer,
                                       + filename;
             _fs->delete_file(dest_path, false);
             if (!_fs->link(source_path, dest_path)) {
-                PLOG(ERROR) << "Fail to link " << source_path
-                            << " to " << dest_path;
                 continue;
             }
             // Don't delete linked file
@@ -581,11 +619,62 @@ int LocalSnapshotCopier::filter_before_copy(LocalSnapshotWriter* writer,
         return -1;
     }
 
+    // 删除临时快照中需要删除的文件
     for (size_t i = 0; i < to_remove.size(); ++i) {
         std::string file_path = writer->get_path() + "/" + to_remove[i];
         _fs->delete_file(file_path, false);
     }
+    return 0;
+}
+```
 
+创建临时目录
+---
+
+首先会调用 `LocalSnapshotStorage::create` 创建一个 `temp` 目录用来保存下载的临时快照，并返回 `SnapshotWriter`。注意，我们在创建本地快照时，也有一样的创建流程。唯一的区别在于用于保存下载快照的 `temp` 目录即使事先存在也不会删除，主要是为了实现我们上面提到的断点续传功能：
+
+```cpp
+SnapshotWriter* LocalSnapshotStorage::create(bool from_empty) {
+    LocalSnapshotWriter* writer = NULL;
+
+    do {
+        std::string snapshot_path(_path);  // _path 为用户配置的快照存储目录
+        snapshot_path.append("/");
+        snapshot_path.append(_s_temp_path);  // e.g. data/temp
+
+        // (1) 因为 `from_empty` 为 False，所以有 `temp` 目录的话
+        //    将不会删除，而是直接返回 `SnapshotWriter`
+        // delete temp
+        // TODO: Notify watcher before deleting
+        if (_fs->path_exists(snapshot_path) && from_empty) {
+            if (destroy_snapshot(snapshot_path) != 0) {
+                break;
+            }
+        }
+
+        // (2) 如果不存在的话，则调用 `LocalSnapshotWriter::init` 创建 temp 目录
+        writer = new LocalSnapshotWriter(snapshot_path, _fs.get());
+        if (writer->init() != 0) {
+            ...
+            break;
+        }
+    } while (0);
+
+    return writer;
+}
+```
+
+遍历用户指定的快照目录，保存最近的一个快照，删除其余全部快照：
+
+```cpp
+int LocalSnapshotWriter::init() {
+    butil::File::Error e;
+    // (3) 创建 temp 目录
+    if (!_fs->create_directory(_path, &e, false)) {
+        ...
+        return EIO;
+    }
+    ...
     return 0;
 }
 ```
@@ -593,18 +682,33 @@ int LocalSnapshotCopier::filter_before_copy(LocalSnapshotWriter* writer,
 逐一下载文件
 ---
 
-```cpp
+在上面的下载快照流程 `copy` 函数中，我们已经介绍过，会根据快照元数据中的文件列表，逐一从 Leader 下载快照文件：
 
+```cpp
+void LocalSnapshotCopier::copy() {
+    do {
+        ...
+        // (1) 获取文件列表
+        std::vector<std::string> files;
+        _remote_snapshot.list_files(&files);
+        // (2) 逐一下载
+        for (size_t i = 0; i < files.size() && ok(); ++i) {
+            copy_file(files[i]);
+        }
+    } while (0);
+    ...
+}
+```
+
+调用 `list_files` 获取快照元数据中的文件列表：
+
+```cpp
 void LocalSnapshot::list_files(std::vector<std::string> *files) {
     return _meta_table.list_files(files);  // _meta_table: LocalSnapshotMetaTable
 }
 
 void LocalSnapshotMetaTable::list_files(std::vector<std::string>* files) const {
-    if (!files) {
-        return;
-    }
-    files->clear();
-    files->reserve(_file_map.size());
+    ...
     for (Map::const_iterator
             iter = _file_map.begin(); iter != _file_map.end(); ++iter) {
         files->push_back(iter->first);
@@ -612,124 +716,109 @@ void LocalSnapshotMetaTable::list_files(std::vector<std::string>* files) const {
 }
 ```
 
+调用 `copy_file` 下载指定文件，参见以下详情注释：
+
 ```cpp
 void LocalSnapshotCopier::copy_file(const std::string& filename) {
-    if (_writer->get_file_meta(filename, NULL) == 0) {
-        LOG(INFO) << "Skipped downloading " << filename
-                  << " path: " << _writer->get_path();
-        return;
-    }
+    ...
+    // (1) 如果路径中还有目录，则在本地创建子目录
     std::string file_path = _writer->get_path() + '/' + filename;
     butil::FilePath sub_path(filename);
     if (sub_path != sub_path.DirName() && sub_path.DirName().value() != ".") {
-        butil::File::Error e;
-        bool rc = false;
+        ...
         if (FLAGS_raft_create_parent_directories) {
             butil::FilePath sub_dir =
                     butil::FilePath(_writer->get_path()).Append(sub_path.DirName());
             rc = _fs->create_directory(sub_dir.value(), &e, true);
-        } else {
-            rc = create_sub_directory(
-                    _writer->get_path(), sub_path.DirName().value(), _fs, &e);
         }
-        if (!rc) {
-            LOG(ERROR) << "Fail to create directory for " << file_path
-                       << " : " << butil::File::ErrorToString(e);
-            set_error(file_error_to_os_error(e),
-                      "Fail to create directory");
-        }
+        ...
     }
-    LocalFileMeta meta;
-    _remote_snapshot.get_file_meta(filename, &meta);
-    std::unique_lock<raft_mutex_t> lck(_mutex);
-    if (_cancelled) {
-        set_error(ECANCELED, "%s", berror(ECANCELED));
-        return;
-    }
+
+    // (2) 调用 `RemoteFileCopier::start_to_copy_to_file` 从 Leader 下载文件存至临时快照
     scoped_refptr<RemoteFileCopier::Session> session
         = _copier.start_to_copy_to_file(filename, file_path, NULL);
-    if (session == NULL) {
-        LOG(WARNING) << "Fail to copy " << filename
-                     << " path: " << _writer->get_path();
-        set_error(-1, "Fail to copy %s", filename.c_str());
-        return;
-    }
+    ...
     _cur_session = session.get();
-    lck.unlock();
+    ..
     session->join();
-    lck.lock();
-    _cur_session = NULL;
-    lck.unlock();
-    if (!session->status().ok()) {
-        set_error(session->status().error_code(), session->status().error_cstr());
-        return;
-    }
+    ...
+
+    // (3) 每成功下载一个文件，则将其添加至临时快照元数据中
     if (_writer->add_file(filename, &meta) != 0) {
-        set_error(EIO, "Fail to add file to writer");
+        ...
         return;
     }
+
+    // (4) 每成功下载一个文件，则将临时快照元数据中持久化，
+    //     也就是说每次都会覆盖快照元数据，这么做主要是为了不重复下载文件
     if (_writer->sync() != 0) {
-        set_error(EIO, "Fail to sync writer");
+        ...
         return;
     }
 }
 ```
 
-打开快照
----
+阶段三：转为正式快照
+===
+
+在上面的下载快照流程 `copy` 函数中，我们已经介绍过，当快照中的所有文件都下载完毕后，就会调用 `LocalSnapshotStorage::close` 将下载的临时快照转为正式快照：
+
 ```cpp
-SnapshotReader* LocalSnapshotStorage::open() {
-    std::unique_lock<raft_mutex_t> lck(_mutex);
-    if (_last_snapshot_index != 0) {
-        const int64_t last_snapshot_index = _last_snapshot_index;
-        ++_ref_map[last_snapshot_index];
-        lck.unlock();
-        std::string snapshot_path(_path);
-        butil::string_appendf(&snapshot_path, "/" BRAFT_SNAPSHOT_PATTERN, last_snapshot_index);
-        LocalSnapshotReader* reader = new LocalSnapshotReader(snapshot_path, _addr,
-                _fs.get(), _snapshot_throttle.get());
-        if (reader->init() != 0) {
-            CHECK(!lck.owns_lock());
-            unref(last_snapshot_index);
-            delete reader;
-            return NULL;
+void LocalSnapshotCopier::copy() {
+    // (1) 各种下载流程
+    ...
+    // (2) 调用 `LocalSnapshotStorage::close`
+    if (_writer) {
+        // set_error for copier only when failed to close writer and copier was
+        // ok before this moment
+        if (_storage->close(_writer, _filter_before_copy_remote) != 0 && ok()) {
+            ...
         }
-        return reader;
-    } else {
-        errno = ENODATA;
-        return NULL;
+        ...
     }
+    ...
 }
 ```
 
-转变为正式快照
+写入元数据
 ---
+
+rename 成正式快照
+---
+
+在 `close` 函数中主要以下做四件事：
+* (1) 将元数据持久化到文件
+* (2) 通过 `rename()` 将临时快照变为正式快照
+* (3) 删除上一个快照
 
 ```cpp
 int LocalSnapshotStorage::close(SnapshotWriter* writer_base,
                                 bool keep_data_on_error) {
-
-     do {
-        ret = writer->sync();
-
+    LocalSnapshotWriter* writer = dynamic_cast<LocalSnapshotWriter*>(writer_base);
+    do {
         ...
+        // (1) 将快照元数据写入文件
+        ret = writer->sync();
+        ...
+        //
+        int old_index = _last_snapshot_index;
+        int64_t new_index = writer->snapshot_index();
 
+        // (2) 将临时快照 rename 成正式快照
         // rename temp to new
         std::string temp_path(_path);
         temp_path.append("/");
         temp_path.append(_s_temp_path);
         std::string new_path(_path);
         butil::string_appendf(&new_path, "/" BRAFT_SNAPSHOT_PATTERN, new_index);
-
         if (!_fs->delete_file(new_path, true)) {
             ...
         }
-
+        ...
         if (!_fs->rename(temp_path, new_path)) {
             ...
         }
 
-        ...
         ref(new_index);
         {
             BAIDU_SCOPED_LOCK(_mutex);
@@ -737,236 +826,138 @@ int LocalSnapshotStorage::close(SnapshotWriter* writer_base,
             _last_snapshot_index = new_index;
         }
         // unref old_index, ref new_index
+
+        // (3) 删除上一个快照。
+        //     需要注意的是，这里有一个引用判断
+        //     因为当前节点可能是 Leader，而该快照可能正用于下载给 Follower
         unref(old_index);
     } while (0);
+    ...
 }
 ```
 
+`sync` 会调用 `save_to_file` 将元数据填充到 `proto`（`LocalSnapshotPbMeta`）中，并将其序列化，最终持久化到文件：
+
 ```cpp
+int LocalSnapshotWriter::sync() {
+    // BRAFT_SNAPSHOT_META_FILE: __raft_snapshot_meta
+    const int rc = _meta_table.save_to_file(_fs, _path + "/" BRAFT_SNAPSHOT_META_FILE);
+    ...
+    return rc;
+}
+
+int LocalSnapshotMetaTable::save_to_file(FileSystemAdaptor* fs, const std::string& path) const {
+    // (1) _meta 中保存的是 lastIncludeIndex，lastIncludedTerm 以及集群配置
+    LocalSnapshotPbMeta pb_meta;
+    if (_meta.IsInitialized()) {
+        *pb_meta.mutable_meta() = _meta;
+    }
+
+    // (2) 将所有文件列表加入到 proto
+    for (Map::const_iterator
+            iter = _file_map.begin(); iter != _file_map.end(); ++iter) {
+        LocalSnapshotPbMeta::File *f = pb_meta.add_files();
+        f->set_name(iter->first);
+        *f->mutable_meta() = iter->second;
+    }
+
+    // (3) 序列化并持久化到文件
+    ProtoBufFile pb_file(path, fs);
+    int ret = pb_file.save(&pb_meta, raft_sync_meta());
+    ...
+    return ret;
+}
+```
+
+删除上一个快照
+---
+
+调用 `unref` 删除上一个快照。需要注意的是，当前节点可能是 Leader，而该快照可能正用于下载给其他 Follower，所以需要判断其引用计数，若引用计数为 0，则删除其目录：
+
+```cpp
+// (1) index 为上一个快照的 lastIncludeIndex
 void LocalSnapshotStorage::unref(const int64_t index) {
     std::unique_lock<raft_mutex_t> lck(_mutex);
     std::map<int64_t, int>::iterator it = _ref_map.find(index);
+    // (2) 找到上一个快照
     if (it != _ref_map.end()) {
+        // (3) 将其引用计数减一
         it->second--;
-
+        // (4) 如果减到 0，则将其删除
         if (it->second == 0) {
             _ref_map.erase(it);
-            lck.unlock();
             std::string old_path(_path);
             butil::string_appendf(&old_path, "/" BRAFT_SNAPSHOT_PATTERN, index);
             destroy_snapshot(old_path);
         }
     }
 }
-```
 
-```cpp
+// (5) 删除上一个快照的目录
 int LocalSnapshotStorage::destroy_snapshot(const std::string& path) {
-    LOG(INFO) << "Deleting "  << path;
     if (!_fs->delete_file(path, true)) {
-        LOG(WARNING) << "delete old snapshot path failed, path " << path;
+        ...
         return -1;
     }
     return 0;
 }
 ```
 
-
-阶段三：Follower 加载快照
+阶段四：Follower 加载快照
 ===
 
-```cpp
-void SnapshotExecutor::load_downloading_snapshot(DownloadingSnapshot* ds,
-                                                 const SnapshotMeta& meta) {
-    _snapshot_storage->close(_cur_copier);  // _cur_copier: LocalSnapshotStorage
-    InstallSnapshotDone* install_snapshot_done =
-            new InstallSnapshotDone(this, reader);
-    int ret = _fsm_caller->on_snapshot_load(install_snapshot_done);
-}
-```
+在将下载来的临时快照转为正式快照后，节点就开始加载快照。加载快照的流程我们在[<5.3 加载快照>](/ch05/5.3/load.md)已有详细介绍，在这里就不重复介绍了。
 
-```cpp
-int LocalSnapshotStorage::close(SnapshotCopier* copier) {
-    delete copier;
-    return 0;
-}
-```
+当快照加载完毕后，运行 `Closure` 时会发送 `InstallSnapshot` 响应给 Leader。
 
-
-
-
-收尾工作
----
-
-```cpp
-void InstallSnapshotDone::Run() {
-    _se->on_snapshot_load_done(status());  // _se: SnapshotExecutor
-    delete this;
-}
-
-void SnapshotExecutor::on_snapshot_load_done(const butil::Status& st) {
-    if (st.ok()) {
-        _last_snapshot_index = _loading_snapshot_meta.last_included_index();
-        _last_snapshot_term = _loading_snapshot_meta.last_included_term();
-        _log_manager->set_snapshot(&_loading_snapshot_meta);
-    }
-
-    ...
-    if (m) {
-        // Respond RPC
-        if (!st.ok()) {
-            m->cntl->SetFailed(st.error_code(), "%s", st.error_cstr());
-        } else {
-            m->response->set_success(true);
-        }
-        m->done->Run();
-        delete m;
-    }
-}
-```
-
-```cpp
-void LogManager::set_snapshot(const SnapshotMeta* meta) {
-    BRAFT_VLOG << "Set snapshot last_included_index="
-              << meta->last_included_index()
-              << " last_included_term=" <<  meta->last_included_term();
-    std::unique_lock<raft_mutex_t> lck(_mutex);
-    if (meta->last_included_index() <= _last_snapshot_id.index) {
-        return;
-    }
-    Configuration conf;
-    for (int i = 0; i < meta->peers_size(); ++i) {
-        conf.add_peer(meta->peers(i));
-    }
-    Configuration old_conf;
-    for (int i = 0; i < meta->old_peers_size(); ++i) {
-        old_conf.add_peer(meta->old_peers(i));
-    }
-    ConfigurationEntry entry;
-    entry.id = LogId(meta->last_included_index(), meta->last_included_term());
-    entry.conf = conf;
-    entry.old_conf = old_conf;
-    _config_manager->set_snapshot(entry);
-    int64_t term = unsafe_get_term(meta->last_included_index());
-
-    const LogId last_but_one_snapshot_id = _last_snapshot_id;
-    _last_snapshot_id.index = meta->last_included_index();
-    _last_snapshot_id.term = meta->last_included_term();
-    if (_last_snapshot_id > _applied_id) {  // 从 leader 下载 snapshot 可能会出现
-        _applied_id = _last_snapshot_id;
-    }
-    // NOTICE: not to update disk_id here as we are not sure if this node really
-    // has these logs on disk storage. Just leave disk_id as it was, which can keep
-    // these logs in memory all the time until they are flushed to disk. By this
-    // way we can avoid some corner cases which failed to get logs.
-
-    // last_included_index > last_index
-    // 快照包含的日志长度比当前节点日志长度大，这种情况只可能发生在从 leader 下载过来的 snapshot
-    if (term == 0) {
-        // last_included_index is larger than last_index
-        // FIXME: what if last_included_index is less than first_index?
-        _virtual_first_log_id = _last_snapshot_id;
-        truncate_prefix(meta->last_included_index() + 1, lck);
-        return;
-    } else if (term == meta->last_included_term()) {  // last_index >= last_included_index
-        // Truncating log to the index of the last snapshot.
-        // We don't truncate log before the latest snapshot immediately since
-        // some log around last_snapshot_index is probably needed by some
-        // followers
-        if (last_but_one_snapshot_id.index > 0) {
-            // We have last snapshot index
-            _virtual_first_log_id = last_but_one_snapshot_id;
-            truncate_prefix(last_but_one_snapshot_id.index + 1, lck);
-        }
-        return;
-    } else {
-        // TODO: check the result of reset.
-        _virtual_first_log_id = _last_snapshot_id;
-        reset(meta->last_included_index() + 1, lck);
-        return;
-    }
-    CHECK(false) << "Cannot reach here";
-}
-```
-
-阶段四：完成快照安装
+阶段五：Leader 处理响应
 ===
+
+Leader 在收到 `InstallSnapshot` 响应后，会调用 `_on_install_snapshot_returned` 进行处理。在该函数中会根据响应的结果，做出不同的决策：
 
 ```cpp
 void Replicator::_on_install_snapshot_returned(
             ReplicatorId id, brpc::Controller* cntl,
             InstallSnapshotRequest* request,
             InstallSnapshotResponse* response) {
-    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
-    std::unique_ptr<InstallSnapshotRequest> request_guard(request);
-    std::unique_ptr<InstallSnapshotResponse> response_guard(response);
-    Replicator *r = NULL;
-    bthread_id_t dummy_id = { id };
-    bool succ = true;
-    if (bthread_id_lock(dummy_id, (void**)&r) != 0) {
-        return;
-    }
-    if (r->_reader) {
-        r->_options.snapshot_storage->close(r->_reader);
-        r->_reader = NULL;
-        if (r->_options.snapshot_throttle) {
-            r->_options.snapshot_throttle->finish_one_task(true);
-        }
-    }
-    std::stringstream ss;
-    ss << "received InstallSnapshotResponse from "
-       << r->_options.group_id << ":" << r->_options.peer_id
-       << " last_included_index " << request->meta().last_included_index()
-       << " last_included_term " << request->meta().last_included_term();
+    ...
     do {
         if (cntl->Failed()) {
-            ss << " error: " << cntl->ErrorText();
-            LOG(INFO) << ss.str();
-
-            LOG_IF(WARNING, (r->_consecutive_error_times++) % 10 == 0)
-                            << "Group " << r->_options.group_id
-                            << " Fail to install snapshot at peer="
-                            << r->_options.peer_id
-                            <<", " << cntl->ErrorText();
+            ...
             succ = false;
             break;
         }
         if (!response->success()) {
             succ = false;
-            ss << " fail.";
-            LOG(INFO) << ss.str();
-            // Let heartbeat do step down
+            ...
             break;
         }
+        // (1) 如果安装快照成功，则将 Follower 的 nextIndex 设置为快照的 lastIncludedIndex + 1
         // Success
         r->_next_index = request->meta().last_included_index() + 1;
-        ss << " success.";
-        LOG(INFO) << ss.str();
+        ...
     } while (0);
 
+    // (2) 如果失败，则先阻塞当前 Replicator 一会儿，最终仍会再次安装快照
     // We don't retry installing the snapshot explicitly.
     // dummy_id is unlock in _send_entries
     if (!succ) {
         return r->_block(butil::gettimeofday_us(), cntl->ErrorCode());
     }
-    r->_has_succeeded = true;
-    r->_notify_on_caught_up(0, false);
-    if (r->_timeout_now_index > 0 && r->_timeout_now_index < r->_min_flying_index()) {
-        r->_send_timeout_now(false, false);
-    }
+
+    // (1.1) 如果成功的话，则继续向 Follower 同步日志
     // dummy_id is unlock in _send_entries
     return r->_send_entries();
 }
 ```
 
-其他：安装快照失败
-===
-
-
-
+[ApplyTaskQueue]: /ch02/2.1/init.md#applytaskqueue
 
 <!--
 TODO
+===
+
+其他：安装快照失败
 ===
 
 > 加载的时候是不是不再接受 Leader 的日志? 或者 Leader 不再发送日志
