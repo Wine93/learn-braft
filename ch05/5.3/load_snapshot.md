@@ -286,9 +286,7 @@ void LocalSnapshotReader::list_files(std::vector<std::string> *files) {
 }
 
 void LocalSnapshotMetaTable::list_files(std::vector<std::string>* files) const {
-    if (!files) {
-        return;
-    }
+    ...
     files->clear();
     files->reserve(_file_map.size());
     for (Map::const_iterator
