@@ -1,6 +1,4 @@
 * [前言](introduction.md)
-
-## braft 源码解析
 * [1. 简介](ch01/introduction.md)
 * [2. 启动节点](ch02/README.md)
     * [2.1 启动流程](ch02/2.1/init.md)
