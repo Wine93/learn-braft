@@ -1,6 +1,8 @@
 learn-raft
 ===
 
+[![](https://img.shields.io/github/stars/wine93/learn-raft.svg?style=social&label=Stars)](https://github.com/wine93/learn-raft)
+
 Raft 学习笔记 - braft 源码解析
 
 说明
