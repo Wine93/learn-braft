@@ -354,16 +354,18 @@ void SnapshotExecutor::on_snapshot_load_done(const butil::Status& st) {
             m->response->set_success(true);
         }
         m->done->Run();
-        delete m;
+        ...
     }
-    _running_jobs.signal();
+    ...
 }
 ```
 
 删除日志
 ---
 
-根据
+`set_snapshot` 主要执行以下 2 件事：
+* 将快照元数据中的节点配置保存至 `_config_manager`
+* 根据快照元数据中的 `lastIncludeIndex` 删除相应的日志
 
 ```cpp
 void LogManager::set_snapshot(const SnapshotMeta* meta) {
@@ -384,16 +386,15 @@ void LogManager::set_snapshot(const SnapshotMeta* meta) {
     entry.old_conf = old_conf;
     _config_manager->set_snapshot(entry);
 
-    // (2) 获取快照 lastIncludedIndex 对应的 term
+    // (2) 开始删除日志
+    // (2.1) 获取快照 lastIncludedIndex 对应的 term
     int64_t term = unsafe_get_term(meta->last_included_index());
-
-    // (3) 上一个快照
+    // (2.2) 上一个快照
     const LogId last_but_one_snapshot_id = _last_snapshot_id;
-
-    // (4) 开始删除日志
-    // (4.1) 快照包含的日志长度比当前节点日志长度大，
-    //       这种情况只可能发生在从 Leader 下载过来的 snapshot
-    //       将当前节点的所有日志都删除掉
+    // (2.3) 开始删除日志
+    // (2.3.1) 快照包含的日志长度比当前节点日志长度大，
+    //         这种情况只可能发生在从 Leader 下载过来的 snapshot
+    //         将当前节点的所有日志都删除掉
     // last_included_index > last_index
     if (term == 0) {
         // last_included_index is larger than last_index
@@ -401,9 +402,9 @@ void LogManager::set_snapshot(const SnapshotMeta* meta) {
         _virtual_first_log_id = _last_snapshot_id;
         truncate_prefix(meta->last_included_index() + 1, lck);
         return;
-    // (4.2) 快照包含的日志长度比当前节点日志长度小
-    //       这种情况发生在节点重启时
-    //       删除上一个快照的日志
+    // (2.3.2) 快照包含的日志长度比当前节点日志长度小
+    //         这种情况发生在节点重启时
+    //         删除上一个快照的日志
     } else if (term == meta->last_included_term()) {
         // Truncating log to the index of the last snapshot.
         // We don't truncate log before the latest snapshot immediately since
@@ -421,7 +422,7 @@ void LogManager::set_snapshot(const SnapshotMeta* meta) {
         reset(meta->last_included_index() + 1, lck);
         return;
     }
-    CHECK(false) << "Cannot reach here";
+    ...
 }
 ```
 
