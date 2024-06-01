@@ -582,7 +582,7 @@ void RemoteFileCopier::Session::send_next_rpc() {
 过滤下载列表
 ---
 
-在正式下载文件前，我们会过滤掉本地拥有的文件，具体规则详见以上<断点续传>。
+在正式下载文件前，我们会过滤掉本地拥有的文件，具体规则详见以上[断点续传](#断点续传)。
 
 ```cpp
 void LocalSnapshotCopier::filter() {
