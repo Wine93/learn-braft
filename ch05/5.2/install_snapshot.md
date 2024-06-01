@@ -15,14 +15,16 @@
    * 2.5 待快照下载完成后，删除本地快照，并将临时快照 `rename()` 成正式快照
 3. Follower 回调用户状态机的 `on_snapshot_load` 加载快照
 4. 等待快照加载完毕后：
-    * 4.1 更新 `applyIndex` 为快照的 `lastIncludedIndex`
-    * 4.2 删除 `index` 小于 `lastIncludedIndex` 的日志（即全部日志）
+    * 4.1 更新 `applyIndex` 为快照元数据中的 `lastIncludedIndex`
+    * 4.2 删除 `logIndex<=lastIncludedIndex` 的日志（即全部日志）
+    * 4.3 将快照元数据中的节点配置设为当前节点配置
 5. Follower 向 Leader 发送成功的 `InstallSnapshot` 响应
 6. Leader 收到成功响应后更新 Follower 的 `nextIndex` 为快照的 `lastIncludedIndex` + 1
 7. Leader 从 `nextIndex` 开始继续向 Follower 发送日志
 
 ![图 5.3  安装快照 RPC 交互](image/5.3.png)
 
+<!--
 快照属性
 ---
 
@@ -37,6 +39,7 @@
   * 当触发创建快照时，发现有快照正在安装，则返回失败；反之亦然
   * 当触发创建快照时，如果有快照正在创建，则返回失败；安装快照亦是如此（安装由 Leader 控制，此情况一般不会发生）
 * 对于 Leader 来说，当其的快照正在供 Leader 下载时（即其已经下发安装快照指令，但未收到响应），其依旧可以创建本地快照。只不过在创建完本地快照后，因为上一个快照仍在供 Follower 下载，不会立即删除，直到 Follower 安装完毕。
+-->
 
 大文件下载
 ---
@@ -51,7 +54,7 @@ message GetFileRequest {
 }
 ```
 
-Follower 通过发送 `GetFileRequest` 从 Leader 下载文件，而当快照的文件较大时，这时候就会开启分片下载。每次通过设置 `GetFileRequest` 中的 `count` 和 `offset` 来实现分片下载，默认每个分片为 `128KB`，其受配置项 `raft_max_byte_count_per_rpc` 控制：
+Follower 通过发送 `GetFileRequest` 从 Leader 下载文件，而当快照的文件较大时（超过单个分片大小），这时候就会开启分片下载。每次通过设置 `GetFileRequest` 中的 `count` 和 `offset` 来实现分片下载，默认每个分片为 `128KB`，其受配置项 `raft_max_byte_count_per_rpc` 控制：
 
 ```cpp
 DEFINE_int32(raft_max_byte_count_per_rpc, 1024 * 128 /*128K*/,
@@ -62,15 +65,15 @@ BRPC_VALIDATE_GFLAG(raft_max_byte_count_per_rpc, brpc::PositiveInteger);
 断点续传
 ---
 
-Follwer 从 Leader 下载的快照文件会保存在临时快照 `temp` 目录中，如果 Follower 下载了一部分后挂掉，在其重启后重新接收 `InstallSnapshot` 开始下载快照时，其不会删除 `temp` 目录，而是对比本地临时快照和远程快照的元数据，对于那些本地已经存在且 `CRC` 一样的文件，则无需重复下载:
+Follwer 从 Leader 下载的快照文件会保存在临时快照 `temp` 目录中，如果 Follower 下载了一部分后 Crash，在重启后重新接收 `InstallSnapshot` 开始下载快照时，其不会删除 `temp` 目录，而是对比本地临时快照和远程快照的元数据，对于那些本地已经存在且 `CRC` 一样的文件，则无需重复下载:
 
 ![图 5.3  断点续传](image/5.4.png)
 
-进一步地，对于本地正式快照已经存在的文件也无需重复下载。之所以要对比本地正式快照，是因为该快照可能来自于 Leader 之前的快照：
+进一步地，对于本地正式快照已经存在的文件也无需重复下载。之所以要对比本地正式快照，是因为该快照可能也来自于 Leader 之前的快照：
 
 ![图 5.4  断点续传](image/5.5.png)
 
-总的来说，为了减少网络的传输，只要本地存在的文件，其文件名和 CRC 和 Leader 的一样就无需重复下载，详见以下<过滤下载列表>。
+总的来说，为了减少网络的传输，只要本地存在的文件，其文件名和 CRC 和 Leader 的一样就无需重复下载，详见以下[过滤下载列表](#guo-lv-xia-zai-lie-biao)。
 
 快照限流
 ---
@@ -79,7 +82,7 @@ Follwer 从 Leader 下载的快照文件会保存在临时快照 `temp` 目录�
 
 限流作用于以下两个维度：
 * 任务个数：节点每开启一个安装快照任务，任务计数将加一（该限制仅作用于 Follower)
-* 带宽：Leader 读取本地快照或 Follower 从 Leader 下载文件写入临时快照，带宽计数将增加对应的字节数。总的来说，其作用的是磁盘带宽和网络带宽
+* 带宽：Leader 读取本地快照、Follower 通过网络从 Leader 下载文件（文件会写入临时快照），带宽计数将增加对应的字节数。总的来说，其作用的是磁盘带宽和网络带宽
 
 快照限流默认是关闭的，用户需要实现 [SnapshotThrottle](https://github.com/baidu/braft/blob/master/src/braft/snapshot_throttle.h#L26)，并在构建 `Node` 时将其通过 `NodeOptions` 传递给 braft：
 
@@ -93,7 +96,7 @@ struct NodeOptions {
 };
 ```
 
-当然了，框架也提供了默认的 `SnapshotThrottle` 实现，即 [ThroughputSnapshotThrottle][ThroughputSnapshotThrottle]，具体算法实现见[限流算法][限流算法]，用户构建时可控制带宽大小：
+当然了，框架也提供了默认的 `SnapshotThrottle` 实现，即 [ThroughputSnapshotThrottle][ThroughputSnapshotThrottle]，具体算法实现见[限流算法][限流算法]，用户构造时可控制带宽大小：
 
 ```cpp
 class ThroughputSnapshotThrottle : public SnapshotThrottle {
@@ -110,6 +113,7 @@ private:
 ```
 
 此外，[ThroughputSnapshotThrottle][ThroughputSnapshotThrottle] 还提供了一些动态配置项来控制并发任务个数以及带宽大小：
+
 ```cpp
 // used to increase throttle threshold dynamically when user-defined
 // threshold is too small in extreme cases.
@@ -125,12 +129,12 @@ DEFINE_int32(raft_max_install_snapshot_tasks_num, 1000,
                     brpc::PositiveInteger);
 ```
 
-由于传递的限流对象是一个指针，用户可以指定哪些 `Node` 共用同一个限流对象，来实现各个级别的限流策略，如针对每块盘或每个 `Raft Group`。
+由于传递的限流对象是一个指针，用户可以通过指定哪些 `Node` 共用同一个限流对象，来实现各个级别的限流策略，如针对每块盘或每个 `Raft Group`。
 
 相关 RPC
 ---
 
-`InstallSnapshot`：
+安装快照 RPC：
 
 ```proto
 message SnapshotMeta {
@@ -159,7 +163,8 @@ service RaftService {
 };
 ```
 
-下载文件：
+下载文件 RPC：
+
 ```proto
 message GetFileRequest {
     required int64 reader_id = 1;
@@ -178,55 +183,6 @@ message GetFileResponse {
 service FileService {
     rpc get_file(GetFileRequest) returns (GetFileResponse);
 }
-```
-
-相关接口
----
-
-```cpp
-class StateMachine {
-public:
-    // user defined snapshot load function
-    // get and load snapshot
-    // success return 0, fail return errno
-    // Default: Load nothing and returns error.
-    virtual int on_snapshot_load(::braft::SnapshotReader* reader);
-
-    // Invoked when a configuration has been committed to the group
-    virtual void on_configuration_committed(const ::braft::Configuration& conf);
-    virtual void on_configuration_committed(const ::braft::Configuration& conf, int64_t index);
-};
-```
-
-```cpp
-class SnapshotReader : public Snapshot {
-public:
-    // Load meta from
-    virtual int load_meta(SnapshotMeta* meta) = 0;
-
-    // Generate uri for other peers to copy this snapshot.
-    // Return an empty string if some error has occcured
-    virtual std::string generate_uri_for_copy() = 0;
-};
-
-class Snapshot : public butil::Status {
-public:
-    // Get the path of the Snapshot
-    virtual std::string get_path() = 0;
-
-    // List all the existing files in the Snapshot currently
-    virtual void list_files(std::vector<std::string> *files) = 0;
-
-    // Get the implementation-defined file_meta
-    virtual int get_file_meta(const std::string& filename,
-                              ::google::protobuf::Message* file_meta) {
-        (void)filename;
-        if (file_meta != NULL) {
-            file_meta->Clear();
-        }
-        return 0;
-    }
-};
 ```
 
 阶段一：Leader 下发指令
