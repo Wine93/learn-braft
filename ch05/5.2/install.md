@@ -6,7 +6,7 @@
 
 当 Follower 落后太多或新节点加入集群时，就会触发安装快照，其流程如下：
 1. Leader 向 Follower 发送 `InstallSnapshot` 请求，并停止向 Follower 同步日志
-2. Follower 根据请求中的 `URI` 分批次向 Leader 下载快照对应的文件集：
+2. Follower 根据请求中的 `URI` 逐一向 Leader 下载快照对应的文件集：
    * 2.1 创建连接 Leader 的客户端
    * 2.2 发送 `GetFileRequest` 请求获取 Leader 快照的元数据
    * 2.3 创建 `temp` 目录保存用于保存下载的临时快照
@@ -39,14 +39,13 @@ message GetFileRequest {
 }
 ```
 
-Follower 通过发送 `GetFileRequest` 从 Leader 下载文件，而有时间快照的文件较大，这时候就会开启分片下载。每次通过设置 `GetFileRequest` 中的 `count` 和 `offset` 来实现分片下载，默认每个分片为 `128KB`，其受配置项 `raft_max_byte_count_per_rpc` 控制：
+Follower 通过发送 `GetFileRequest` 从 Leader 下载文件，而当快照的文件较大时，这时候就会开启分片下载。每次通过设置 `GetFileRequest` 中的 `count` 和 `offset` 来实现分片下载，默认每个分片为 `128KB`，其受配置项 `raft_max_byte_count_per_rpc` 控制：
 
 ```cpp
 DEFINE_int32(raft_max_byte_count_per_rpc, 1024 * 128 /*128K*/,
              "Maximum of block size per RPC");
 BRPC_VALIDATE_GFLAG(raft_max_byte_count_per_rpc, brpc::PositiveInteger);
 ```
-
 
 断点续传
 ---
@@ -55,14 +54,35 @@ Follwer 从 Leader 下载的快照文件会保存在临时快照 `temp` 目录�
 
 ![图 5.3  断点续传](image/5.4.png)
 
-进一步地，对于本地快照已经存在的文件也无需重复下载：
+进一步地，对于本地快照已经存在的文件也无需重复下载。之所以要对比本地快照，是因为该快照可能来自于 Leader 之前的快照：
 
 ![图 5.4  断点续传](image/5.5.png)
 
 总的来说，为了减少网络的传输，只要本地存在的文件，其文件名和 CRC 和 Leader 的一样就无需重复下载，详见以下<过滤下载列表>。
 
-下载限流
+快照限流
 ---
+
+当一个 Raft 进程挂掉一段时间后重启，其可能会从 Leader 下载快照。特别地，当一个进程上跑着大量的 `Raft Group`，而每一个 `Node` 都需要从 Leader 下载快照，这时候下载的数据量将是庞大的，可能会占满 Leader 和 Follower 的网卡和磁盘带宽，影响正常的 `IO`。为此，braft 提供了相应的快照限流特性。
+
+```cpp
+// used to increase throttle threshold dynamically when user-defined
+// threshold is too small in extreme cases.
+// notice that this flag does not distinguish disk types(sata or ssd, and so on)
+DEFINE_int64(raft_minimal_throttle_threshold_mb, 0,
+            "minimal throttle throughput threshold per second");
+BRPC_VALIDATE_GFLAG(raft_minimal_throttle_threshold_mb,
+                    brpc::NonNegativeInteger);
+DEFINE_int32(raft_max_install_snapshot_tasks_num, 1000,
+             "Max num of install_snapshot tasks per disk at the same time");
+BRPC_VALIDATE_GFLAG(raft_max_install_snapshot_tasks_num,
+                    brpc::PositiveInteger);
+
+DEFINE_bool(raft_enable_throttle_when_install_snapshot, true,
+            "enable throttle when install snapshot, for both leader and follower");
+BRPC_VALIDATE_GFLAG(raft_enable_throttle_when_install_snapshot,
+                    ::brpc::PassValidate);
+```
 
 相关 RPC
 ---
