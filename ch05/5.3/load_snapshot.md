@@ -11,7 +11,8 @@
 4. 等待快照加载完成
 5. 以快照元数据中的节点配置作为参数，调用用户状态机的 `on_configuration_committed`
 6. 更新 `applyIndex` 为快照元数据中的 `lastIncludedIndex`
-7. 将快照元数据中的节点配置设为当前节点配置
+7. 删除 `logIndex<=lastIncludedIndex` 的日志（细节略有出入，见以下代码解析）
+8. 将快照元数据中的节点配置设为当前节点配置
 
 相关接口
 ---
@@ -179,7 +180,7 @@ int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
 }
 ```
 
-在 `FSMCaller::do_snapshot_load` 函数中主要做以下几件事：
+`FSMCaller::do_snapshot_load` 是加载快照的主干函数， 在该函数中主要做以下几件事，每一件事我们将在下面逐一介绍：
 
 ```cpp
 void FSMCaller::do_snapshot_load(LoadSnapshotClosure* done) {
@@ -203,7 +204,8 @@ void FSMCaller::do_snapshot_load(LoadSnapshotClosure* done) {
         return;
     }
 
-    // (3) 获取快照元数据中的节点配置，
+    // (3) 等待快照加载完成后，
+    //     获取快照元数据中的节点配置，
     //     并以该配置调用用户状态机的 on_configuration_committed
     if (meta.old_peers_size() == 0) {
         // Joint stage is not supposed to be noticeable by end users.
@@ -219,6 +221,7 @@ void FSMCaller::do_snapshot_load(LoadSnapshotClosure* done) {
                               butil::memory_order_release);
     _last_applied_term = meta.last_included_term();
 
+    // (5) 调用上面设置的 Closure，即 FirstSnapshotLoadDone 或 InstallSnapshotDone
     done->Run();
 }
 ```
@@ -299,12 +302,53 @@ void LocalSnapshotMetaTable::list_files(std::vector<std::string>* files) const {
 阶段三：完成快照加载
 ===
 
+on_configuration_committed
+---
+
+在上面的 `FSMCaller::do_snapshot_load` 函数中，我们提到过，在快照加载完成后，会调用用户状态机的 `on_configuration_committed` 函数：
+
+```cpp
+void FSMCaller::do_snapshot_load(LoadSnapshotClosure* done) {
+    ...
+    if (meta.old_peers_size() == 0) {
+        // Joint stage is not supposed to be noticeable by end users.
+        Configuration conf;
+        for (int i = 0; i < meta.peers_size(); ++i) {
+            conf.add_peer(meta.peers(i));
+        }
+        _fsm->on_configuration_committed(conf, meta.last_included_index());
+    }
+    ...
+}
+```
+
+更新 applyIndex
+---
+
+同样是在 `FSMCaller::do_snapshot_load` 函数中，在快照加载完成后，会设置 `applyIndex` 为快照元数据中的 `lastIncludedIndex`：
+
+```cpp
+void FSMCaller::do_snapshot_load(LoadSnapshotClosure* done) {
+    ...
+    _last_applied_index.store(meta.last_included_index(),
+                              butil::memory_order_release);
+    _last_applied_term = meta.last_included_term();
+    ...
+}
+```
+
 调用 Closure
 ---
 
 我们上面提到了，对于节点重启和安装快照这两种不同的加载快照场景，会设置不同的回调函数，但是其最终都会调用 `SnapshotExecutor::on_snapshot_load_done` 来做收尾工作：
 
 ```cpp
+// do_snapshot_load 函数中的最后一件事就是回调 Closure
+void FSMCaller::do_snapshot_load(LoadSnapshotClosure* done) {
+    ...
+    done->Run();
+}
+
 // 场景 1：节点重启时
 class FirstSnapshotLoadDone : public LoadSnapshotClosure {
 public:
@@ -395,7 +439,7 @@ void LogManager::set_snapshot(const SnapshotMeta* meta) {
     // (2.3.1) 快照包含的日志长度比当前节点日志长度大，
     //         这种情况只可能发生在从 Leader 下载过来的 snapshot
     //         将当前节点的所有日志都删除掉
-    // last_included_index > last_index
+    // lastIncludedIndex > lastLogIndex
     if (term == 0) {
         // last_included_index is larger than last_index
         // FIXME: what if last_included_index is less than first_index?
@@ -405,6 +449,7 @@ void LogManager::set_snapshot(const SnapshotMeta* meta) {
     // (2.3.2) 快照包含的日志长度比当前节点日志长度小
     //         这种情况发生在节点重启时
     //         删除上一个快照的日志
+    //  lastIncludedIndex <= lastLogIndex
     } else if (term == meta->last_included_term()) {
         // Truncating log to the index of the last snapshot.
         // We don't truncate log before the latest snapshot immediately since
