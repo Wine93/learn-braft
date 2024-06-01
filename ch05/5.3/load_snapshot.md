@@ -70,7 +70,7 @@ public:
 触发加载快照
 ---
 
-节点在重启或安装完 Leader 的快照后，会触发加载快照。这两种场景都会调用 `FSMCaller::on_snapshot_load` 加载快照，只不过加载快照完成后的回调函数不同：
+节点在重启或下载完 Leader 的快照后，会触发加载快照。这两种场景都会调用 `FSMCaller::on_snapshot_load` 加载快照，只不过加载快照完成后的回调函数不同：
 
 * 重启：`FirstSnapshotLoadDone`
 * 安装快照：`InstallSnapshotDone`
@@ -80,7 +80,7 @@ public:
 节点重启时会遍历快照存储目录，获取最新的快照目录，将其打开并返回 `SnapshotReader`，然后调用 `FSMCaller::on_snapshot_load` 加载快照，并同步等待其加载完成：
 
 ```cpp
-// (1) 重启时，调用 `init_snapshot_storage` 加载快照
+// (1) 重启时，调用 init_snapshot_storage 加载快照
 int NodeImpl::init(const NodeOptions& options) {
     ...
     // snapshot storage init and load
@@ -92,7 +92,7 @@ int NodeImpl::init(const NodeOptions& options) {
     return 0;
 }
 
-// (2) `init_snapshot_storage` 会调用 `SnapshotExecutor::init`
+// (2) init_snapshot_storage 会调用 SnapshotExecutor::init
 int NodeImpl::init_snapshot_storage() {
     ...
     return _snapshot_executor->init(opt);
@@ -112,7 +112,7 @@ int SnapshotExecutor::init(const SnapshotExecutorOptions& options) {
     ...
     // (5) 生成快照加载完成后的回调函数
     FirstSnapshotLoadDone done(this, reader);
-    // (6) 调用 `FSMCaller::on_snapshot_load` 加载快照
+    // (6) 调用 FSMCaller::on_snapshot_load 加载快照
     CHECK_EQ(0, _fsm_caller->on_snapshot_load(&done));
     // (7) 等待快照加载完毕
     done.wait_for_run();
@@ -123,21 +123,21 @@ int SnapshotExecutor::init(const SnapshotExecutorOptions& options) {
 
 **场景 2：安装快照**
 
-当节点下载完 Leader 的快照时，会调用 `load_downloading_snapshot` 加载快照。关于安装快照相关流程，可以参考[<5.2 安装快照>](/ch05/5.2/install.md)。
+当节点下载完 Leader 的快照时，会调用 `load_downloading_snapshot` 加载快照。关于安装快照相关流程，可以参考[<5.2 安装快照>](/ch05/5.2/install_snapshot.md)：
 
 ```cpp
 void SnapshotExecutor::load_downloading_snapshot(DownloadingSnapshot* ds,
                                                  const SnapshotMeta& meta) {
     ...
-    // (1) 打开从 Leader 下载的快照目录，返回 `SnapshotReader`
+    // (1) 打开从 Leader 下载的快照目录，返回 SnapshotReader
     SnapshotReader* reader = _cur_copier->get_reader();
     ...
     _snapshot_storage->close(_cur_copier);
     ...
-    // (2) 生成快照加载完毕后的回调函数
+    // (2) 生成快照加载完成后的回调函数
     InstallSnapshotDone* install_snapshot_done =
             new InstallSnapshotDone(this, reader);
-    // (3) 调用 `FSMCaller::on_snapshot_load` 加载快照
+    // (3) 调用 FSMCaller::on_snapshot_load 加载快照
     int ret = _fsm_caller->on_snapshot_load(install_snapshot_done);
     ...
 }
