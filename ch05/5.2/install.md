@@ -26,6 +26,18 @@
 快照属性
 ---
 
+当安装快照遇到本地创建快照时，会产生一些混淆，下面将介绍本地创建快照和安装快照的一些属性：
+
+* Leader 和 Follower 都是各自创建本地快照
+* 当 Follower 落后太多时，就需要安装快照
+  * 安装快照时，Leader 会停止向其同步日志
+  * 安装快照的流程包括从 Leader 下载快照以及加载快照
+  * 安装快照成功后，会删除本地的快照和所有的日志，此时 Follower 只有一个来自 Leader 的快照
+* 本地快照的创建与安装快照是互斥的，其自身之间也是互斥的：
+  * 当触发创建快照时，发现有快照正在安装，则返回失败；反之亦然
+  * 当触发创建快照时，如果有快照正在创建，则返回失败；安装快照亦是如此（安装由 Leader 控制，此情况一般不会发生）
+* 对于 Leader 来说，当其的快照正在供 Leader 下载时（即其已经下发安装快照指令，待未收到响应），其依旧可以创建本地快照。只不过在创建完本地快照后，因为上一个快照仍在供 Follower 下载，不会立即删除，直到 Follower 安装完毕。
+
 大文件下载
 ---
 
@@ -65,24 +77,55 @@ Follwer 从 Leader 下载的快照文件会保存在临时快照 `temp` 目录�
 
 当一个 Raft 进程挂掉一段时间后重启，其可能会从 Leader 下载快照。特别地，当一个进程上跑着大量的 `Raft Group`，而每一个 `Node` 都需要从 Leader 下载快照，这时候下载的数据量将是庞大的，可能会占满 Leader 和 Follower 的网卡和磁盘带宽，影响正常的 `IO`。为此，braft 提供了相应的快照限流特性。
 
+限流作用于以下两个维度：
+* 任务个数：节点每开启一个安装快照任务，任务计数将加一（该限制仅作用于 Follower)
+* 带宽：Leader 读取本地快照或 Follower 从 Leader 下载文件写入临时快照，带宽计数将增加对应的字节数。总的来说，其作用的是磁盘带宽和网络带宽
+
+快照限流默认是关闭的，用户需要实现 [SnapshotThrottle](https://github.com/baidu/braft/blob/master/src/braft/snapshot_throttle.h#L26)，并在构建 `Node` 时将其通过 `NodeOptions` 传递给 braft：
+
+```cpp
+struct NodeOptions {
+    ...
+    // If non-null, we will pass this snapshot_throttle to SnapshotExecutor
+    // Default: NULL
+    scoped_refptr<SnapshotThrottle>* snapshot_throttle;
+    ...
+};
+```
+
+当然了，框架也提供了默认的 `SnapshotThrottle` 实现，即 [ThroughputSnapshotThrottle][ThroughputSnapshotThrottle]，具体算法实现见[限流算法][限流算法]，用户构建时可控制带宽大小：
+
+```cpp
+class ThroughputSnapshotThrottle : public SnapshotThrottle {
+public:
+    ThroughputSnapshotThrottle(int64_t throttle_throughput_bytes, int64_t check_cycle);
+    ...
+private:
+    // user defined throughput threshold for raft, bytes per second
+    int64_t _throttle_throughput_bytes;
+    // user defined check cycles of throughput per second
+    int64_t _check_cycle;
+    ...
+};
+```
+
+此外，[ThroughputSnapshotThrottle][ThroughputSnapshotThrottle] 还提供了一些动态配置项来控制并发任务个数以及带宽大小：
 ```cpp
 // used to increase throttle threshold dynamically when user-defined
 // threshold is too small in extreme cases.
 // notice that this flag does not distinguish disk types(sata or ssd, and so on)
+DEFINE_bool(raft_enable_throttle_when_install_snapshot, true,
+            "enable throttle when install snapshot, for both leader and follower");
+                    ::brpc::PassValidate);
 DEFINE_int64(raft_minimal_throttle_threshold_mb, 0,
             "minimal throttle throughput threshold per second");
-BRPC_VALIDATE_GFLAG(raft_minimal_throttle_threshold_mb,
                     brpc::NonNegativeInteger);
 DEFINE_int32(raft_max_install_snapshot_tasks_num, 1000,
              "Max num of install_snapshot tasks per disk at the same time");
-BRPC_VALIDATE_GFLAG(raft_max_install_snapshot_tasks_num,
                     brpc::PositiveInteger);
-
-DEFINE_bool(raft_enable_throttle_when_install_snapshot, true,
-            "enable throttle when install snapshot, for both leader and follower");
-BRPC_VALIDATE_GFLAG(raft_enable_throttle_when_install_snapshot,
-                    ::brpc::PassValidate);
 ```
+
+由于传递的限流对象是一个指针，用户可以指定哪些 `Node` 共用同一个限流对象，来实现各个级别的限流策略，如针对每块盘或每个 `Raft Group`。
 
 相关 RPC
 ---
@@ -972,6 +1015,8 @@ void Replicator::_on_install_snapshot_returned(
 ```
 
 [ApplyTaskQueue]: /ch02/2.1/init.md#applytaskqueue
+[ThroughputSnapshotThrottle]: https://github.com/baidu/braft/blob/master/src/braft/snapshot_throttle.h#L53
+[限流算法]: https://github.com/baidu/braft/blob/master/src/braft/snapshot_throttle.cpp#L49
 
 <!--
 TODO

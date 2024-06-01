@@ -26,27 +26,6 @@
 
 ![图 5.1  创建快照整体流程](image/5.1.png)
 
-<!--
-异步快照
----
-
-如以下图 5.1 所示，快照任务是进入 [ApplyTaskQueue][ApplyTaskQueue]，如果快照是同步执行的话会阻塞后续日志的 `on_apply`，所以一般快照都是异步 + COW 执行：
-
-这样就会导致同一条日志在状态机中应用两次，所以需要状态机保证幂等性。
-
-```cpp
-on_snapshot_save() {
-    // 1.  new bthread
-    bthread.run(do_real_snapshot)
-    // 2. return
-}
-
-do_real_snapshot() {
-    // 3. do real snapshot
-}
-```
--->
-
 快照结构
 ---
 
