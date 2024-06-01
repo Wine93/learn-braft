@@ -180,7 +180,7 @@ int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
 }
 ```
 
-`FSMCaller::do_snapshot_load` 是加载快照的主干函数， 在该函数中主要做以下几件事，每一件事我们将在下面逐一介绍：
+`FSMCaller::do_snapshot_load` 是加载快照的主干函数，在该函数中主要做以下几件事，而每一件事我们将在下面详细介绍：
 
 ```cpp
 void FSMCaller::do_snapshot_load(LoadSnapshotClosure* done) {
