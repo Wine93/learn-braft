@@ -263,7 +263,7 @@ private:
 load_meta
 ---
 
-用户可调用 `load_meta` 函数获取快照的元数据。该函数会快照元数据返回给用户：
+`load_meta` 接口会将快照元数据返回给用户：
 
 ```cpp
 int LocalSnapshotReader::load_meta(SnapshotMeta* meta) {
@@ -278,7 +278,7 @@ int LocalSnapshotReader::load_meta(SnapshotMeta* meta) {
 list_files
 ---
 
-用户可以调用 `list_files` 接口获取当前快照下的所有文件列表。该函数会从快照元数据中返回快照中所有文件的相对路径：
+`list_files` 接口会从快照元数据中返回当前快照中所有文件的相对路径：
 
 ```cpp
 void LocalSnapshotReader::list_files(std::vector<std::string> *files) {
@@ -346,8 +346,8 @@ void SnapshotExecutor::on_snapshot_load_done(const butil::Status& st) {
         _node->update_configuration_after_installing_snapshot();
     }
 
-    // (3) 如果当前是安装快照下的回调函数，则设置 InstallSnapshotResponse 相应字段
-    //     并发送响应
+    // (3) 如果当前是安装快照下的回调函数，
+    //     则设置 InstallSnapshot 响应，并发送响应
     if (m) {
         // Respond RPC
         if (!st.ok()) {
@@ -435,13 +435,15 @@ void LogManager::set_snapshot(const SnapshotMeta* meta) {
 ```cpp
 void NodeImpl::update_configuration_after_installing_snapshot() {
     ...
-    // _conf 为当前节点配置
+    // (1) _conf 为当前节点配置
     _log_manager->check_and_set_configuration(&_conf);
 }
 
 bool LogManager::check_and_set_configuration(ConfigurationEntry* current) {
     ...
+    // (2) 获得之前从快照元数据中保存的节点配置
     const ConfigurationEntry& last_conf = _config_manager->last_configuration();
+    // (3) 将其设为当前节点配置
     if (current->id != last_conf.id) {
         *current = last_conf;
         return true;
