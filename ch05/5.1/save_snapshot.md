@@ -487,17 +487,17 @@ void* SaveSnapshotDone::continue_run(void* arg) {
 int SnapshotExecutor::on_snapshot_save_done(
     const butil::Status& st, const SnapshotMeta& meta, SnapshotWriter* writer) {
     ...
-    // (1) 将快照元数据保存到 LocalSnapshotMetaTable，等待持久化
+    // (1.1) 将快照元数据保存到 LocalSnapshotMetaTable，等待持久化
     if (writer->save_meta(meta)) {
         ...
     }
 
-    // (2) 调用 LocalSnapshotStorage::close 完成写入元数据、将快照 rename 成正式快照等工作
+    // (1.2) 调用 LocalSnapshotStorage::close 完成写入元数据、将快照 rename 成正式快照等工作
     if (_snapshot_storage->close(writer) != 0) {
         ...
     }
 
-    // (3) 调用 LogManager::set_snapshot 删除上一个快照对应的日志
+    // (1.3) 调用 LogManager::set_snapshot 删除上一个快照对应的日志
     if (ret == 0) {
         _last_snapshot_index = meta.last_included_index();
         _last_snapshot_term = meta.last_included_term();
@@ -596,13 +596,13 @@ int LocalSnapshotWriter::sync() {
 }
 
 int LocalSnapshotMetaTable::save_to_file(FileSystemAdaptor* fs, const std::string& path) const {
-    // (1) _meta 中保存的是 lastIncludeIndex，lastIncludedTerm 以及集群配置
+    // (1.1) _meta 中保存的是 lastIncludeIndex，lastIncludedTerm 以及集群配置
     LocalSnapshotPbMeta pb_meta;
     if (_meta.IsInitialized()) {
         *pb_meta.mutable_meta() = _meta;
     }
 
-    // (2) 将所有文件列表加入到 proto
+    // (1.2) 将所有文件列表加入到 proto
     for (Map::const_iterator
             iter = _file_map.begin(); iter != _file_map.end(); ++iter) {
         LocalSnapshotPbMeta::File *f = pb_meta.add_files();
@@ -610,7 +610,7 @@ int LocalSnapshotMetaTable::save_to_file(FileSystemAdaptor* fs, const std::strin
         *f->mutable_meta() = iter->second;
     }
 
-    // (3) 序列化并持久化到文件
+    // (1.3) 序列化并持久化到文件
     ProtoBufFile pb_file(path, fs);
     int ret = pb_file.save(&pb_meta, raft_sync_meta());
     ...
