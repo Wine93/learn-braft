@@ -10,7 +10,7 @@
 2. 节点会将任务放进 [ApplyTaskQueue][ApplyTaskQueue]，等待其被执行
 3. 当任务被执行时，会创建一个 `temp` 目录用来保存临时快照，并返回一个 `SnapshotWriter`
 4. 以 `SnapshotWriter` 和 `Closure` 做为参数调用用户状态机的 `on_snapshot_save`
-5. 用户需通过 `SnapshotWriter` 将状态数据写入到临时快照中
+5. 用户需通过 `SnapshotWriter` 将状态数据写入到临时快照中：
     * 5.1 调用 `SnapshotWriter::get_path` 获得快照目录绝对路径，并将快照文件写入该目录
     * 5.2 调用 `SnapshotWriter::add_file` 将快照文件相对路径添加至快照元数据中
 6. 待数据写入完成，用户需回调 `Closure` 将其转换为正式快照：
@@ -21,8 +21,6 @@
 7. 至此，快照创建完成
 
 流程整体分为以下 3 个阶段：创建临时快照（1-3），用户写入数据（4-5），转为正式快照（6-7）
-
-[ApplyTaskQueue]: /ch02/2.1/init.md#applytaskqueue
 
 ![图 5.1  创建快照整体流程](image/5.1.png)
 
@@ -35,7 +33,7 @@
 
 正式快照目录以当时创建快照时的 `applyIndex` 命名，如 `snapshot_00000000000000002000`。
 
-快照目录下除了用户写入的快照文件集外，还有一个框架写入的元数据文件 `__raft_snapshot_meta`，元数据主要保存以下 2 部分信息：
+快照目录下除了用户写入的快照文件集合外，还有一个框架写入的元数据文件 `__raft_snapshot_meta`，元数据主要保存以下 2 部分信息：
 
 * 快照中每一个文件的相对路径
 * 快照中包含的最后日志的 `index` 和 `term`，以及集群配置
@@ -148,7 +146,7 @@ public:
 触发快照任务
 ---
 
-节点有以下 2 种方式触发快照任务，其最终都是调用 `NodeImpl::do_snapshot` 执行快照任务
+节点有以下 2 种方式触发快照任务，其最终都是调用 `NodeImpl::do_snapshot` 执行快照任务。
 
 * 快照定时器超时：
 
@@ -164,6 +162,7 @@ void NodeImpl::handle_snapshot_timeout() {
 ```
 
 * 用户手动触发：
+
 ```cpp
 void Node::snapshot(Closure* done) {
     _impl->snapshot(done);
@@ -286,7 +285,7 @@ int LocalSnapshotWriter::init() {
 }
 ```
 
-调用 `on_snapshot_save`
+任务入队执行
 ---
 
 创建好 `temp` 目录后，会调用 `FSMCaller::on_snapshot_save` 将快照任务放入 [ApplyTaskQueue][applytaskqueue]，等待其被执行：
@@ -679,6 +678,8 @@ void LogManager::set_snapshot(const SnapshotMeta* meta) {
     ...
 }
 ```
+
+[ApplyTaskQueue]: /ch02/2.1/init.md#applytaskqueue
 
 <!--
 其他：创建快照失败
