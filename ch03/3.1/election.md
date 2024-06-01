@@ -10,7 +10,7 @@
 4. 在投票超时时间（`vote_timeout_ms`）内若收到足够多的选票则成为 Leader；若有收到更高 `term` 的响应则转变为 Follower 并重复步骤 1；否则等待投票超时后转变为 Follower 并重复步骤 2
 5. 成为 Leader
     * 5.1 将自身角色转变为 Leader
-    * 5.2 对所有 Follower 定期广播心跳
+    * 5.2 为所有 Follower 创建 `Replicator`，并对所有 Follower 定期广播心跳
     * 5.3 通过发送空的 `AppendEntries` 请求来确定各 Follower 的 `nextIndex`
     * 5.4 将之前任期的日志全部复制给 Follower（**只复制不提交，不更新 commitIndex**）
     * 5.5 通过复制并提交一条本任期的配置日志来提交之前任期的日志，提交后日志就可以 apply了
