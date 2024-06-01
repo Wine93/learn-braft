@@ -219,7 +219,7 @@ void SnapshotExecutor::do_snapshot(Closure* done) {
         return;
     }
 
-    // (4) 调用 `LocalSnapshotStorage::create` 创建 temp 目录用于保存临时快照
+    // (4) 调用 LocalSnapshotStorage::create 创建 temp 目录用于保存临时快照
     //     并返回 SnapshotWriter
     SnapshotWriter* writer = _snapshot_storage->create();
     ...
@@ -263,7 +263,7 @@ SnapshotWriter* LocalSnapshotStorage::create(bool from_empty) {
             }
         }
 
-        // (2) 调用 `LocalSnapshotWriter::init` 创建 temp 目录
+        // (2) 调用 LocalSnapshotWriter::init 创建 temp 目录
         writer = new LocalSnapshotWriter(snapshot_path, _fs.get());
         if (writer->init() != 0) {
             ...
@@ -351,7 +351,7 @@ void FSMCaller::do_snapshot_save(SaveSnapshotClosure* done) {
         *meta.add_old_peers() = iter->to_string();
     }
 
-    // (1.4) 将元数据保存在 `Closure` 中
+    // (1.4) 将元数据保存在 Closure 中
     SnapshotWriter* writer = done->start(meta);
     ...
     // (2) 调用用户状态机 on_snapshot_save
@@ -451,7 +451,7 @@ int LocalSnapshotMetaTable::add_file(const std::string& filename,
 调用 `Closure`
 ---
 
-用户完成快照的创建后，会调用 `Closure` 即 `SaveSnapshotDone::Run()`，而该函数会将临时快照 `rename` 成正式快照，并删除上一个快照，以及删除上一个快照对应的日志。
+用户完成快照的创建后，需调用 `Closure`，即 `SaveSnapshotDone::Run()`，而该函数会将临时快照 `rename` 成正式快照，并删除上一个快照，以及删除上一个快照对应的日志。
 
 用户调用 `SaveSnapshotDone::Run`，该函数主要执行以下 2 件事：
 
@@ -468,7 +468,7 @@ void* SaveSnapshotDone::continue_run(void* arg) {
     SaveSnapshotDone* self = (SaveSnapshotDone*)arg;
     ...
     // Must call on_snapshot_save_done to clear _saving_snapshot
-    // (1) 调用 `SnapshotExecutor::on_snapshot_save_done` 执行实际的收尾动作
+    // (1) 调用 SnapshotExecutor::on_snapshot_save_done 执行实际的收尾动作
     int ret = self->_se->on_snapshot_save_done(
         self->status(), self->_meta, self->_writer);
     }
@@ -487,13 +487,12 @@ void* SaveSnapshotDone::continue_run(void* arg) {
 int SnapshotExecutor::on_snapshot_save_done(
     const butil::Status& st, const SnapshotMeta& meta, SnapshotWriter* writer) {
     ...
-    // (1) 将快照元数据保存到 `LocalSnapshotMetaTable`，等待持久化
+    // (1) 将快照元数据保存到 LocalSnapshotMetaTable，等待持久化
     if (writer->save_meta(meta)) {
-        LOG(WARNING) << "node " << _node->node_id() << " fail to save snapshot";
-        ret = EIO;
+        ...
     }
 
-    // (2) 调用 LocalSnapshotStorage::close 写入元数据和将快照转换成正式快照等工作
+    // (2) 调用 LocalSnapshotStorage::close 完成写入元数据、将快照 rename 成正式快照等工作
     if (_snapshot_storage->close(writer) != 0) {
         ...
     }
@@ -547,7 +546,7 @@ int LocalSnapshotStorage::close(SnapshotWriter* writer_base,
     LocalSnapshotWriter* writer = dynamic_cast<LocalSnapshotWriter*>(writer_base);
     do {
         ...
-        // (1) 将快照元数据写入文件
+        // (1) 调用 LocalSnapshotWriter::sync 将快照元数据写入文件
         ret = writer->sync();
         ...
         //
@@ -586,7 +585,7 @@ int LocalSnapshotStorage::close(SnapshotWriter* writer_base,
 }
 ```
 
-`sync` 会调用 `save_to_file` 将元数据填充到 `proto`（`LocalSnapshotPbMeta`）中，并将其序列化，最终持久化到文件：
+`LocalSnapshotWriter::sync` 会调用 `save_to_file` 将元数据填充到 `proto`（`LocalSnapshotPbMeta`）中，并将其序列化，最终持久化到文件：
 
 ```cpp
 int LocalSnapshotWriter::sync() {
