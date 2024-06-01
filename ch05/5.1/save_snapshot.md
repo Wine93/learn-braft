@@ -448,7 +448,7 @@ int LocalSnapshotMetaTable::add_file(const std::string& filename,
 阶段三：转为正式快照
 ===
 
-调用 `Closure`
+调用 Closure
 ---
 
 用户完成快照的创建后，需调用 `Closure`，即 `SaveSnapshotDone::Run()`，而该函数会将临时快照 `rename` 成正式快照，并删除上一个快照，以及删除上一个快照对应的日志。

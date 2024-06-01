@@ -4,17 +4,14 @@
 流程概览
 ---
 
-当节点重启后或安装来自 Leader 的快照后，会进行加载快照来恢复状态机，其流程如下：
+当节点重启或安装来自 Leader 的快照后，会进行加载快照来恢复状态机，其流程如下：
 1. 节点会将加载快照任务放进 [ApplyTaskQueue][ApplyTaskQueue]，等待其被执行
-2. 当任务被执行时，会打开本地快照目录，返回 `SnapshotReader`
+2. 当任务被执行时，会打开本地快照目录，并返回 `SnapshotReader`
 3. 将 `SnapshotReader` 作为参数调用用户状态机的 `on_snapshot_load`
 4. 等待快照加载完成
-   * 4.1
-   * 4.2
-5. 根据快照元数据中的节点配置，调用用户状态机的 `on_configuration_committed`
+5. 以快照元数据中的节点配置作为参数，调用用户状态机的 `on_configuration_committed`
 6. 更新 `applyIndex` 为快照元数据中的 `lastIncludedIndex`
 7. 将快照元数据中的节点配置设为当前节点配置
-
 
 相关接口
 ---
@@ -30,8 +27,6 @@ public:
     // Default: Load nothing and returns error.
     virtual int on_snapshot_load(::braft::SnapshotReader* reader);
 
-    // Invoked when a configuration has been committed to the group
-    virtual void on_configuration_committed(const ::braft::Configuration& conf);
     virtual void on_configuration_committed(const ::braft::Configuration& conf, int64_t index);
 };
 ```
@@ -148,10 +143,10 @@ void SnapshotExecutor::load_downloading_snapshot(DownloadingSnapshot* ds,
 }
 ```
 
-任务入队
+任务入队执行
 ---
 
-`on_snapshot_load` 会将加载快照任务放进 [ApplyTaskQueue][ApplyTaskQueue]，等待其被执行：
+`on_snapshot_load` 会将加载快照任务放入 [ApplyTaskQueue][ApplyTaskQueue]，等待其被执行：
 
 ```cpp
 int FSMCaller::on_snapshot_load(LoadSnapshotClosure* done) {
@@ -162,21 +157,16 @@ int FSMCaller::on_snapshot_load(LoadSnapshotClosure* done) {
 }
 ```
 
-执行加载快照
----
-
-队列的消费函数 `run` 会调用 `FSMCaller::do_snapshot_load` 执加载快照：
+队列消费函数会调用 `FSMCaller::do_snapshot_load` 执行加载快照任务：
 
 ```cpp
 int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
     ...
     for (; iter; ++iter) {
-        ...
         switch (iter->type) {
         ...
         case SNAPSHOT_LOAD:
             caller->_cur_task = SNAPSHOT_LOAD;
-            ...
             if (caller->pass_by_status(iter->done)) {
                 caller->do_snapshot_load((LoadSnapshotClosure*)iter->done);
             }
@@ -189,7 +179,7 @@ int FSMCaller::run(void* meta, bthread::TaskIterator<ApplyTask>& iter) {
 }
 ```
 
-`do_snapshot_load` 函数会做以下几件事：
+在 `FSMCaller::do_snapshot_load` 函数中主要做以下几件事：
 
 ```cpp
 void FSMCaller::do_snapshot_load(LoadSnapshotClosure* done) {
@@ -204,7 +194,7 @@ void FSMCaller::do_snapshot_load(LoadSnapshotClosure* done) {
         return;
     }
 
-    // (2) 调用用户状态机的 `on_snapshot_load` 加载快照
+    // (2) 调用用户状态机的 on_snapshot_load 加载快照
     ret = _fsm->on_snapshot_load(reader);
     if (ret != 0) {
         done->status().set_error(ret, "StateMachine on_snapshot_load failed");
@@ -214,7 +204,7 @@ void FSMCaller::do_snapshot_load(LoadSnapshotClosure* done) {
     }
 
     // (3) 获取快照元数据中的节点配置，
-    //     并以该配置调用用户状态机的 `on_configuration_committed`
+    //     并以该配置调用用户状态机的 on_configuration_committed
     if (meta.old_peers_size() == 0) {
         // Joint stage is not supposed to be noticeable by end users.
         Configuration conf;
@@ -255,43 +245,25 @@ public:
 get_path
 ---
 
-用户需要调用 `get_path` 接口获取快照目录的绝对路径，所有快照的文件集都位于该目录下：
+`get_path` 接口会返回快照目录的绝对路径，所有快照的文件集都位于该目录下：
 
 ```cpp
-class SnapshotReader : public Snapshot {
-public:
-    ...
-};
-
-class Snapshot : public butil::Status {
-public:
-    virtual std::string get_path() = 0;
-};
-```
-
-```cpp
-class LocalSnapshotReader: public SnapshotReader {
+class LocalSnapshotReader : public SnapshotReader {
 friend class LocalSnapshotStorage;
 public:
     ...
     // Get the path of the Snapshot
     virtual std::string get_path() { return _path; }
+private:
+    ...
+    std::string _path;
+    ...
 ```
 
 load_meta
 ---
 
-用户可调用 `load_meta` 函数获取快照的元数据：
-
-```cpp
-class SnapshotReader : public Snapshot {
-public:
-    // Load meta from
-    virtual int load_meta(SnapshotMeta* meta) = 0;
-};
-```
-
-该函数会将已经加载过保存在内存中的快照元数据返回给用户：
+用户可调用 `load_meta` 函数获取快照的元数据。该函数会快照元数据返回给用户：
 
 ```cpp
 int LocalSnapshotReader::load_meta(SnapshotMeta* meta) {
@@ -306,22 +278,7 @@ int LocalSnapshotReader::load_meta(SnapshotMeta* meta) {
 list_files
 ---
 
-用户可以调用 `list_files` 接口获取当前快照下的所有文件列表：
-
-```cpp
-class SnapshotReader : public Snapshot {
-public:
-    ...
-};
-
-class Snapshot : public butil::Status {
-public:
-    // List all the existing files in the Snapshot currently
-    virtual void list_files(std::vector<std::string> *files) = 0;
-};
-```
-
-`list_files` 函数会从快照元数据中返回快照中所有文件的相对路径：
+用户可以调用 `list_files` 接口获取当前快照下的所有文件列表。该函数会从快照元数据中返回快照中所有文件的相对路径：
 
 ```cpp
 void LocalSnapshotReader::list_files(std::vector<std::string> *files) {
@@ -341,11 +298,10 @@ void LocalSnapshotMetaTable::list_files(std::vector<std::string>* files) const {
 }
 ```
 
-
 阶段三：完成快照加载
 ===
 
-调用 `Closure`
+调用 Closure
 ---
 
 我们上面提到了，对于节点重启和安装快照这两种不同的加载快照场景，会设置不同的回调函数，但是其最终都会调用 `SnapshotExecutor::on_snapshot_load_done` 来做收尾工作：
