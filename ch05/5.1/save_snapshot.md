@@ -363,7 +363,7 @@ void FSMCaller::do_snapshot_save(SaveSnapshotClosure* done) {
 阶段二：用户写入数据
 ===
 
-`on_snapshot_save`
+on_snapshot_save
 ---
 
 用户需要实现状态机的 `on_snapshot_save` 函数，在该函数中用户需要做以下 3 件事：
