@@ -9,7 +9,8 @@
 3. Leader 向本地追加日志：
    * 3.1 为日志分配 `index`，并将其追加到内存存储中
    * 3.2 异步将内存中的日志持久化到磁盘
-4. Leader 将内存中的日志通过 `AppendEntries` 请求并行地复制给所有 Follower
+   * 3.3 唤醒所有 `Replicator` 准备向 Follower 同步日志
+4. Leader 的 `Replicator` 将内存中的日志通过 `AppendEntries` 请求并行地复制给所有 Follower
 5. Follower 收到 `AppenEntries` 请求，将日志持久化到本地后返回成功响应
 6. Leader 若收到大多数确定，则提交日志，更新 `commitIndex` 并应用日志
 7. Leader 调用用户状态机的 `on_apply` 应用日志
