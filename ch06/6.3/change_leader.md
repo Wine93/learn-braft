@@ -6,17 +6,19 @@
 
 1. 用户调用 `transfer_leadership_to` 接口转移 Leader
 2. 若当前 Leader 正在转移或有配置变更正在进行中，则返回 `EBUSY`
-3. Leader 将自身状态设为 `TRANSFERRING`，此时所有的 `apply` 会报错，Leader 停止写入，无新增日志
+3. Leader 将自身状态设为 `Transferring`，此时所有的 `apply` 会报错，Leader 停止写入，无新增日志
 4. 判断目标节点日志是否和当前 Leader 一样多：
-   * 4.1 如果是的话，向对应节点发送 `TimeoutNow` 请求开始重新选举
+   * 4.1 如果是的话，向目标节点发送 `TimeoutNow` 请求开始重新选举
    * 4.2 否则，继续在后台向 Follower 同步日志，每成功同步一批日志，就重复步骤 4
 5. 调用用户状态机的 `on_leader_stop`
 6. 启动转移超时定时器；该步骤后，`transfer_leadership_to` 接口返回成功，但变更仍在继续
-7. 节点收到 `TimeoutNow` 请求后：
-   * 7.1 设置 `TimeoutNow` 响应中的 `term` 为自身 `term` 加一
+7. 节点收到 `TimeoutNow` 请求后，并行进行以下 2 件事：
+   * 7.1 设置 `TimeoutNow` 响应中的 `term` 为自身 `term` 加一，并发送响应
    * 7.2 立马变为 `Candidate` 并自增 `term` 进行选举（跳过 `PreVote` 阶段）
 8. Leader 收到 `TimeoutNow` 响应后，发现目标节点的 `term` 比自身大，则开始 `step_down` 成 Follower
-9.  如果在 `election_timeout_ms` 时间内 Leader 没有 `step_down`，则取消迁移操作，开始重新接受写入请求
+9. 如果在 `election_timeout_ms` 时间内 Leader 没有 `step_down`，则取消迁移操作：
+    * 调用状态机的 `on_leader_start`
+    * 将自身状态变为 `Leader`，并开始重新接受写入请求
 
 相关 RPC
 ---
@@ -57,14 +59,21 @@ public:
 阶段一：开始转移 Leader
 ===
 
+transfer_leadership_to
+---
+
+用户调用 `transfer_leadership_to` 开始转移 Leader，其流程见以下注释：
+
 ```cpp
 int NodeImpl::transfer_leadership_to(const PeerId& peer) {
     std::unique_lock<raft_mutex_t> lck(_mutex);
+    // (1) 如果当前 Leader 正在转移，则返回 EBUSY
     if (_state != STATE_LEADER) {
-        LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                     << " is in state " << state2str(_state);
+        ...
         return _state == STATE_TRANSFERRING ? EBUSY : EPERM;
     }
+
+    // (2) 如果当前 Leader 有配置变更正在进行中，则返回 EBUSY
     if (_conf_ctx.is_busy() /*FIXME: make this expression more readable*/) {
         // It's very messy to deal with the case when the |peer| received
         // TimeoutNowRequest and increase the term while somehow another leader
@@ -78,173 +87,223 @@ int NodeImpl::transfer_leadership_to(const PeerId& peer) {
         // invoke transfer_leadership_to after configuration changing is
         // completed so that the peer's configuration is up-to-date when it
         // receives the TimeOutNowRequest.
-        LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                     << " refused to transfer leadership to peer " << peer
-                     << " when the leader is changing the configuration";
+        ...
         return EBUSY;
     }
 
+    // (3) 对目标 PeerId 做一些检查
     PeerId peer_id = peer;
     // if peer_id is ANY_PEER(0.0.0.0:0:0), the peer with the largest
     // last_log_id will be selected.
     if (peer_id == ANY_PEER) {
-        LOG(INFO) << "node " << _group_id << ":" << _server_id
-                  << " starts to transfer leadership to any peer.";
+        ...
         // find the next candidate which is the most possible to become new leader
         if (_replicator_group.find_the_next_candidate(&peer_id, _conf) != 0) {
             return -1;
         }
     }
     if (peer_id == _server_id) {
-        LOG(INFO) << "node " << _group_id << ":" << _server_id
-                  << " transfering leadership to self";
+        ...
         return 0;
     }
+
     if (!_conf.contains(peer_id)) {
-        LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                     << " refused to transfer leadership to peer " << peer_id
-                     << " which doesn't belong to " << _conf.conf;
+        ...
         return EINVAL;
     }
+
+    // (4) 记录当前日志的的 lastLogIndex，
+    //     并调用 ReplicatorGroup::transfer_leadership_to 来目标节点日志是否和当前 Leader 一样多
+    //     见以下 <判断差距>
     const int64_t last_log_index = _log_manager->last_log_index();
     const int rc = _replicator_group.transfer_leadership_to(peer_id, last_log_index);
-    if (rc != 0) {
-        if (rc == EINVAL) {
-            LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                     << " fail to transfer leadership, no such peer=" << peer_id;
-        } else if (rc == EHOSTUNREACH) {
-            LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                     << " fail to transfer leadership, peer=" << peer_id
-                     << " whose consecutive_error_times not 0.";
-        } else {
-            LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                     << " fail to transfer leadership, peer=" << peer_id
-                     << " err: " << berror(rc);
-        }
-        return rc;
-    }
+    ...
+    // (5) 将状态设为 Transferring，此时将停止写入，所有 apply 都会报错
+    //     见以下 <停止写入>
     _state = STATE_TRANSFERRING;
-    butil::Status status;
-    status.set_error(ETRANSFERLEADERSHIP, "Raft leader is transferring "
-            "leadership to %s", peer_id.to_string().c_str());
-    _leader_lease.on_leader_stop();
+    ...
+    // (6) 调用用户状态机的 on_leader_stop
     _fsm_caller->on_leader_stop(status);
-    LOG(INFO) << "node " << _group_id << ":" << _server_id
-              << " starts to transfer leadership to " << peer_id;
-    _stop_transfer_arg = new StopTransferArg(this, _current_term, peer_id);
+    ...
+    // (7) 启动转移超时定时器，若在 election_timeout_ms 时间内 Leader 没有 step_down,
+    //     则调用 on_transfer_timeout
     if (bthread_timer_add(&_transfer_timer,
                        butil::milliseconds_from_now(_options.election_timeout_ms),
                        on_transfer_timeout, _stop_transfer_arg) != 0) {
-        lck.unlock();
-        LOG(ERROR) << "Fail to add timer";
-        on_transfer_timeout(_stop_transfer_arg);
+        ...
         return -1;
     }
     return 0;
 }
 ```
 
+判断差距
+---
+
+`ReplicatorGroup::transfer_leadership_to` 会在 `ReplicatorGroup` 找到目标节点的 `Replicator`，然后调用其 `_transfer_leadership`。
+
+在 `_transfer_leadership` 中主要判断目标节点的日志是否和当前 Leader 一样多：
+* 如果是的话，直接进入阶段三发送 `TimeoutNow` 请求进行重新选举
+* 否则，保存 `lastLogIndex` 为 `timeoutNowIndex`，并进入阶段二继续同步日志
+
 ```cpp
 int ReplicatorGroup::transfer_leadership_to(
         const PeerId& peer, int64_t log_index) {
+    // (1) 找到对应的 Replicator
     std::map<PeerId, ReplicatorIdAndStatus>::const_iterator iter = _rmap.find(peer);
     if (iter == _rmap.end()) {
         return EINVAL;
     }
-    ReplicatorId rid = iter->second.id;
-    const int consecutive_error_times = Replicator::get_consecutive_error_times(rid);
-    if (consecutive_error_times > 0) {
-        return EHOSTUNREACH;
-    }
+    ...
     return Replicator::transfer_leadership(rid, log_index);
 }
 
-```
-
-
-```cpp
 int Replicator::transfer_leadership(ReplicatorId id, int64_t log_index) {
-    Replicator* r = NULL;
-    bthread_id_t dummy = { id };
-    const int rc = bthread_id_lock(dummy, (void**)&r);
-    if (rc != 0) {
-        return rc;
-    }
-    // dummy is unlock in _transfer_leadership
+    ...
     return r->_transfer_leadership(log_index);
 }
 
+// (2) 最终调用 Replicator 的 _transfer_leadership
 int Replicator::_transfer_leadership(int64_t log_index) {
+    /*
+     * int64_t _min_flying_index() {  // 返回已经成功同步的 logIndex
+     *     return _next_index - _flying_append_entries_size;
+     * }
+     *
+     * (3) 如果目标节点日志和当前 Leader 一样多，
+     *     则直接进入发送 TimeoutNow 请求进行重新选举，
+     *     详见 <阶段三：重新选举>
+     */
     if (_has_succeeded && _min_flying_index() > log_index) {
         // _id is unlock in _send_timeout_now
         _send_timeout_now(true, false);
         return 0;
     }
+
+    // (3.1) 否则，保存 lastLogIndex 为 timeoutNowIndex
+    //       继续同步日志，每通过一批日志，就重判差距
+    //       详见 <阶段二：同步日志>
     // Register log_index so that _on_rpc_returned trigger
     // _send_timeout_now if _min_flying_index reaches log_index
     _timeout_now_index = log_index;
-    CHECK_EQ(0, bthread_id_unlock(_id)) << "Fail to unlock " << _id;
     return 0;
 }
+```
 
-void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
-                     AppendEntriesRequest* request,
-                     AppendEntriesResponse* response,
-                     int64_t rpc_send_time) {
+停止写入
+---
+
+```cpp
+void NodeImpl::apply(LogEntryAndClosure tasks[], size_t size) {
     ...
-    r->_has_succeeded = true;
-    r->_notify_on_caught_up(0, false);
-    // dummy_id is unlock in _send_entries
-    if (r->_timeout_now_index > 0 && r->_timeout_now_index < r->_min_flying_index()) {
-        r->_send_timeout_now(false, false);
+    std::unique_lock<raft_mutex_t> lck(_mutex);
+    ...
+    // (1) 如果当前 Leader 正在转移,则将 status 设为 EPERM
+    if (_state != STATE_LEADER || reject_new_user_logs) {
+        if (_state == STATE_LEADER && reject_new_user_logs) {
+            ...
+        } else if (_state != STATE_TRANSFERRING) {
+            st.set_error(EPERM, "is not leader");
+        } else {
+            ...
+        }
+        ...
+        // (2) 回调所有 Task 的 Closure
+        for (size_t i = 0; i < size; ++i) {
+            tasks[i].entry->Release();
+            if (tasks[i].done) {
+                tasks[i].done->status() = st;
+                run_closure_in_bthread(tasks[i].done);
+            }
+        }
+        return;
     }
-    r->_send_entries();
-    return;
+    ...
 }
 ```
 
 阶段二：同步日志
 ===
 
+`Replicator` 的作用就是不断调用 `_send_entries` 同步日志，直至 Follower 同步了 Leader 的全部日志才在后台等待，详见[<4.1 复制流程>](/ch04/4.1/replicate.md)：
+
+同步日志
+---
+
+```cpp
+void Replicator::_send_entries() {
+    ...
+    // (1) 更新 nextIndex 以及 flyingAppendEntriesSize
+    _next_index += request->entries_size();
+    _flying_append_entries_size += request->entries_size();
+    ...
+    // (2) 向 Follower 发送 AppendEntries 请求来同步日志，
+    //     并设置响应回调函数 _on_rpc_returned
+    google::protobuf::Closure* done = brpc::NewCallback(
+                _on_rpc_returned, _id.value, cntl.get(),
+                request.get(), response.get(), butil::monotonic_time_ms());
+    RaftService_Stub stub(&_sending_channel);
+    stub.append_entries(cntl.release(), request.release(),
+                        response.release(), done);
+    ...
+}
+```
+
+重判差距
+---
+
+每当收到日志复制的 `AppendEntries` 响应，都会回调 `_on_rpc_returned`：
+
+```cpp
+void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
+                     AppendEntriesRequest* request,
+                     AppendEntriesResponse* response,
+                     int64_t rpc_send_time) {
+    ...
+    r->_has_succeeded = true;
+    ...
+    // int64_t _min_flying_index() {  // 返回已经成功同步的 logIndex
+    //     return _next_index - _flying_append_entries_size;
+    // }
+    // (1) 如果 Follower 已经同步了 Leader 的全部日志，则发送 TimeoutNow 请求进行重新选举
+    if (r->_timeout_now_index > 0 && r->_timeout_now_index < r->_min_flying_index()) {
+        r->_send_timeout_now(false, false);
+    }
+    // (2) 如果没有则继续发送日志
+    r->_send_entries();
+    return;
+}
+```
+
 阶段三：重新选举
 ===
 
-发送 `TimeoutNow` 请求
+发送请求
 ---
+
+Leader 调用 `_send_timeout_now` 向目标节点发送 `TimeoutNow` 请求：
 
 ```cpp
 void Replicator::_send_timeout_now(bool unlock_id, bool old_leader_stepped_down,
                                    int timeout_ms) {
     TimeoutNowRequest* request = new TimeoutNowRequest;
     TimeoutNowResponse* response = new TimeoutNowResponse;
-    request->set_term(_options.term);
-    request->set_group_id(_options.group_id);
-    request->set_server_id(_options.server_id.to_string());
+    ...
     request->set_peer_id(_options.peer_id.to_string());
-    request->set_old_leader_stepped_down(old_leader_stepped_down);
-    brpc::Controller* cntl = new brpc::Controller;
-    if (!old_leader_stepped_down) {
-        // This RPC is issued by transfer_leadership, save this call_id so that
-        // the RPC can be cancelled by stop.
-        _timeout_now_in_fly = cntl->call_id();
-        _timeout_now_index = 0;
-    }
-    if (timeout_ms > 0) {
-        cntl->set_timeout_ms(timeout_ms);
-    }
+    ...
     RaftService_Stub stub(&_sending_channel);
     ::google::protobuf::Closure* done = brpc::NewCallback(
             _on_timeout_now_returned, _id.value, cntl, request, response,
             old_leader_stepped_down);
     stub.timeout_now(cntl, request, response, done);
-    if (unlock_id) {
-        CHECK_EQ(0, bthread_id_unlock(_id));
-    }
+    ...
 }
 ```
 
-处理 `TimeoutNow` 请求
+处理请求
 ---
+
+Follower 收到 `TimeoutNow` 请求后，会调用 `handle_timeout_now_request` 处理请求，具体流程见以下注释：
 
 ```cpp
 void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
@@ -252,65 +311,24 @@ void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
                                           TimeoutNowResponse* response,
                                           google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
-    std::unique_lock<raft_mutex_t> lck(_mutex);
-    if (request->term() != _current_term) {
-        const int64_t saved_current_term = _current_term;
-        if (request->term() > _current_term) {
-            butil::Status status;
-            status.set_error(EHIGHERTERMREQUEST, "Raft node receives higher term request.");
-            step_down(request->term(), false, status);
-        }
-        response->set_term(_current_term);
-        response->set_success(false);
-        lck.unlock();
-        LOG(INFO) << "node " << _group_id << ":" << _server_id
-                  << " received handle_timeout_now_request while _current_term="
-                  << saved_current_term << " didn't match request_term="
-                  << request->term();
-        return;
-    }
-    if (_state != STATE_FOLLOWER) {
-        const State saved_state = _state;
-        const int64_t saved_term = _current_term;
-        response->set_term(_current_term);
-        response->set_success(false);
-        lck.unlock();
-        LOG(INFO) << "node " << _group_id << ":" << _server_id
-                  << " received handle_timeout_now_request while state is "
-                  << state2str(saved_state) << " at term=" << saved_term;
-        return;
-    }
-    const butil::EndPoint remote_side = controller->remote_side();
-    const int64_t saved_term = _current_term;
-    if (FLAGS_raft_enable_leader_lease) {
-        // We will disrupt the leader, don't let the old leader
-        // step down.
-        response->set_term(_current_term);
-    } else {
-        // Increase term to make leader step down
-        response->set_term(_current_term + 1);
-    }
+    ...
+    // (1) 设置响应中的 term 为自身 term 加一
+    // Increase term to make leader step down
+    response->set_term(_current_term + 1);
+    ...
     response->set_success(true);
+    // (2) 同时发送相应会调用 elect_self 进行选举
     // Parallelize Response and election
     run_closure_in_bthread(done_guard.release());
     elect_self(&lck, request->old_leader_stepped_down());
-    // Don't touch any mutable field after this point, it's likely out of the
-    // critical section
-    if (lck.owns_lock()) {
-        lck.unlock();
-    }
-    // Note: don't touch controller, request, response, done anymore since they
-    // were dereferenced at this point
-    LOG(INFO) << "node " << _group_id << ":" << _server_id
-              << " received handle_timeout_now_request from "
-              << remote_side << " at term=" << saved_term;
-
+    ...
 }
 ```
 
-
-Leader 收到 `TimeoutNow` 响应
+收到响应
 ---
+
+Leader 在收到 `TimeoutNow` 响应后，会调用 `_on_timeout_now_returned` 进行 `step_down`，并在 `step_down` 函数中移除转移超时定时器：
 
 ```cpp
 void Replicator::_on_timeout_now_returned(
@@ -318,93 +336,79 @@ void Replicator::_on_timeout_now_returned(
                 TimeoutNowRequest* request,
                 TimeoutNowResponse* response,
                 bool old_leader_stepped_down) {
-    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
-    std::unique_ptr<TimeoutNowRequest>  req_guard(request);
-    std::unique_ptr<TimeoutNowResponse> res_guard(response);
-    Replicator *r = NULL;
-    bthread_id_t dummy_id = { id };
-    if (bthread_id_lock(dummy_id, (void**)&r) != 0) {
-        return;
-    }
-
-    std::stringstream ss;
-    ss << "node " << r->_options.group_id << ":" << r->_options.server_id
-       << " received TimeoutNowResponse from "
-       << r->_options.peer_id;
-
-    if (cntl->Failed()) {
-        ss << " fail : " << cntl->ErrorText();
-        BRAFT_VLOG << ss.str();
-
-        if (old_leader_stepped_down) {
-            r->_notify_on_caught_up(ESTOP, true);
-            r->_destroy();
-        } else {
-            CHECK_EQ(0, bthread_id_unlock(dummy_id));
-        }
-        return;
-    }
-    ss << (response->success() ? " success " : "fail:");
-    BRAFT_VLOG << ss.str();
-
+    ...
+    // (1) 如果目标节点的 Term 比自身大，则开始 step_down 成 Follower
     if (response->term() > r->_options.term) {
         NodeImpl *node_impl = r->_options.node;
-        // Acquire a reference of Node here in case that Node is detroyed
-        // after _notify_on_caught_up.
-        node_impl->AddRef();
-        r->_notify_on_caught_up(EPERM, true);
-        butil::Status status;
-        status.set_error(EHIGHERTERMRESPONSE, "Leader receives higher term "
-                "timeout_now_response from peer:%s", r->_options.peer_id.to_string().c_str());
-        r->_destroy();
+        ...
         node_impl->increase_term_to(response->term(), status);
-        node_impl->Release();
+        ...
         return;
     }
-    if (old_leader_stepped_down) {
-        r->_notify_on_caught_up(ESTOP, true);
-        r->_destroy();
-    } else {
-        CHECK_EQ(0, bthread_id_unlock(dummy_id));
-    }
+    ...
 }
-```
 
-```cpp
 int NodeImpl::increase_term_to(int64_t new_term, const butil::Status& status) {
-    BAIDU_SCOPED_LOCK(_mutex);
-    if (new_term <= _current_term) {
-        return EINVAL;
-    }
+    ...
+    // (2) 调用 step_down
     step_down(new_term, false, status);
     return 0;
 }
-```
 
-其他：转移 Leader 超时
-===
+void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate,
+                         const butil::Status& status) {
+    // (3) 变为 Follower
+    // soft state in memory
+    _state = STATE_FOLLOWER;
 
-```cpp
-void on_transfer_timeout(void* arg) {
-    StopTransferArg* a = (StopTransferArg*)arg;
-    a->node->handle_transfer_timeout(a->term, a->peer);
-    delete a;
+    // (4) 投票给目标节点，并持久化 term 和 votedFor
+    // meta state
+    if (term > _current_term) {
+        //TODO: outof lock
+        butil::Status status = _meta_storage->
+                    set_term_and_votedfor(term, _voted_id, _v_group_id);
+        ...
+    }
+    ...
+    // (5) 删除转移超时定时器
+    const int rc = bthread_timer_del(_transfer_timer);
 }
 ```
 
+其他：转移超时
+===
+
+如果在 `election_timeout_ms` 时间内 Leader 没有 `step_down`，则转移超时定时器就会超时，调用 `on_transfer_timeout` 进行处理：
+
 ```cpp
+void on_transfer_timeout(void* arg) {
+    ...
+    // (1) 调用 handle_transfer_timeout
+    a->node->handle_transfer_timeout(a->term, a->peer);
+    ...
+}
+
 void NodeImpl::handle_transfer_timeout(int64_t term, const PeerId& peer) {
-    LOG(INFO) << "node " << node_id()  << " failed to transfer leadership to peer="
-              << peer << " : reached timeout";
-    BAIDU_SCOPED_LOCK(_mutex);
+    ...
     if (term == _current_term) {
+        // (2) 取消迁移操作
         _replicator_group.stop_transfer_leadership(peer);
         if (_state == STATE_TRANSFERRING) {
-            _leader_lease.on_leader_start(term);
+            // (3) 调用用户状态机的 on_leader_start
             _fsm_caller->on_leader_start(term, _leader_lease.lease_epoch());
+            // (4) 将自身角色设为 Leader
             _state = STATE_LEADER;
-            _stop_transfer_arg = NULL;
+            ...
         }
     }
+}
+
+int Replicator::stop_transfer_leadership(ReplicatorId id) {
+    ...
+    // (2.1) 将 timeoutNowIndex 设为 0，
+    //       这样每次同步日志后就不需要判断差距，也不会再发送 TimeoutNow 请求
+    r->_timeout_now_index = 0;
+    ...
+    return 0;
 }
 ```
