@@ -6,15 +6,17 @@
 
 1. 用户调用 `transfer_leadership_to` 接口转移 Leader
 2. 若当前 Leader 正在转移或有配置变更正在进行中，则返回 `EBUSY`
-3. Leader 停止写入，这时候所有的apply会报错.
-4. 继续向所有的 Follower 同步日志，当发现目标节点的日志已经和主一样多之后，向对应节点发起一个`TimeoutNow` RPC
-5. 回调用户状态机的 `on_leader_stop`
-6. 节点收到 `TimeoutNow` 请求后，立马变为 `Candidate` 并增加 `Term` 进行选举
-7. Leader 收到 `TimeoutNow` 响应后, 开始 `step_down`
-8. 如果在 `election_timeout_ms` 时间内主没有 `step_down`，会取消主迁移操作，开始重新接受写入请求
-
-流程注解
----
+3. Leader 将自身状态设为 `TRANSFERRING`，此时所有的 `apply` 会报错，Leader 停止写入，无新增日志
+4. 判断目标节点日志是否和主一样多：
+   * 4.1 如果是的话，向对应节点发送 `TimeoutNow` 请求
+   * 4.2 继续在后台向 Follower 同步日志，每成功同步一批日志，则重复步骤 4
+5. 调用用户状态机的 `on_leader_stop`
+6. 启动转移超时定时器；该步骤后，`transfer_leadership_to` 接口返回成功，变更仍在继续
+7. 节点收到 `TimeoutNow` 请求后：
+   * 7.1 设置 `TimeoutNow` 响应中的 `term` 我自身 `term` 加一
+   * 7.2 立马变为 `candidate` 并增加 `term` 进行选举（跳过 `PreVote` 阶段）
+8. Leader 收到 `TimeoutNow` 响应后, 发现目标节点的 `term` 比自身大，则开始 `step_down` 成 Follower
+9.  如果在 `election_timeout_ms` 时间内 Leader 没有 `step_down`，会取消主迁移操作，开始重新接受写入请求
 
 相关 RPC
 ---

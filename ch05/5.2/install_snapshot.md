@@ -8,10 +8,10 @@
 1. Leader 向 Follower 发送 `InstallSnapshot` 请求，并停止向 Follower 同步日志
 2. Follower 根据请求中的 `URI` 逐一向 Leader 下载快照对应的文件集：
    * 2.1 创建连接 Leader 的客户端
-   * 2.2 发送 `GetFileRequest` 请求获取 Leader 快照的元数据
-   * 2.3 创建 `temp` 目录保存用于保存下载的临时快照
+   * 2.2 发送 `GetFile` 请求获取 Leader 快照的元数据
+   * 2.3 创建 `temp` 目录用于保存下载的临时快照
    * 2.3 根据元数据中的文件列表对比本地快照与远程快照的差异，获得下载文件列表
-   * 2.4 根据文件列表，逐一发送 `GetFileRequest` 请求获得文件保存至临时快照中
+   * 2.4 根据文件列表，逐一发送 `GetFile` 请求下载文件并保存至临时快照
    * 2.5 待快照下载完成后，删除本地快照，并将临时快照 `rename()` 成正式快照
 3. Follower 回调用户状态机的 `on_snapshot_load` 加载快照
 4. 等待快照加载完毕后：
