@@ -17,7 +17,7 @@
    * 7.2 立马变为 `Candidate` 并自增 `term` 进行选举（跳过 `PreVote` 阶段）
 8. Leader 收到 `TimeoutNow` 响应后，发现目标节点的 `term` 比自身大，则开始 `step_down` 成 Follower
 9. 如果在 `election_timeout_ms` 时间内 Leader 没有 `step_down`，则取消迁移操作：
-    * 调用状态机的 `on_leader_start`
+    * 调用状态机的 `on_leader_start` 继续领导当前任期，此时 Leader 的 `term` 并未改变
     * 将自身状态变为 `Leader`，并开始重新接受写入请求
 
 相关 RPC
@@ -113,7 +113,7 @@ int NodeImpl::transfer_leadership_to(const PeerId& peer) {
     }
 
     // (4) 记录当前日志的的 lastLogIndex，
-    //     并调用 ReplicatorGroup::transfer_leadership_to 来目标节点日志是否和当前 Leader 一样多
+    //     并调用 ReplicatorGroup::transfer_leadership_to 来判断目标节点的日志是否和当前 Leader 一样多
     //     见以下 <判断差距>
     const int64_t last_log_index = _log_manager->last_log_index();
     const int rc = _replicator_group.transfer_leadership_to(peer_id, last_log_index);
@@ -140,7 +140,7 @@ int NodeImpl::transfer_leadership_to(const PeerId& peer) {
 判断差距
 ---
 
-`ReplicatorGroup::transfer_leadership_to` 会在 `ReplicatorGroup` 找到目标节点的 `Replicator`，然后调用其 `_transfer_leadership`。
+`ReplicatorGroup::transfer_leadership_to` 会在 `ReplicatorGroup` 找到目标节点的 `Replicator`，然后调用其 `_transfer_leadership` 函数。
 
 在 `_transfer_leadership` 中主要判断目标节点的日志是否和当前 Leader 一样多：
 * 如果是的话，直接进入阶段三发送 `TimeoutNow` 请求进行重新选举
@@ -238,7 +238,7 @@ void Replicator::_send_entries() {
     _flying_append_entries_size += request->entries_size();
     ...
     // (2) 向 Follower 发送 AppendEntries 请求来同步日志，
-    //     并设置响应回调函数 _on_rpc_returned
+    //     并设置响应回调函数为 _on_rpc_returned
     google::protobuf::Closure* done = brpc::NewCallback(
                 _on_rpc_returned, _id.value, cntl.get(),
                 request.get(), response.get(), butil::monotonic_time_ms());
@@ -317,7 +317,7 @@ void NodeImpl::handle_timeout_now_request(brpc::Controller* controller,
     response->set_term(_current_term + 1);
     ...
     response->set_success(true);
-    // (2) 同时发送相应会调用 elect_self 进行选举
+    // (2) 并行发送响应和调用 elect_self 进行选举
     // Parallelize Response and election
     run_closure_in_bthread(done_guard.release());
     elect_self(&lck, request->old_leader_stepped_down());
@@ -337,7 +337,7 @@ void Replicator::_on_timeout_now_returned(
                 TimeoutNowResponse* response,
                 bool old_leader_stepped_down) {
     ...
-    // (1) 如果目标节点的 Term 比自身大，则开始 step_down 成 Follower
+    // (1) 如果目标节点的 term 比自身大，则开始 step_down 成 Follower
     if (response->term() > r->_options.term) {
         NodeImpl *node_impl = r->_options.node;
         ...
@@ -394,7 +394,8 @@ void NodeImpl::handle_transfer_timeout(int64_t term, const PeerId& peer) {
         // (2) 取消迁移操作
         _replicator_group.stop_transfer_leadership(peer);
         if (_state == STATE_TRANSFERRING) {
-            // (3) 调用用户状态机的 on_leader_start
+            // (3) 调用用户状态机的 on_leader_start 继续领导当前任期
+            //     Leader 的 term 并未改变
             _fsm_caller->on_leader_start(term, _leader_lease.lease_epoch());
             // (4) 将自身角色设为 Leader
             _state = STATE_LEADER;
