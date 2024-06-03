@@ -19,14 +19,14 @@
     * 4.1 应用联合配置（即 `C{old,new}`）为当前节点配置，以该配置视角进行选举和日志复制：
         * 4.1.1 在该阶段，选举需要同时在新老集群都达到 `Qourum`
         * 4.1.2 在该阶段，日志复制需要同时在新老集群都达到 `Qourum` 才能提交
-    * 4.2 Leader 将联合配置日志（即 `C{old,new}`）同时复制给新老集群；同时 Leader 也复制其他日志新来集群
+    * 4.2 Leader 将联合配置日志（即 `C{old,new}`）同时复制给新老集群；同时也复制其他日志
     * 4.3 待联合配置在新老集群都达到 `Qourum`，则提交并应用该日志：
         * 4.3.1 调用该配置的 `Closure`，进入下一阶段
 5. 进入同步新配置（`Stable`）阶段：
     * 5.1 应用新配置（即 `C{new}`）为当前节点配置，以该配置视角进行选举和日志复制：
         * 5.1.1 在该阶段，选举只需在新集群达到 `Qourum`
         * 5.1.2 在该阶段，日志仍会复制给新老集群，只需在新集群达到 `Qourum` 即可提交
-    * 5.2 Leader 将新配置日志（即 `Cnew}`）同时复制给新老集群；同时 Leader 也复制其他日志给新老集群
+    * 5.2 Leader 将新配置日志（即 `C{new}`）同时复制给新老集群；同时也复制其他日志
     * 5.3 待新配置在新集群中达到 `Qourum`，则提交并应用该日志：
         * 5.3.1 以新配置作为参数，调用用户状态机的 `on_configuration_committed`
         * 5.3.2 调用该配置的 `Closure`，进入下一阶段
@@ -116,42 +116,56 @@ public:
 调用接口
 ---
 
+调用调用各节点进行配置变更，在这些接口中，会生成新配置和老配置，并调用 `on_configuration_committed` 执行变更：
+
 ```cpp
 void NodeImpl::add_peer(const PeerId& peer, Closure* done) {
-    BAIDU_SCOPED_LOCK(_mutex);
+    ...
     Configuration new_conf = _conf.conf;
     new_conf.add_peer(peer);
     return unsafe_register_conf_change(_conf.conf, new_conf, done);
 }
 
 void NodeImpl::remove_peer(const PeerId& peer, Closure* done) {
-    BAIDU_SCOPED_LOCK(_mutex);
+    ...
     Configuration new_conf = _conf.conf;
     new_conf.remove_peer(peer);
     return unsafe_register_conf_change(_conf.conf, new_conf, done);
 }
 
 void NodeImpl::change_peers(const Configuration& new_peers, Closure* done) {
-    BAIDU_SCOPED_LOCK(_mutex);
+    ...
     return unsafe_register_conf_change(_conf.conf, new_peers, done);
 }
 ```
+
+而在 `unsafe_register_conf_change` 函数中首先会进行一些判断，决定是否要执行变更。如要进行变更，则调用 `ConfigurationCtx::start` 正式开始变更：
 
 ```cpp
 void NodeImpl::unsafe_register_conf_change(const Configuration& old_conf,
                                            const Configuration& new_conf,
                                            Closure* done) {
     ...
-    if (_conf_ctx.is_busy()) {  // 已经有配置变更在进行了
+    // (1) 如果当前 Leader 已经有配置变更在进行，则返回 EBUSY
+    if (_conf_ctx.is_busy()) {
         ...
+        if (done) {
+            done->status().set_error(EBUSY, "Doing another configuration change");
+            run_closure_in_bthread(done);
+        }
         return;
     }
     ...
+    // (2) 如果新老配置一样，则理解返回
+    if (_conf.conf.equals(new_conf)) {
+        run_closure_in_bthread(done);
+        return;
+    }
+    ...
+    // (3) 调用 ConfigurationCtx::start 开始变更
     return _conf_ctx.start(old_conf, new_conf, done);
 }
 ```
-
-将新老配置做 diff 获得新加入的节点列表：
 
 开始变更
 ---
@@ -164,10 +178,9 @@ void NodeImpl::unsafe_register_conf_change(const Configuration& old_conf,
 void NodeImpl::ConfigurationCtx::start(const Configuration& old_conf,
                                        const Configuration& new_conf,
                                        Closure* done) {
-    CHECK(!is_busy());
-    CHECK(!_done);
     _done = done;
     _stage = STAGE_CATCHING_UP;
+
     old_conf.list_peers(&_old_peers);
     new_conf.list_peers(&_new_peers);
     Configuration adding;
@@ -175,23 +188,17 @@ void NodeImpl::ConfigurationCtx::start(const Configuration& old_conf,
     new_conf.diffs(old_conf, &adding, &removing);
     _nchanges = adding.size() + removing.size();
 
-    std::stringstream ss;
-    ss << "node " << _node->_group_id << ":" << _node->_server_id
-       << " change_peers from " << old_conf << " to " << new_conf;
-
     if (adding.empty()) {
-        ss << ", begin removing.";
-        LOG(INFO) << ss.str();
+        ...
         return next_stage();
     }
-    ss << ", begin caughtup.";
+
     LOG(INFO) << ss.str();
     adding.list_peers(&_adding_peers);
     for (std::set<PeerId>::const_iterator iter
             = _adding_peers.begin(); iter != _adding_peers.end(); ++iter) {
         if (_node->_replicator_group.add_replicator(*iter) != 0) {
-            LOG(ERROR) << "node " << _node->node_id()
-                       << " start replicator failed, peer " << *iter;
+            ...
             return on_caughtup(_version, *iter, false);
         }
         OnCaughtUp* caught_up = new OnCaughtUp(
@@ -200,10 +207,7 @@ void NodeImpl::ConfigurationCtx::start(const Configuration& old_conf,
                 _node->_options.get_catchup_timeout_ms());
         if (_node->_replicator_group.wait_caughtup(
             *iter, _node->_options.catchup_margin, &due_time, caught_up) != 0) {
-            LOG(WARNING) << "node " << _node->node_id()
-                         << " wait_caughtup failed, peer " << *iter;
-            delete caught_up;
-            return on_caughtup(_version, *iter, false);
+            ...
         }
     }
 ```
