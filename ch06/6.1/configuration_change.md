@@ -4,31 +4,40 @@
 流程概览
 ---
 
-1. 用户通过 `add_peer`/`remove_peer`/`change_peer` 接口触发配置变更
-2. 若当前有配置变更正在进行，则返回 `EBUSY`；若新老配置相等，则直接返回成功
+1. 用户通过 `add_peer`/`remove_peer`/`change_peer` 接口向 Leader 提交配置变更
+2. 若当前 Leader 有配置变更正在进行，则返回 `EBUSY`；若新老配置相等，则直接返回成功
 3. 进入日志追赶（`CaughtUp`）阶段：
-   * 3.1 将新老配置做 `diff` 获得新加入的节点列表；若列表为空，则直接进入下一阶段
-   * 3.2 为每个新节点创建 `Replicator`，并启动心跳定时器
-   * 3.3 为新节点安装最新的快照
-   * 3.4 向新节点同步日志；每成功同步一部分日志，判断一下 Leader 与新节点的日志差距，若差距小于一定值，则进入下一阶段
-   * 3.5 若追赶阶段任意节点失败，则本次配置变更标记为失败
+   * 3.1 将新老配置做 `diff` 获得新加入的节点列表；若新增列表为空，则直接进入下一阶段
+   * 3.2 为每个新节点创建 `Replicator`，并对所有新节点定期广播心跳
+   * 3.3 为每个新节点安装最新的快照，每当一个节点完成快照的安装，则进行步骤 3.4 的判断
+   * 3.4 判断该节点日志与 Leader 之间的差距
+     * 3.4.1 若小于一定值（默认 1000 条日志），则将其从追赶节点列表中移除
+     * 3.4.2 若追赶列表为空，即所有节点都追赶上 Leader 的日志后，则进入下一阶段
+   * 3.5 向新节点同步日志，每成功同步一部分日志，重复步骤 3.4
+   * 3.6 若追赶阶段任意节点失败，则本次配置变更标记为失败
 4. 进入联合共识（`Joint-Consensus`）阶段：
-   * 4.1 在该阶段，选举和日志同步需要**同时**在新老集群都达到 `Qourum`
-   * 4.2 Leader 将新老集群配置日志（即 C<sub>old,new</sub>）同时复制给新老集群
-   * 4.3 等待该日志在新老集群都达到 `Qourum` 则提交该日志并进入下一阶段
+    * 4.1 应用联合配置（即 `C{old,new}`）为当前节点配置，以该配置视角进行选举和日志复制：
+        * 4.1.1 在该阶段，选举需要同时在新老集群都达到 `Qourum`
+        * 4.1.2 在该阶段，日志复制需要同时在新老集群都达到 `Qourum` 才能提交
+    * 4.2 Leader 将联合配置日志（即 `C{old,new}`）同时复制给新老集群；同时 Leader 也复制其他日志新来集群
+    * 4.3 待联合配置在新老集群都达到 `Qourum`，则提交并应用该日志：
+        * 4.3.1 调用该配置的 `Closure`，进入下一阶段
 5. 进入同步新配置（`Stable`）阶段：
-    * 5.1 在该阶段，日志会同时复制给新老集群，但只需在新集群中达到 `Quorum` 即可提交
-    * 5.2 Leader 将新集群配置日志（即 `C{new}`）复制给新老集群
-    * 5.3 Leader 立即应用新集群配置，不必等待其日志被提交
-    * 5.4 等待日志 `C{new}` 在新集群达到 `Quorum` 即被提交，至此配置变更已完成
+    * 5.1 应用新配置（即 `C{new}`）为当前节点配置，以该配置视角进行选举和日志复制：
+        * 5.1.1 在该阶段，选举只需在新集群达到 `Qourum`
+        * 5.1.2 在该阶段，日志仍会复制给新老集群，只需在新集群达到 `Qourum` 即可提交
+    * 5.2 Leader 将新配置日志（即 `Cnew}`）同时复制给新老集群；同时 Leader 也复制其他日志给新老集群
+    * 5.3 待新配置在新集群中达到 `Qourum`，则提交并应用该日志：
+        * 5.3.1 以新配置作为参数，调用用户状态机的 `on_configuration_committed`
+        * 5.3.2 调用该配置的 `Closure`，进入下一阶段
 6. 进行清理工作：
     * 6.1 Leader 移除不在集群中的 `Replicator`，不再向它们发送心跳和日志
-    * 6.2 若 Leader 不在新集群中，则降为 `Follower` 并向拥有最长日志的节点发送 `TimeoutNow` 请求让你立马进行选举
+    * 6.2 回调接入传口的 `Closure`
+    * 6.3 若当前 Leader 不在新配置中，则 `step_down` 变为 Follower：
+      * 6.3.1 调用用户状态机的 `on_leader_stop`
+      * 6.3.2 向拥有最长日志的节点发送 `TimeoutNow` 请求，让其立马进行选举
 
-![图 6.1  配置变更流程](image/configuration_change.png)
-
-流程注解
----
+![图 6.1  配置变更示例](image/6.1.png)
 
 故障恢复
 ---
@@ -45,8 +54,15 @@
 
 从上面可以看出，一旦 `C{old,new}` 已达到 `Quorum` 被提交，则可以立马应用 `C{new}`，因为即使此时 Leader 此时挂掉，新 Leader 也将继续推进变更从而使用  `C{new}`，等同于处于事务的隐式提交（implicit commit）一样。详见以下[故障恢复](#其他故障恢复)。
 
+新节点配置
+---
+
+{1,2,3} {1,2,4}
+
 干扰集群
 ---
+
+![](image/6.2.png)
 
 <!---
 TODO:
@@ -97,6 +113,9 @@ public:
 阶段一：追赶日志
 ===
 
+调用接口
+---
+
 ```cpp
 void NodeImpl::add_peer(const PeerId& peer, Closure* done) {
     BAIDU_SCOPED_LOCK(_mutex);
@@ -134,39 +153,63 @@ void NodeImpl::unsafe_register_conf_change(const Configuration& old_conf,
 
 将新老配置做 diff 获得新加入的节点列表：
 
+开始变更
+---
+创建 Replicator
+---
+
+详见 [创建 Replicator](/ch03/3.1/election.d#chuang-jian-replicator)
+
 ```cpp
 void NodeImpl::ConfigurationCtx::start(const Configuration& old_conf,
                                        const Configuration& new_conf,
                                        Closure* done) {
-    ...
+    CHECK(!is_busy());
+    CHECK(!_done);
+    _done = done;
+    _stage = STAGE_CATCHING_UP;
+    old_conf.list_peers(&_old_peers);
+    new_conf.list_peers(&_new_peers);
+    Configuration adding;
+    Configuration removing;
     new_conf.diffs(old_conf, &adding, &removing);
     _nchanges = adding.size() + removing.size();
-    ...
+
+    std::stringstream ss;
+    ss << "node " << _node->_group_id << ":" << _node->_server_id
+       << " change_peers from " << old_conf << " to " << new_conf;
+
     if (adding.empty()) {
         ss << ", begin removing.";
         LOG(INFO) << ss.str();
         return next_stage();
     }
-
+    ss << ", begin caughtup.";
+    LOG(INFO) << ss.str();
     adding.list_peers(&_adding_peers);
     for (std::set<PeerId>::const_iterator iter
             = _adding_peers.begin(); iter != _adding_peers.end(); ++iter) {
-
         if (_node->_replicator_group.add_replicator(*iter) != 0) {
-            ...
+            LOG(ERROR) << "node " << _node->node_id()
+                       << " start replicator failed, peer " << *iter;
+            return on_caughtup(_version, *iter, false);
         }
-
         OnCaughtUp* caught_up = new OnCaughtUp(
                 _node, _node->_current_term, *iter, _version);
         timespec due_time = butil::milliseconds_from_now(
                 _node->_options.get_catchup_timeout_ms());
         if (_node->_replicator_group.wait_caughtup(
             *iter, _node->_options.catchup_margin, &due_time, caught_up) != 0) {
-            ...
+            LOG(WARNING) << "node " << _node->node_id()
+                         << " wait_caughtup failed, peer " << *iter;
+            delete caught_up;
+            return on_caughtup(_version, *iter, false);
         }
     }
-
 ```
+
+注册 Closure
+---
 
 ```cpp
 int ReplicatorGroup::wait_caughtup(const PeerId& peer,
@@ -197,7 +240,240 @@ public:
 };
 ```
 
-每次 send_entries 后都会 notify
+安装快照
+---
+
+```cpp
+void Replicator::_send_entries() {
+    if (_flying_append_entries_size >= FLAGS_raft_max_entries_size ||
+        _append_entries_in_fly.size() >= (size_t)FLAGS_raft_max_parallel_append_entries_rpc_num ||
+        _st.st == BLOCKING) {
+        BRAFT_VLOG << "node " << _options.group_id << ":" << _options.server_id
+            << " skip sending AppendEntriesRequest to " << _options.peer_id
+            << ", too many requests in flying, or the replicator is in block,"
+            << " next_index " << _next_index << " flying_size " << _flying_append_entries_size;
+        CHECK_EQ(0, bthread_id_unlock(_id)) << "Fail to unlock " << _id;
+        return;
+    }
+
+    std::unique_ptr<brpc::Controller> cntl(new brpc::Controller);
+    std::unique_ptr<AppendEntriesRequest> request(new AppendEntriesRequest);
+    std::unique_ptr<AppendEntriesResponse> response(new AppendEntriesResponse);
+    // 情况 1：已经发送给 Follower 的最后一条日志已经被压缩了
+    if (_fill_common_fields(request.get(), _next_index - 1, false) != 0) {
+        _reset_next_index();
+        return _install_snapshot();
+    }
+    EntryMeta em;
+    const int max_entries_size = FLAGS_raft_max_entries_size - _flying_append_entries_size;
+    int prepare_entry_rc = 0;
+    CHECK_GT(max_entries_size, 0);
+    for (int i = 0; i < max_entries_size; ++i) {
+        // 生成每一个 LogEntry，在 _prepare_entry 中通过判断 Log Index 对应的 Term 在没在
+        // 从而找到最后的 Log
+        prepare_entry_rc = _prepare_entry(i, &em, &cntl->request_attachment());
+        if (prepare_entry_rc != 0) {
+            break;
+        }
+        request->add_entries()->Swap(&em);
+    }
+    if (request->entries_size() == 0) {
+        // _id is unlock in _wait_more
+        // 情况 2：follower 需要的第一条日志已经被压缩了
+        if (_next_index < _options.log_manager->first_log_index()) {
+            _reset_next_index();
+            return _install_snapshot();  // 为什么这里还会触发安装快照，
+        }
+        // NOTICE: a follower's readonly mode does not prevent install_snapshot
+        // as we need followers to commit conf log(like add_node) when
+        // leader reaches readonly as well
+        if (prepare_entry_rc == EREADONLY) {
+            if (_flying_append_entries_size == 0) {
+                _st.st = IDLE;
+            }
+            CHECK_EQ(0, bthread_id_unlock(_id)) << "Fail to unlock " << _id;
+            return;
+        }
+        return _wait_more_entries();
+    }
+
+    _append_entries_in_fly.push_back(FlyingAppendEntriesRpc(_next_index,
+                                     request->entries_size(), cntl->call_id()));
+    _append_entries_counter++;
+    _next_index += request->entries_size();
+    _flying_append_entries_size += request->entries_size();
+
+    g_send_entries_batch_counter << request->entries_size();
+
+    BRAFT_VLOG << "node " << _options.group_id << ":" << _options.server_id
+        << " send AppendEntriesRequest to " << _options.peer_id << " term " << _options.term
+        << " last_committed_index " << request->committed_index()
+        << " prev_log_index " << request->prev_log_index()
+        << " prev_log_term " << request->prev_log_term()
+        << " next_index " << _next_index << " count " << request->entries_size();
+    _st.st = APPENDING_ENTRIES;
+    _st.first_log_index = _min_flying_index();
+    _st.last_log_index = _next_index - 1;
+    google::protobuf::Closure* done = brpc::NewCallback(
+                _on_rpc_returned, _id.value, cntl.get(),
+                request.get(), response.get(), butil::monotonic_time_ms());
+    RaftService_Stub stub(&_sending_channel);
+    stub.append_entries(cntl.release(), request.release(),
+                        response.release(), done);
+    _wait_more_entries();
+}
+```
+
+```cpp
+void Replicator::_on_install_snapshot_returned(
+            ReplicatorId id, brpc::Controller* cntl,
+            InstallSnapshotRequest* request,
+            InstallSnapshotResponse* response) {
+    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
+    std::unique_ptr<InstallSnapshotRequest> request_guard(request);
+    std::unique_ptr<InstallSnapshotResponse> response_guard(response);
+    Replicator *r = NULL;
+    bthread_id_t dummy_id = { id };
+    bool succ = true;
+    if (bthread_id_lock(dummy_id, (void**)&r) != 0) {
+        return;
+    }
+    if (r->_reader) {
+        r->_options.snapshot_storage->close(r->_reader);
+        r->_reader = NULL;
+        if (r->_options.snapshot_throttle) {
+            r->_options.snapshot_throttle->finish_one_task(true);
+        }
+    }
+    std::stringstream ss;
+    ss << "received InstallSnapshotResponse from "
+       << r->_options.group_id << ":" << r->_options.peer_id
+       << " last_included_index " << request->meta().last_included_index()
+       << " last_included_term " << request->meta().last_included_term();
+    do {
+        if (cntl->Failed()) {
+            ss << " error: " << cntl->ErrorText();
+            LOG(INFO) << ss.str();
+
+            LOG_IF(WARNING, (r->_consecutive_error_times++) % 10 == 0)
+                            << "Group " << r->_options.group_id
+                            << " Fail to install snapshot at peer="
+                            << r->_options.peer_id
+                            <<", " << cntl->ErrorText();
+            succ = false;
+            break;
+        }
+        if (!response->success()) {
+            succ = false;
+            ss << " fail.";
+            LOG(INFO) << ss.str();
+            // Let heartbeat do step down
+            break;
+        }
+        // Success
+        r->_next_index = request->meta().last_included_index() + 1;
+        ss << " success.";
+        LOG(INFO) << ss.str();
+    } while (0);
+
+    // We don't retry installing the snapshot explicitly.
+    // dummy_id is unlock in _send_entries
+    if (!succ) {
+        return r->_block(butil::gettimeofday_us(), cntl->ErrorCode());
+    }
+    r->_has_succeeded = true;
+    r->_notify_on_caught_up(0, false);
+    if (r->_timeout_now_index > 0 && r->_timeout_now_index < r->_min_flying_index()) {
+        r->_send_timeout_now(false, false);
+    }
+    // dummy_id is unlock in _send_entries
+    return r->_send_entries();
+}
+```
+
+同步日志
+---
+
+```cpp
+void Replicator::_send_entries() {
+    if (_flying_append_entries_size >= FLAGS_raft_max_entries_size ||
+        _append_entries_in_fly.size() >= (size_t)FLAGS_raft_max_parallel_append_entries_rpc_num ||
+        _st.st == BLOCKING) {
+        BRAFT_VLOG << "node " << _options.group_id << ":" << _options.server_id
+            << " skip sending AppendEntriesRequest to " << _options.peer_id
+            << ", too many requests in flying, or the replicator is in block,"
+            << " next_index " << _next_index << " flying_size " << _flying_append_entries_size;
+        CHECK_EQ(0, bthread_id_unlock(_id)) << "Fail to unlock " << _id;
+        return;
+    }
+
+    std::unique_ptr<brpc::Controller> cntl(new brpc::Controller);
+    std::unique_ptr<AppendEntriesRequest> request(new AppendEntriesRequest);
+    std::unique_ptr<AppendEntriesResponse> response(new AppendEntriesResponse);
+    // 情况 1：已经发送给 Follower 的最后一条日志已经被压缩了
+    if (_fill_common_fields(request.get(), _next_index - 1, false) != 0) {
+        _reset_next_index();
+        return _install_snapshot();
+    }
+    EntryMeta em;
+    const int max_entries_size = FLAGS_raft_max_entries_size - _flying_append_entries_size;
+    int prepare_entry_rc = 0;
+    CHECK_GT(max_entries_size, 0);
+    for (int i = 0; i < max_entries_size; ++i) {
+        // 生成每一个 LogEntry，在 _prepare_entry 中通过判断 Log Index 对应的 Term 在没在
+        // 从而找到最后的 Log
+        prepare_entry_rc = _prepare_entry(i, &em, &cntl->request_attachment());
+        if (prepare_entry_rc != 0) {
+            break;
+        }
+        request->add_entries()->Swap(&em);
+    }
+    if (request->entries_size() == 0) {
+        // _id is unlock in _wait_more
+        // 情况 2：follower 需要的第一条日志已经被压缩了
+        if (_next_index < _options.log_manager->first_log_index()) {
+            _reset_next_index();
+            return _install_snapshot();  // 为什么这里还会触发安装快照，
+        }
+        // NOTICE: a follower's readonly mode does not prevent install_snapshot
+        // as we need followers to commit conf log(like add_node) when
+        // leader reaches readonly as well
+        if (prepare_entry_rc == EREADONLY) {
+            if (_flying_append_entries_size == 0) {
+                _st.st = IDLE;
+            }
+            CHECK_EQ(0, bthread_id_unlock(_id)) << "Fail to unlock " << _id;
+            return;
+        }
+        return _wait_more_entries();
+    }
+
+    _append_entries_in_fly.push_back(FlyingAppendEntriesRpc(_next_index,
+                                     request->entries_size(), cntl->call_id()));
+    _append_entries_counter++;
+    _next_index += request->entries_size();
+    _flying_append_entries_size += request->entries_size();
+
+    g_send_entries_batch_counter << request->entries_size();
+
+    BRAFT_VLOG << "node " << _options.group_id << ":" << _options.server_id
+        << " send AppendEntriesRequest to " << _options.peer_id << " term " << _options.term
+        << " last_committed_index " << request->committed_index()
+        << " prev_log_index " << request->prev_log_index()
+        << " prev_log_term " << request->prev_log_term()
+        << " next_index " << _next_index << " count " << request->entries_size();
+    _st.st = APPENDING_ENTRIES;
+    _st.first_log_index = _min_flying_index();
+    _st.last_log_index = _next_index - 1;
+    google::protobuf::Closure* done = brpc::NewCallback(
+                _on_rpc_returned, _id.value, cntl.get(),
+                request.get(), response.get(), butil::monotonic_time_ms());
+    RaftService_Stub stub(&_sending_channel);
+    stub.append_entries(cntl.release(), request.release(),
+                        response.release(), done);
+    _wait_more_entries();
+}
+```
 
 ```cpp
 void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
@@ -366,8 +642,16 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
 }
 ```
 
+判断差距
+---
+
+成功安装快照或每次成功同步一批日之后，都会调用 `_notify_on_caught_up` 判断新加入节点日志与当前 Leader 的差距。若差距小于一定值（默认为 1000），
+
 ```cpp
 void Replicator::_notify_on_caught_up(int error_code, bool before_destroy) {
+    if (!_is_catchup(_catchup_closure->_max_margin)) {
+        return;
+    }
     ...
     Closure* saved_catchup_closure = _catchup_closure;
     _catchup_closure = NULL;
@@ -385,9 +669,7 @@ void NodeImpl::on_caughtup(const PeerId& peer, int64_t term,
     }
     ...
 }
-```
 
-```cpp
 void NodeImpl::ConfigurationCtx::on_caughtup(
         int64_t version, const PeerId& peer_id, bool succ) {
 
@@ -406,168 +688,16 @@ void NodeImpl::ConfigurationCtx::on_caughtup(
 阶段二：联合共识
 ===
 
-```cpp
-void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
-                                          const Configuration* old_conf,
-                                          bool leader_start) {
-    LogEntry* entry = new LogEntry();
-    entry->AddRef();
-    entry->id.term = _current_term;
-    entry->type = ENTRY_TYPE_CONFIGURATION;
-    entry->peers = new std::vector<PeerId>;
-    new_conf.list_peers(entry->peers);
-    if (old_conf) {
-        entry->old_peers = new std::vector<PeerId>;
-        old_conf->list_peers(entry->old_peers);
-    }
-    ...
-    _log_manager->append_entries(&entries,
-                                 new LeaderStableClosure(
-                                        NodeId(_group_id, _server_id),
-                                        1u, _ballot_box));
-    _log_manager->check_and_set_configuration(&_conf);
-}
-```
-
-```cpp
-int BallotBox::append_pending_task(const Configuration& conf, const Configuration* old_conf,
-                                   Closure* closure) {
-    Ballot bl;
-    if (bl.init(conf, old_conf) != 0) {
-        CHECK(false) << "Fail to init ballot";
-        return -1;
-    }
-
-    BAIDU_SCOPED_LOCK(_mutex);
-    CHECK(_pending_index > 0);
-    _pending_meta_queue.push_back(Ballot());
-    _pending_meta_queue.back().swap(bl);
-    _closure_queue->append_pending_closure(closure);
-    return 0;
-}
-```
-
-```cpp
-int Ballot::init(const Configuration& conf, const Configuration* old_conf) {
-    _peers.clear();
-    _old_peers.clear();
-    _quorum = 0;
-    _old_quorum = 0;
-
-    _peers.reserve(conf.size());
-    for (Configuration::const_iterator
-            iter = conf.begin(); iter != conf.end(); ++iter) {
-        _peers.push_back(*iter);
-    }
-    _quorum = _peers.size() / 2 + 1;
-    if (!old_conf) {
-        return 0;
-    }
-    _old_peers.reserve(old_conf->size());
-    for (Configuration::const_iterator
-            iter = old_conf->begin(); iter != old_conf->end(); ++iter) {
-        _old_peers.push_back(*iter);
-    }
-    _old_quorum = _old_peers.size() / 2 + 1;
-    return 0;
-}
-```
-
-```cpp
-bool LogManager::check_and_set_configuration(ConfigurationEntry* current) {
-    if (current == NULL) {
-        CHECK(false) << "current should not be NULL";
-        return false;
-    }
-    BAIDU_SCOPED_LOCK(_mutex);
-
-    const ConfigurationEntry& last_conf = _config_manager->last_configuration();
-    if (current->id != last_conf.id) {
-        *current = last_conf;
-        return true;
-    }
-    return false;
-}
-```
-
-```cpp
-bool LogManager::check_and_set_configuration(ConfigurationEntry* current) {
-    if (current == NULL) {
-        CHECK(false) << "current should not be NULL";
-        return false;
-    }
-    BAIDU_SCOPED_LOCK(_mutex);
-
-    const ConfigurationEntry& last_conf = _config_manager->last_configuration();
-    if (current->id != last_conf.id) {
-        *current = last_conf;
-        return true;
-    }
-    return false;
-}
-```
-
-
-follower 接收到 append_entries
----
-
-```cpp
-void NodeImpl::become_leader() {
-    CHECK(_state == STATE_CANDIDATE);
-    LOG(INFO) << "node " << _group_id << ":" << _server_id
-              << " term " << _current_term
-              << " become leader of group " << _conf.conf
-              << " " << _conf.old_conf;
-    // cancel candidate vote timer
-    _vote_timer.stop();
-    _vote_ctx.reset(this);
-
-    _state = STATE_LEADER;
-    _leader_id = _server_id;
-
-    _replicator_group.reset_term(_current_term);
-    _follower_lease.reset();
-    _leader_lease.on_leader_start(_current_term);
-
-    std::set<PeerId> peers;
-    _conf.list_peers(&peers);
-    for (std::set<PeerId>::const_iterator
-            iter = peers.begin(); iter != peers.end(); ++iter) {
-        if (*iter == _server_id) {
-            continue;
-        }
-
-        BRAFT_VLOG << "node " << _group_id << ":" << _server_id
-                   << " term " << _current_term
-                   << " add replicator " << *iter;
-        //TODO: check return code
-        _replicator_group.add_replicator(*iter);
-    }
-
-    // init commit manager
-    _ballot_box->reset_pending_index(_log_manager->last_log_index() + 1);
-
-    // Register _conf_ctx to reject configuration changing before the first log
-    // is committed.
-    CHECK(!_conf_ctx.is_busy());
-    _conf_ctx.flush(_conf.conf, _conf.old_conf);
-    _stepdown_timer.start();
-}
-```
-
-阶段三：同步新配置
-===
-
-新阶段
+进入新阶段
 ---
 
 ```cpp
 void NodeImpl::ConfigurationCtx::next_stage() {
     CHECK(is_busy());
     switch (_stage) {
-    case STAGE_CATCHING_UP:
+    case STAGE_CATCHING_UP:  // (1) 执行该分支
         if (_nchanges > 1) {
-            _stage = STAGE_JOINT;
+            _stage = STAGE_JOINT;  // (2) 进入联合共识阶段
             Configuration old_conf(_old_peers);
             return _node->unsafe_apply_configuration(
                     Configuration(_new_peers), &old_conf, false);
@@ -598,11 +728,15 @@ void NodeImpl::ConfigurationCtx::next_stage() {
 }
 ```
 
+应用 `C{old,new}`
+---
+复制日志
+---
+
 ```cpp
 void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
                                           const Configuration* old_conf,
                                           bool leader_start) {
-    CHECK(_conf_ctx.is_busy());
     LogEntry* entry = new LogEntry();
     entry->AddRef();
     entry->id.term = _current_term;
@@ -613,13 +747,12 @@ void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
         entry->old_peers = new std::vector<PeerId>;
         old_conf->list_peers(entry->old_peers);
     }
+
     ConfigurationChangeDone* configuration_change_done =
-            new ConfigurationChangeDone(this, _current_term, leader_start, _leader_lease.lease_epoch());
+        new ConfigurationChangeDone(this, _current_term, leader_start, _leader_lease.lease_epoch());
     // Use the new_conf to deal the quorum of this very log
     _ballot_box->append_pending_task(new_conf, old_conf, configuration_change_done);
-
-    std::vector<LogEntry*> entries;
-    entries.push_back(entry);
+    ...
     _log_manager->append_entries(&entries,
                                  new LeaderStableClosure(
                                         NodeId(_group_id, _server_id),
@@ -628,7 +761,186 @@ void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
 }
 ```
 
-提交新配置
+```cpp
+int BallotBox::append_pending_task(const Configuration& conf, const Configuration* old_conf,
+                                   Closure* closure) {
+    Ballot bl;
+    if (bl.init(conf, old_conf) != 0) {
+        CHECK(false) << "Fail to init ballot";
+        return -1;
+    }
+
+    BAIDU_SCOPED_LOCK(_mutex);
+    CHECK(_pending_index > 0);
+    _pending_meta_queue.push_back(Ballot());
+    _pending_meta_queue.back().swap(bl);
+    _closure_queue->append_pending_closure(closure);
+    return 0;
+}
+```
+
+提交日志
+---
+
+```cpp
+int Ballot::init(const Configuration& conf, const Configuration* old_conf) {
+    _peers.clear();
+    _old_peers.clear();
+    _quorum = 0;
+    _old_quorum = 0;
+
+    _peers.reserve(conf.size());
+    for (Configuration::const_iterator
+            iter = conf.begin(); iter != conf.end(); ++iter) {
+        _peers.push_back(*iter);
+    }
+    _quorum = _peers.size() / 2 + 1;
+    if (!old_conf) {
+        return 0;
+    }
+    _old_peers.reserve(old_conf->size());
+    for (Configuration::const_iterator
+            iter = old_conf->begin(); iter != old_conf->end(); ++iter) {
+        _old_peers.push_back(*iter);
+    }
+    _old_quorum = _old_peers.size() / 2 + 1;
+    return 0;
+}
+```
+
+```cpp
+// 将 index 在 [fist_log_index, last_log_index] 之间的日志的投票数加一
+int BallotBox::commit_at(
+        int64_t first_log_index, int64_t last_log_index, const PeerId& peer) {
+    // FIXME(chenzhangyi01): The cricital section is unacceptable because it
+    // blocks all the other Replicators and LogManagers
+    std::unique_lock<raft_mutex_t> lck(_mutex);
+    if (_pending_index == 0) {
+        return EINVAL;
+    }
+    if (last_log_index < _pending_index) {
+        return 0;
+    }
+    if (last_log_index >= _pending_index + (int64_t)_pending_meta_queue.size()) {
+        return ERANGE;
+    }
+
+    int64_t last_committed_index = 0;
+    const int64_t start_at = std::max(_pending_index, first_log_index);
+    Ballot::PosHint pos_hint;
+    for (int64_t log_index = start_at; log_index <= last_log_index; ++log_index) {
+        Ballot& bl = _pending_meta_queue[log_index - _pending_index];
+        pos_hint = bl.grant(peer, pos_hint);
+        if (bl.granted()) {
+            last_committed_index = log_index;
+        }
+    }
+
+    if (last_committed_index == 0) {
+        return 0;
+    }
+
+    // When removing a peer off the raft group which contains even number of
+    // peers, the quorum would decrease by 1, e.g. 3 of 4 changes to 2 of 3. In
+    // this case, the log after removal may be committed before some previous
+    // logs, since we use the new configuration to deal the quorum of the
+    // removal request, we think it's safe to commit all the uncommitted
+    // previous logs, which is not well proved right now
+    // TODO: add vlog when committing previous logs
+    for (int64_t index = _pending_index; index <= last_committed_index; ++index) {
+        _pending_meta_queue.pop_front();
+    }
+
+    _pending_index = last_committed_index + 1;
+    _last_committed_index.store(last_committed_index, butil::memory_order_relaxed);
+    lck.unlock();
+    // The order doesn't matter
+    _waiter->on_committed(last_committed_index);
+    return 0;
+}
+```
+
+```cpp
+bool LogManager::check_and_set_configuration(ConfigurationEntry* current) {
+    if (current == NULL) {
+        CHECK(false) << "current should not be NULL";
+        return false;
+    }
+    BAIDU_SCOPED_LOCK(_mutex);
+
+    const ConfigurationEntry& last_conf = _config_manager->last_configuration();
+    if (current->id != last_conf.id) {
+        *current = last_conf;
+        return true;
+    }
+    return false;
+}
+```
+
+应用日志
+---
+
+```cpp
+void FSMCaller::do_committed(int64_t committed_index) {
+    if (!_error.status().ok()) {
+        return;
+    }
+    int64_t last_applied_index = _last_applied_index.load(
+                                        butil::memory_order_relaxed);
+
+    // We can tolerate the disorder of committed_index
+    if (last_applied_index >= committed_index) {
+        return;
+    }
+    std::vector<Closure*> closure;
+    int64_t first_closure_index = 0;
+    CHECK_EQ(0, _closure_queue->pop_closure_until(committed_index, &closure,
+                                                  &first_closure_index));
+
+    IteratorImpl iter_impl(_fsm, _log_manager, &closure, first_closure_index,
+                 last_applied_index, committed_index, &_applying_index);
+    for (; iter_impl.is_good();) {
+        if (iter_impl.entry()->type != ENTRY_TYPE_DATA) {
+            if (iter_impl.entry()->type == ENTRY_TYPE_CONFIGURATION) {
+                if (iter_impl.entry()->old_peers == NULL) {
+                    // Joint stage is not supposed to be noticeable by end users.
+                    _fsm->on_configuration_committed(
+                            Configuration(*iter_impl.entry()->peers),
+                            iter_impl.entry()->id.index);
+                }
+            }
+            // For other entries, we have nothing to do besides flush the
+            // pending tasks and run this closure to notify the caller that the
+            // entries before this one were successfully committed and applied.
+            if (iter_impl.done()) {
+                iter_impl.done()->Run();
+            }
+            iter_impl.next();
+            continue;
+        }
+        Iterator iter(&iter_impl);
+        _fsm->on_apply(iter);
+        LOG_IF(ERROR, iter.valid())
+                << "Node " << _node->node_id()
+                << " Iterator is still valid, did you return before iterator "
+                   " reached the end?";
+        // Try move to next in case that we pass the same log twice.
+        iter.next();
+    }
+    if (iter_impl.has_error()) {
+        set_error(iter_impl.error());
+        iter_impl.run_the_rest_closure_with_error();
+    }
+    const int64_t last_index = iter_impl.index() - 1;
+    const int64_t last_term = _log_manager->get_term(last_index);
+    LogId last_applied_id(last_index, last_term);
+    _last_applied_index.store(committed_index, butil::memory_order_release);
+    _last_applied_term = last_term;
+    _log_manager->set_applied_id(last_applied_id);
+}
+```
+
+回调 Closure
 ---
 
 ```cpp
@@ -683,15 +995,30 @@ void NodeImpl::on_configuration_change_done(int64_t term) {
 ```
 
 
-阶段四：清理工作
+阶段三：同步新配置
 ===
 
-新阶段
+进入新阶段
 ---
 
 ```cpp
 void NodeImpl::ConfigurationCtx::next_stage() {
-    ...
+    CHECK(is_busy());
+    switch (_stage) {
+    case STAGE_CATCHING_UP:
+        if (_nchanges > 1) {
+            _stage = STAGE_JOINT;
+            Configuration old_conf(_old_peers);
+            return _node->unsafe_apply_configuration(
+                    Configuration(_new_peers), &old_conf, false);
+        }
+        // Skip joint consensus since only one peer has been changed here. Make
+        // it a one-stage change to be compitible with the legacy
+        // implementation.
+    case STAGE_JOINT:  // (1) 执行该分支
+        _stage = STAGE_STABLE;  // (2) 进入 Stable 阶段
+        return _node->unsafe_apply_configuration(
+                    Configuration(_new_peers), NULL, false);
     case STAGE_STABLE:
         {
             bool should_step_down =
@@ -704,50 +1031,162 @@ void NodeImpl::ConfigurationCtx::next_stage() {
             }
             return;
         }
-    ...
+    case STAGE_NONE:
+        CHECK(false) << "Can't reach here";
+        return;
+    }
 }
 ```
 
-```cpp
-void NodeImpl::ConfigurationCtx::reset(butil::Status* st) {
-    // reset() should be called only once
-    if (_stage == STAGE_NONE) {
-        BRAFT_VLOG << "node " << _node->node_id()
-                   << " reset ConfigurationCtx when stage is STAGE_NONE already";
-        return;
-    }
+应用 `C{new}`
+---
 
-    LOG(INFO) << "node " << _node->node_id()
-              << " reset ConfigurationCtx, new_peers: " << Configuration(_new_peers)
-              << ", old_peers: " << Configuration(_old_peers);
-    if (st && st->ok()) {
-        _node->stop_replicator(_new_peers, _old_peers);
-    } else {
-        // leader step_down may stop replicators of catching up nodes, leading to
-        // run catchup_closure
-        _node->stop_replicator(_old_peers, _new_peers);
+```cpp
+void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
+                                          const Configuration* old_conf,
+                                          bool leader_start) {
+    CHECK(_conf_ctx.is_busy());
+    LogEntry* entry = new LogEntry();
+    entry->AddRef();
+    entry->id.term = _current_term;
+    entry->type = ENTRY_TYPE_CONFIGURATION;
+    entry->peers = new std::vector<PeerId>;
+    new_conf.list_peers(entry->peers);
+    if (old_conf) {
+        entry->old_peers = new std::vector<PeerId>;
+        old_conf->list_peers(entry->old_peers);
     }
-    _new_peers.clear();
-    _old_peers.clear();
-    _adding_peers.clear();
-    ++_version;
-    _stage = STAGE_NONE;
-    _nchanges = 0;
-    _node->check_majority_nodes_readonly();
-    if (_done) {
-        if (!st) {
-            _done->status().set_error(EPERM, "leader stepped down");
-        } else {
-            _done->status() = *st;
+    ConfigurationChangeDone* configuration_change_done =
+            new ConfigurationChangeDone(this, _current_term, leader_start, _leader_lease.lease_epoch());
+    // Use the new_conf to deal the quorum of this very log
+    _ballot_box->append_pending_task(new_conf, old_conf, configuration_change_done);
+
+    std::vector<LogEntry*> entries;
+    entries.push_back(entry);
+    _log_manager->append_entries(&entries,
+                                 new LeaderStableClosure(
+                                        NodeId(_group_id, _server_id),
+                                        1u, _ballot_box));
+    _log_manager->check_and_set_configuration(&_conf);
+}
+```
+
+复制日志
+---
+
+提交日志
+---
+
+应用日志
+---
+
+回调 Closure
+---
+
+```cpp
+class ConfigurationChangeDone : public Closure {
+public:
+    void Run() {
+        if (status().ok()) {
+            _node->on_configuration_change_done(_term);
+            ...
         }
-        run_closure_in_bthread(_done);
-        _done = NULL;
+        ...
+    }
+    ...
+};
+
+void NodeImpl::on_configuration_change_done(int64_t term) {
+    ...
+    _conf_ctx.next_stage();
+}
+```
+
+
+阶段四：清理工作
+===
+
+进入新阶段
+---
+
+调用 `next_stage` 进入清理阶段：
+
+```cpp
+void NodeImpl::ConfigurationCtx::next_stage() {
+    CHECK(is_busy());
+    switch (_stage) {
+    case STAGE_CATCHING_UP:
+        if (_nchanges > 1) {
+            _stage = STAGE_JOINT;
+            Configuration old_conf(_old_peers);
+            return _node->unsafe_apply_configuration(
+                    Configuration(_new_peers), &old_conf, false);
+        }
+        // Skip joint consensus since only one peer has been changed here. Make
+        // it a one-stage change to be compitible with the legacy
+        // implementation.
+    case STAGE_JOINT:
+        _stage = STAGE_STABLE;
+        return _node->unsafe_apply_configuration(
+                    Configuration(_new_peers), NULL, false);
+    case STAGE_STABLE:  // (1) 执行该分支
+        {
+            bool should_step_down =
+                _new_peers.find(_node->_server_id) == _new_peers.end();
+            // (2) 以成功状态码调用 reset 进行一些清理工作，
+            //     以及回调用户通过接口传递的 Closure
+            butil::Status st = butil::Status::OK();
+            reset(&st);
+            // (3) 如果当前 Leader 不在新配置中，则调用 step_down
+            if (should_step_down) {
+                _node->step_down(_node->_current_term, true,
+                        butil::Status(ELEADERREMOVED, "This node was removed"));
+            }
+            return;
+        }
+    case STAGE_NONE:
+        CHECK(false) << "Can't reach here";
+        return;
     }
 }
 ```
 
 停止 Replicator
 ---
+回调 Closure
+---
+
+`reset` 函数会执行一些清理工作以及回调接口的 `Closure`，详见以下注释：
+
+```cpp
+void NodeImpl::ConfigurationCtx::reset(butil::Status* st) {
+    // (1) 调用 NodeImpl::stop_replicator 停止不在新配置中的 Replicator
+    if (st && st->ok()) {
+        _node->stop_replicator(_new_peers, _old_peers);
+    } else {
+        ...
+    }
+    // (2) 清空一些状态
+    _new_peers.clear();
+    _old_peers.clear();
+    _adding_peers.clear();
+    ++_version;
+    _stage = STAGE_NONE;
+    _nchanges = 0;
+    ...
+    // (3) 若用户在调用接口（[add|remove|change]_peers）时有传入 Closure，
+    //     则以成功状态回调 Closure
+    if (_done) {
+        ...
+        _done->status() = *st;
+        ...
+        run_closure_in_bthread(_done);
+        ...
+    }
+}
+```
+
+`stop_replicator` 函数会清理不在新配置中 Follower 对应的 `Replicator`，具体流程见以下注释：
 
 ```cpp
 void NodeImpl::stop_replicator(const std::set<PeerId>& keep,
@@ -755,80 +1194,118 @@ void NodeImpl::stop_replicator(const std::set<PeerId>& keep,
     for (std::set<PeerId>::const_iterator
             iter = drop.begin(); iter != drop.end(); ++iter) {
         if (keep.find(*iter) == keep.end() && *iter != _server_id) {
+            // (1) 如果节点不在新配置中，则调用 `ReplicatorGroup::stop_replicator` 停止其 Replicator
             _replicator_group.stop_replicator(*iter);
         }
     }
 }
-```
 
-```cpp
 int ReplicatorGroup::stop_replicator(const PeerId &peer) {
+    // (2) 找到节点最用的 Replicator
     std::map<PeerId, ReplicatorIdAndStatus>::iterator iter = _rmap.find(peer);
-    if (iter == _rmap.end()) {
-        return -1;
-    }
+    ...
     ReplicatorId rid = iter->second.id;
     // Calling ReplicatorId::stop might lead to calling stop_replicator again,
     // erase iter first to avoid race condition
-    _rmap.erase(iter);
-    return Replicator::stop(rid);
+    _rmap.erase(iter);  // (3) 将其从 ReplicatorGroup 中删除
+    return Replicator::stop(rid);  // (4) 调用 Replicator::stop
 }
-```
 
-```cpp
 int Replicator::stop(ReplicatorId id) {
     bthread_id_t dummy_id = { id };
-    Replicator* r = NULL;
-    // already stopped
-    if (bthread_id_lock(dummy_id, (void**)&r) != 0) {
+    ...
+    // (5) 向 Replicator 对应的 bthread 发送 ESTOP 状态码
+    return bthread_id_error(dummy_id, ESTOP);
+}
+
+int Replicator::_on_error(bthread_id_t id, void* arg, int error_code) {
+    Replicator* r = (Replicator*)arg;
+    // (6) 接受到状态码后，会调用 _on_error 处理
+    if (error_code == ESTOP) {
+        ...
+        bthread_timer_del(r->_heartbeat_timer);  // (6.1) 停止向其发送心跳
+        r->_options.log_manager->remove_waiter(r->_wait_id);  // (6.2) 停止向其复制日志
+        ...
+        r->_wait_id = 0;
+        ...
         return 0;
     }
-    // to run _catchup_closure if it is not NULL
-    r->_notify_on_caught_up(EPERM, true);
-    CHECK_EQ(0, bthread_id_unlock(dummy_id)) << "Fail to unlock " << dummy_id;
-    return bthread_id_error(dummy_id, ESTOP);
+    ...
 }
 ```
 
+step_down
+---
+
+在 `step_down` 函数中会向一个日志最长的节点发送一个 `TimeoutNow` 请求，让其立马进行选举，该优化我们曾在[<3.2 选举优化>](/ch03/3.2/optimization.md)中提到过。`step_down` 的具体流程见以下注释：
+
 ```cpp
-int Replicator::_on_error(bthread_id_t id, void* arg, int error_code) {
-    Replicator* r = (Replicator*)arg;
-    if (error_code == ESTOP) {
-        brpc::StartCancel(r->_install_snapshot_in_fly);
-        brpc::StartCancel(r->_heartbeat_in_fly);
-        brpc::StartCancel(r->_timeout_now_in_fly);
-        r->_cancel_append_entries_rpcs();
-        bthread_timer_del(r->_heartbeat_timer);
-        r->_options.log_manager->remove_waiter(r->_wait_id);
-        r->_notify_on_caught_up(error_code, true);
-        r->_wait_id = 0;
-        LOG(INFO) << "Group " << r->_options.group_id
-                  << " Replicator=" << id << " is going to quit";
-        r->_destroy();
-        return 0;
-    } else if (error_code == ETIMEDOUT) {
-        // This error is issued in the TimerThread, start a new bthread to avoid
-        // blocking the caller.
-        // Unlock id to remove the context-switch out of the critical section
-        CHECK_EQ(0, bthread_id_unlock(id)) << "Fail to unlock" << id;
-        bthread_t tid;
-        if (bthread_start_urgent(&tid, NULL, _send_heartbeat,
-                                 reinterpret_cast<void*>(id.value)) != 0) {
-            PLOG(ERROR) << "Fail to start bthread";
-            _send_heartbeat(reinterpret_cast<void*>(id.value));
-        }
-        return 0;
-    } else {
-        CHECK(false) << "Group " << r->_options.group_id
-                     << " Unknown error_code=" << error_code;
-        CHECK_EQ(0, bthread_id_unlock(id)) << "Fail to unlock " << id;
-        return -1;
+void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate,
+                         const butil::Status& status) {
+    ...
+    // (1) 调用用户状态机的 on_leader_stop
+    if (_state == STATE_LEADER) {
+        _fsm_caller->on_leader_stop(status);
     }
+    ...
+    // (2) 将自身转变为 Follower
+    // soft state in memory
+    _state = STATE_FOLLOWER;
+    // (3) 向日志最长的节点发送 `TimeoutNow` 请求，让其立马进行选举
+    // stop stagging new node
+    if (wakeup_a_candidate) {
+        _replicator_group.stop_all_and_find_the_next_candidate(
+                                            &_waking_candidate, _conf);
+        // FIXME: We issue the RPC in the critical section, which is fine now
+        // since the Node is going to quit when reaching the branch
+        Replicator::send_timeout_now_and_stop(
+                _waking_candidate, _options.election_timeout_ms);
+    } else {
+        ...
+    }
+    ...
+    // (4) 启动选举超时定时器，待其超时后会触发该节点进行选举
+    _election_timer.start();
 }
 ```
 
 其他：故障恢复
 ===
+
+```cpp
+// in lock
+void NodeImpl::become_leader() {
+    ...
+    // cancel candidate vote timer
+    _vote_timer.stop();  // (1) 停止投票计时器
+    ...
+    _state = STATE_LEADER;  // (2) 将自身角色转变为 Leader
+    _leader_id = _server_id;  // (3) 记录当前 leaderId 为自身的 PeerId
+    ...
+    // (3) 为所有 Follower 创建 Replicator，Replicator 主要负责向 Follower 发送心跳、日志等
+    std::set<PeerId> peers;
+    _conf.list_peers(&peers);
+    for (std::set<PeerId>::const_iterator
+            iter = peers.begin(); iter != peers.end(); ++iter) {
+        ...
+        _replicator_group.add_replicator(*iter);
+    }
+
+    // (4) 设置最小可以提交的 logIndex，在这之前的日志就算复制达到了 Quorum，也不会更新 commitIndex
+    //     注意：这是实现只复制但不提交上一任期日志的关键
+    // init commit manager
+    _ballot_box->reset_pending_index(_log_manager->last_log_index() + 1);
+
+    // (5) 复制并提交本一条任期的配置日志
+    // Register _conf_ctx to reject configuration changing before the first log
+    // is committed.
+    _conf_ctx.flush(_conf.conf, _conf.old_conf);
+
+    // (6) 启动 StepdownTimer，用于实现 Check Quorum 优化
+    //     详见 <3.2 选举优化> 小节
+    _stepdown_timer.start();
+}
+```
 
 ```cpp
 void NodeImpl::ConfigurationCtx::flush(const Configuration& conf,
