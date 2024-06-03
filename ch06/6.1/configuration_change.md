@@ -21,12 +21,12 @@
         * 4.1.2 在该阶段，日志复制需要同时在新老集群**都**达到 `Qourum` 才能提交
     * 4.2 Leader 将联合配置日志（即 `C{old,new}`）同时复制给新老集群；当然也复制其他日志
     * 4.3 待联合配置日志在新老集群都达到 `Qourum`，则提交并应用该日志：
-        * 4.3.1 调用该配置的 `Closure`，进入下一阶段
+        * 4.3.1 调用该日志的 `Closure`，进入下一阶段
 5. 进入同步新配置（`Stable`）阶段：
     * 5.1 Leader 应用新配置（即 `C{new}`）为当前配置，以该配置视角进行选举和日志复制：
         * 5.1.1 在该阶段，选举**只需**在新集群达到 `Qourum`
         * 5.1.2 在该阶段，日志**只需**在新集群达到 `Qourum` 即可提交
-        * 5.1.3 在该阶段，日志仍会被复制给新老集群，因为老集群节点的 `Replicator` 还未停止
+        * 5.1.3 在该阶段，日志仍会被复制给老集群，因为老集群节点的 `Replicator` 还未停止
     * 5.2 Leader 将新配置日志（即 `C{new}`）同时复制给新老集群；当然也复制其他日志
     * 5.3 待新配置日志在新集群中达到 `Qourum`，则提交并应用该日志：
         * 5.3.1 以新配置作为参数，调用用户状态机的 `on_configuration_committed`
@@ -111,7 +111,7 @@ public:
 调用接口
 ---
 
-调用调用各节点进行配置变更，在这些接口中，会生成新配置和老配置，并调用 `on_configuration_committed` 执行变更：
+用户调用各接口要求 Leader 进行配置变更。在这些接口中，会生成新配置和老配置，最终都会调用 `on_configuration_committed` 执行变更：
 
 ```cpp
 void NodeImpl::add_peer(const PeerId& peer, Closure* done) {
@@ -134,7 +134,10 @@ void NodeImpl::change_peers(const Configuration& new_peers, Closure* done) {
 }
 ```
 
-而在 `unsafe_register_conf_change` 函数中首先会进行一些判断，决定是否要执行变更。如要进行变更，则调用 `ConfigurationCtx::start` 正式开始变更：
+开始变更
+---
+
+而在 `unsafe_register_conf_change` 函数中首先做进行一些判断，决定是否要执行变更。若要进行变更，则调用 `ConfigurationCtx::start` 正式开始变更：
 
 ```cpp
 void NodeImpl::unsafe_register_conf_change(const Configuration& old_conf,
@@ -151,7 +154,7 @@ void NodeImpl::unsafe_register_conf_change(const Configuration& old_conf,
         return;
     }
     ...
-    // (2) 如果新老配置一样，则理解返回
+    // (2) 如果新老配置一样，则直接返回
     if (_conf.conf.equals(new_conf)) {
         run_closure_in_bthread(done);
         return;
@@ -162,20 +165,17 @@ void NodeImpl::unsafe_register_conf_change(const Configuration& old_conf,
 }
 ```
 
-开始变更
----
-创建 Replicator
----
-
-详见 [创建 Replicator](/ch03/3.1/election.d#chuang-jian-replicator)
+`ConfigurationCtx::start` 的主要流程详见以下注释：
 
 ```cpp
 void NodeImpl::ConfigurationCtx::start(const Configuration& old_conf,
                                        const Configuration& new_conf,
                                        Closure* done) {
+    // (1) 保存接口的 Closure，将当前阶段设为 `STAGE_CATCHING_UP`
     _done = done;
     _stage = STAGE_CATCHING_UP;
 
+    // (2) 将新老配置做 diff，获得新增节点列表
     old_conf.list_peers(&_old_peers);
     new_conf.list_peers(&_new_peers);
     Configuration adding;
@@ -183,23 +183,25 @@ void NodeImpl::ConfigurationCtx::start(const Configuration& old_conf,
     new_conf.diffs(old_conf, &adding, &removing);
     _nchanges = adding.size() + removing.size();
 
+    // (3) 如果没有新增节点，则直接进入下一阶段（联合共识）
     if (adding.empty()) {
         ...
         return next_stage();
     }
 
-    LOG(INFO) << ss.str();
     adding.list_peers(&_adding_peers);
     for (std::set<PeerId>::const_iterator iter
             = _adding_peers.begin(); iter != _adding_peers.end(); ++iter) {
+        // (4) 为每个新增节点创建 Replicator，详见以下 <创建 Replicator>
         if (_node->_replicator_group.add_replicator(*iter) != 0) {
             ...
             return on_caughtup(_version, *iter, false);
         }
+
+        // (5) 为每个新增节点保存 CatchupClosure 用来判断追赶进度，详见以下 <保存 Closure>
         OnCaughtUp* caught_up = new OnCaughtUp(
                 _node, _node->_current_term, *iter, _version);
-        timespec due_time = butil::milliseconds_from_now(
-                _node->_options.get_catchup_timeout_ms());
+        ...
         if (_node->_replicator_group.wait_caughtup(
             *iter, _node->_options.catchup_margin, &due_time, caught_up) != 0) {
             ...
@@ -207,8 +209,31 @@ void NodeImpl::ConfigurationCtx::start(const Configuration& old_conf,
     }
 ```
 
+创建 Replicator
+---
+
+`ReplicatorGroup::add_replicator` 会为每个节点创建 `Replicator`，并将其启动，`Replicator` 负责发送心跳和同步日志。
+
+关于 `Replicator` 的创建，我们已经在<3.1 选举流程>中详细介绍过了，见[创建 Replicator](/ch03/3.1/election.md#chuang-jian-replicator)：
+
+```cpp
+int ReplicatorGroup::add_replicator(const PeerId& peer) {
+    ...
+    options.replicator_status = new ReplicatorStatus;
+    ...
+    if (Replicator::start(options, &rid) != 0) {
+        ...
+        return -1;
+    }
+    _rmap[peer] = { rid, options.replicator_status };
+    return 0;
+}
+```
+
 保存 Closure
 ---
+
+在<开始变更>的主干函数中会调用 `ReplicatorGroup::wait_caughtup` 为每个新增节点保存 `OnCaughtUp`，其会在安装快照或同步日志后被调用，来判断追赶进度是否可以进入下一阶段。具体流程见以下注释：
 
 ```cpp
 int ReplicatorGroup::wait_caughtup(const PeerId& peer,
@@ -223,169 +248,42 @@ void Replicator::wait_for_caught_up(ReplicatorId id,
                                     int64_t max_margin,
                                     const timespec* due_time,
                                     CatchupClosure* done) {
+    ...
+    // 保存 CatchupClosure 为 `OnCaughtUp`
     r->_catchup_closure = done;
 }
-```
-
-```cpp
-class OnCaughtUp : public CatchupClosure {
-public:
-    ...
-    virtual void Run() {
-        _node->on_caughtup(_peer, _term, _version, status());
-        delete this;
-    };
-    ...
-};
 ```
 
 安装快照
 ---
 
+当 `Replicator` 被创建后，其就会调用 `_send_entries` 开始复制日志。由于新加入的节点需要的日志很大概率已经被快照压缩了，所以需要向其安装快照。安装快照的流程我们已经在[<5.2 安装快照>](/ch05/5.2/install_snapshot.md)中详细介绍过来，这里只阐述相关流程：
+
 ```cpp
 void Replicator::_send_entries() {
-    if (_flying_append_entries_size >= FLAGS_raft_max_entries_size ||
-        _append_entries_in_fly.size() >= (size_t)FLAGS_raft_max_parallel_append_entries_rpc_num ||
-        _st.st == BLOCKING) {
-        BRAFT_VLOG << "node " << _options.group_id << ":" << _options.server_id
-            << " skip sending AppendEntriesRequest to " << _options.peer_id
-            << ", too many requests in flying, or the replicator is in block,"
-            << " next_index " << _next_index << " flying_size " << _flying_append_entries_size;
-        CHECK_EQ(0, bthread_id_unlock(_id)) << "Fail to unlock " << _id;
-        return;
-    }
-
-    std::unique_ptr<brpc::Controller> cntl(new brpc::Controller);
-    std::unique_ptr<AppendEntriesRequest> request(new AppendEntriesRequest);
-    std::unique_ptr<AppendEntriesResponse> response(new AppendEntriesResponse);
-    // 情况 1：已经发送给 Follower 的最后一条日志已经被压缩了
+    ...
+    // (1) 如果日志已经被压缩了，则安装快照
     if (_fill_common_fields(request.get(), _next_index - 1, false) != 0) {
-        _reset_next_index();
+        ...
+        // (2) 开始安装快照
         return _install_snapshot();
     }
-    EntryMeta em;
-    const int max_entries_size = FLAGS_raft_max_entries_size - _flying_append_entries_size;
-    int prepare_entry_rc = 0;
-    CHECK_GT(max_entries_size, 0);
-    for (int i = 0; i < max_entries_size; ++i) {
-        // 生成每一个 LogEntry，在 _prepare_entry 中通过判断 Log Index 对应的 Term 在没在
-        // 从而找到最后的 Log
-        prepare_entry_rc = _prepare_entry(i, &em, &cntl->request_attachment());
-        if (prepare_entry_rc != 0) {
-            break;
-        }
-        request->add_entries()->Swap(&em);
-    }
-    if (request->entries_size() == 0) {
-        // _id is unlock in _wait_more
-        // 情况 2：follower 需要的第一条日志已经被压缩了
-        if (_next_index < _options.log_manager->first_log_index()) {
-            _reset_next_index();
-            return _install_snapshot();  // 为什么这里还会触发安装快照，
-        }
-        // NOTICE: a follower's readonly mode does not prevent install_snapshot
-        // as we need followers to commit conf log(like add_node) when
-        // leader reaches readonly as well
-        if (prepare_entry_rc == EREADONLY) {
-            if (_flying_append_entries_size == 0) {
-                _st.st = IDLE;
-            }
-            CHECK_EQ(0, bthread_id_unlock(_id)) << "Fail to unlock " << _id;
-            return;
-        }
-        return _wait_more_entries();
-    }
-
-    _append_entries_in_fly.push_back(FlyingAppendEntriesRpc(_next_index,
-                                     request->entries_size(), cntl->call_id()));
-    _append_entries_counter++;
-    _next_index += request->entries_size();
-    _flying_append_entries_size += request->entries_size();
-
-    g_send_entries_batch_counter << request->entries_size();
-
-    BRAFT_VLOG << "node " << _options.group_id << ":" << _options.server_id
-        << " send AppendEntriesRequest to " << _options.peer_id << " term " << _options.term
-        << " last_committed_index " << request->committed_index()
-        << " prev_log_index " << request->prev_log_index()
-        << " prev_log_term " << request->prev_log_term()
-        << " next_index " << _next_index << " count " << request->entries_size();
-    _st.st = APPENDING_ENTRIES;
-    _st.first_log_index = _min_flying_index();
-    _st.last_log_index = _next_index - 1;
-    google::protobuf::Closure* done = brpc::NewCallback(
-                _on_rpc_returned, _id.value, cntl.get(),
-                request.get(), response.get(), butil::monotonic_time_ms());
-    RaftService_Stub stub(&_sending_channel);
-    stub.append_entries(cntl.release(), request.release(),
-                        response.release(), done);
-    _wait_more_entries();
+    ...
 }
-```
 
-```cpp
+// (3) 待快照安装完成，收到节点的 `InstallSnapshot` 响应后，
+//     会调用 _on_install_snapshot_returned
 void Replicator::_on_install_snapshot_returned(
             ReplicatorId id, brpc::Controller* cntl,
             InstallSnapshotRequest* request,
             InstallSnapshotResponse* response) {
-    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
-    std::unique_ptr<InstallSnapshotRequest> request_guard(request);
-    std::unique_ptr<InstallSnapshotResponse> response_guard(response);
-    Replicator *r = NULL;
-    bthread_id_t dummy_id = { id };
-    bool succ = true;
-    if (bthread_id_lock(dummy_id, (void**)&r) != 0) {
-        return;
-    }
-    if (r->_reader) {
-        r->_options.snapshot_storage->close(r->_reader);
-        r->_reader = NULL;
-        if (r->_options.snapshot_throttle) {
-            r->_options.snapshot_throttle->finish_one_task(true);
-        }
-    }
-    std::stringstream ss;
-    ss << "received InstallSnapshotResponse from "
-       << r->_options.group_id << ":" << r->_options.peer_id
-       << " last_included_index " << request->meta().last_included_index()
-       << " last_included_term " << request->meta().last_included_term();
-    do {
-        if (cntl->Failed()) {
-            ss << " error: " << cntl->ErrorText();
-            LOG(INFO) << ss.str();
-
-            LOG_IF(WARNING, (r->_consecutive_error_times++) % 10 == 0)
-                            << "Group " << r->_options.group_id
-                            << " Fail to install snapshot at peer="
-                            << r->_options.peer_id
-                            <<", " << cntl->ErrorText();
-            succ = false;
-            break;
-        }
-        if (!response->success()) {
-            succ = false;
-            ss << " fail.";
-            LOG(INFO) << ss.str();
-            // Let heartbeat do step down
-            break;
-        }
-        // Success
-        r->_next_index = request->meta().last_included_index() + 1;
-        ss << " success.";
-        LOG(INFO) << ss.str();
-    } while (0);
-
-    // We don't retry installing the snapshot explicitly.
-    // dummy_id is unlock in _send_entries
-    if (!succ) {
-        return r->_block(butil::gettimeofday_us(), cntl->ErrorCode());
-    }
+    ...
     r->_has_succeeded = true;
+    // (4) 调用 Replicator::_notify_on_caught_up 判断日志差距
+    //     来决定继续同步日志，还是进入下一阶段，
+    //     详见以下<判断日志差距>
     r->_notify_on_caught_up(0, false);
-    if (r->_timeout_now_index > 0 && r->_timeout_now_index < r->_min_flying_index()) {
-        r->_send_timeout_now(false, false);
-    }
-    // dummy_id is unlock in _send_entries
+    ...
     return r->_send_entries();
 }
 ```
@@ -393,249 +291,33 @@ void Replicator::_on_install_snapshot_returned(
 同步日志
 ---
 
+如果日志差距仍大于配置值，则先继续调用 `_send_entries` 同步日志：
+
 ```cpp
 void Replicator::_send_entries() {
-    if (_flying_append_entries_size >= FLAGS_raft_max_entries_size ||
-        _append_entries_in_fly.size() >= (size_t)FLAGS_raft_max_parallel_append_entries_rpc_num ||
-        _st.st == BLOCKING) {
-        BRAFT_VLOG << "node " << _options.group_id << ":" << _options.server_id
-            << " skip sending AppendEntriesRequest to " << _options.peer_id
-            << ", too many requests in flying, or the replicator is in block,"
-            << " next_index " << _next_index << " flying_size " << _flying_append_entries_size;
-        CHECK_EQ(0, bthread_id_unlock(_id)) << "Fail to unlock " << _id;
-        return;
-    }
-
-    std::unique_ptr<brpc::Controller> cntl(new brpc::Controller);
-    std::unique_ptr<AppendEntriesRequest> request(new AppendEntriesRequest);
-    std::unique_ptr<AppendEntriesResponse> response(new AppendEntriesResponse);
-    // 情况 1：已经发送给 Follower 的最后一条日志已经被压缩了
-    if (_fill_common_fields(request.get(), _next_index - 1, false) != 0) {
-        _reset_next_index();
-        return _install_snapshot();
-    }
-    EntryMeta em;
-    const int max_entries_size = FLAGS_raft_max_entries_size - _flying_append_entries_size;
-    int prepare_entry_rc = 0;
-    CHECK_GT(max_entries_size, 0);
-    for (int i = 0; i < max_entries_size; ++i) {
-        // 生成每一个 LogEntry，在 _prepare_entry 中通过判断 Log Index 对应的 Term 在没在
-        // 从而找到最后的 Log
-        prepare_entry_rc = _prepare_entry(i, &em, &cntl->request_attachment());
-        if (prepare_entry_rc != 0) {
-            break;
-        }
-        request->add_entries()->Swap(&em);
-    }
-    if (request->entries_size() == 0) {
-        // _id is unlock in _wait_more
-        // 情况 2：follower 需要的第一条日志已经被压缩了
-        if (_next_index < _options.log_manager->first_log_index()) {
-            _reset_next_index();
-            return _install_snapshot();  // 为什么这里还会触发安装快照，
-        }
-        // NOTICE: a follower's readonly mode does not prevent install_snapshot
-        // as we need followers to commit conf log(like add_node) when
-        // leader reaches readonly as well
-        if (prepare_entry_rc == EREADONLY) {
-            if (_flying_append_entries_size == 0) {
-                _st.st = IDLE;
-            }
-            CHECK_EQ(0, bthread_id_unlock(_id)) << "Fail to unlock " << _id;
-            return;
-        }
-        return _wait_more_entries();
-    }
-
-    _append_entries_in_fly.push_back(FlyingAppendEntriesRpc(_next_index,
-                                     request->entries_size(), cntl->call_id()));
-    _append_entries_counter++;
-    _next_index += request->entries_size();
-    _flying_append_entries_size += request->entries_size();
-
-    g_send_entries_batch_counter << request->entries_size();
-
-    BRAFT_VLOG << "node " << _options.group_id << ":" << _options.server_id
-        << " send AppendEntriesRequest to " << _options.peer_id << " term " << _options.term
-        << " last_committed_index " << request->committed_index()
-        << " prev_log_index " << request->prev_log_index()
-        << " prev_log_term " << request->prev_log_term()
-        << " next_index " << _next_index << " count " << request->entries_size();
-    _st.st = APPENDING_ENTRIES;
-    _st.first_log_index = _min_flying_index();
-    _st.last_log_index = _next_index - 1;
+    ...
+    // (1) 发送 AppendEntries 请求同步日志，并设置回调函数为 `_on_rpc_returned`
     google::protobuf::Closure* done = brpc::NewCallback(
                 _on_rpc_returned, _id.value, cntl.get(),
                 request.get(), response.get(), butil::monotonic_time_ms());
     RaftService_Stub stub(&_sending_channel);
     stub.append_entries(cntl.release(), request.release(),
                         response.release(), done);
-    _wait_more_entries();
+    ...
 }
-```
 
-```cpp
+// (2) 收到 AppendEntries 响应，会调用 _on_rpc_returned
 void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
                      AppendEntriesRequest* request,
                      AppendEntriesResponse* response,
                      int64_t rpc_send_time) {
-    std::unique_ptr<brpc::Controller> cntl_guard(cntl);
-    std::unique_ptr<AppendEntriesRequest>  req_guard(request);
-    std::unique_ptr<AppendEntriesResponse> res_guard(response);
-    Replicator *r = NULL;
-    bthread_id_t dummy_id = { id };
-    const long start_time_us = butil::gettimeofday_us();
-    if (bthread_id_lock(dummy_id, (void**)&r) != 0) {
-        return;
-    }
-
-    std::stringstream ss;
-    ss << "node " << r->_options.group_id << ":" << r->_options.server_id
-       << " received AppendEntriesResponse from "
-       << r->_options.peer_id << " prev_log_index " << request->prev_log_index()
-       << " prev_log_term " << request->prev_log_term() << " count " << request->entries_size();
-
-    bool valid_rpc = false;
-    int64_t rpc_first_index = request->prev_log_index() + 1;
-    int64_t min_flying_index = r->_min_flying_index();  // _next_index - _flying_append_entries_size
-    CHECK_GT(min_flying_index, 0);
-
-    for (std::deque<FlyingAppendEntriesRpc>::iterator rpc_it = r->_append_entries_in_fly.begin();
-        rpc_it != r->_append_entries_in_fly.end(); ++rpc_it) {
-        if (rpc_it->log_index > rpc_first_index) {
-            break;
-        }
-        if (rpc_it->call_id == cntl->call_id()) {
-            valid_rpc = true;
-        }
-    }
-    if (!valid_rpc) {
-        ss << " ignore invalid rpc";
-        BRAFT_VLOG << ss.str();
-        CHECK_EQ(0, bthread_id_unlock(r->_id)) << "Fail to unlock " << r->_id;
-        return;
-    }
-
-    if (cntl->Failed()) {
-        ss << " fail, sleep.";
-        BRAFT_VLOG << ss.str();
-
-        // TODO: Should it be VLOG?
-        LOG_IF(WARNING, (r->_consecutive_error_times++) % 10 == 0)
-                        << "Group " << r->_options.group_id
-                        << " fail to issue RPC to " << r->_options.peer_id
-                        << " _consecutive_error_times=" << r->_consecutive_error_times
-                        << ", " << cntl->ErrorText();
-        // If the follower crashes, any RPC to the follower fails immediately,
-        // so we need to block the follower for a while instead of looping until
-        // it comes back or be removed
-        // dummy_id is unlock in block
-        r->_reset_next_index();
-        return r->_block(start_time_us, cntl->ErrorCode());
-    }
-    r->_consecutive_error_times = 0;
-    if (!response->success()) {
-        if (response->term() > r->_options.term) {
-            BRAFT_VLOG << " fail, greater term " << response->term()
-                       << " expect term " << r->_options.term;
-            r->_reset_next_index();
-
-            NodeImpl *node_impl = r->_options.node;
-            // Acquire a reference of Node here in case that Node is destroyed
-            // after _notify_on_caught_up.
-            node_impl->AddRef();
-            r->_notify_on_caught_up(EPERM, true);
-            butil::Status status;
-            status.set_error(EHIGHERTERMRESPONSE, "Leader receives higher term "
-                    "%s from peer:%s", response->GetTypeName().c_str(), r->_options.peer_id.to_string().c_str());
-            r->_destroy();
-            node_impl->increase_term_to(response->term(), status);
-            node_impl->Release();
-            return;
-        }
-        ss << " fail, find next_index remote last_log_index " << response->last_log_index()
-           << " local next_index " << r->_next_index
-           << " rpc prev_log_index " << request->prev_log_index();
-        BRAFT_VLOG << ss.str();
-        r->_update_last_rpc_send_timestamp(rpc_send_time);
-        // prev_log_index and prev_log_term doesn't match
-        r->_reset_next_index();
-        if (response->last_log_index() + 1 < r->_next_index) {
-            BRAFT_VLOG << "Group " << r->_options.group_id
-                       << " last_log_index at peer=" << r->_options.peer_id
-                       << " is " << response->last_log_index();
-            // The peer contains less logs than leader
-            r->_next_index = response->last_log_index() + 1;
-        } else {
-            // The peer contains logs from old term which should be truncated,
-            // decrease _last_log_at_peer by one to test the right index to keep
-            if (BAIDU_LIKELY(r->_next_index > 1)) {
-                BRAFT_VLOG << "Group " << r->_options.group_id
-                           << " log_index=" << r->_next_index << " mismatch";
-                --r->_next_index;
-            } else {
-                LOG(ERROR) << "Group " << r->_options.group_id
-                           << " peer=" << r->_options.peer_id
-                           << " declares that log at index=0 doesn't match,"
-                              " which is not supposed to happen";
-            }
-        }
-        // dummy_id is unlock in _send_heartbeat
-        r->_send_empty_entries(false);
-        return;
-    }
-
-    ss << " success";
-    BRAFT_VLOG << ss.str();
-
-    if (response->term() != r->_options.term) {
-        LOG(ERROR) << "Group " << r->_options.group_id
-                   << " fail, response term " << response->term()
-                   << " mismatch, expect term " << r->_options.term;
-        r->_reset_next_index();
-        CHECK_EQ(0, bthread_id_unlock(r->_id)) << "Fail to unlock " << r->_id;
-        return;
-    }
-    r->_update_last_rpc_send_timestamp(rpc_send_time);
-    const int entries_size = request->entries_size();
-    const int64_t rpc_last_log_index = request->prev_log_index() + entries_size;
-    BRAFT_VLOG_IF(entries_size > 0) << "Group " << r->_options.group_id
-                                    << " replicated logs in ["
-                                    << min_flying_index << ", "
-                                    << rpc_last_log_index
-                                    << "] to peer " << r->_options.peer_id;
-    if (entries_size > 0) {
-        r->_options.ballot_box->commit_at(
-                min_flying_index, rpc_last_log_index,
-                r->_options.peer_id);
-        int64_t rpc_latency_us = cntl->latency_us();
-        if (FLAGS_raft_trace_append_entry_latency &&
-            rpc_latency_us > FLAGS_raft_append_entry_high_lat_us) {
-            LOG(WARNING) << "append entry rpc latency us " << rpc_latency_us
-                         << " greater than "
-                         << FLAGS_raft_append_entry_high_lat_us
-                         << " Group " << r->_options.group_id
-                         << " to peer  " << r->_options.peer_id
-                         << " request entry size " << entries_size
-                         << " request data size "
-                         <<  cntl->request_attachment().size();
-        }
-        g_send_entries_latency << cntl->latency_us();
-        if (cntl->request_attachment().size() > 0) {
-            g_normalized_send_entries_latency <<
-                cntl->latency_us() * 1024 / cntl->request_attachment().size();
-        }
-    }
-    // A rpc is marked as success, means all request before it are success,
-    // erase them sequentially.
-    while (!r->_append_entries_in_fly.empty() &&
-           r->_append_entries_in_fly.front().log_index <= rpc_first_index) {
-        r->_flying_append_entries_size -= r->_append_entries_in_fly.front().entries_size;
-        r->_append_entries_in_fly.pop_front();
-    }
+    ...
     r->_has_succeeded = true;
     r->_notify_on_caught_up(0, false);
     ...
+    // (4) 调用 Replicator::_notify_on_caught_up 判断日志差距
+    //     来决定继续同步日志，还是进入下一阶段，
+    //     详见以下<判断日志差距>
     r->_send_entries();
     return;
 }
@@ -706,6 +388,8 @@ void NodeImpl::ConfigurationCtx::on_caughtup(
 进入新阶段
 ---
 
+当所有新增节点都追赶上了 Leader 的日志，则调用 `next_stage` 进入下一阶段，详见以下注释：
+
 ```cpp
 void NodeImpl::ConfigurationCtx::next_stage() {
     CHECK(is_busy());
@@ -714,7 +398,7 @@ void NodeImpl::ConfigurationCtx::next_stage() {
         if (_nchanges > 1) {
             _stage = STAGE_JOINT;  // (2) 进入联合共识阶段
             Configuration old_conf(_old_peers);
-            return _node->unsafe_apply_configuration(  // (3) 调用 unsafe_apply_configuration 应用联合日志（即 C{old,new}）
+            return _node->unsafe_apply_configuration(  // (3) 调用 unsafe_apply_configuration 开始变更
                     Configuration(_new_peers), &old_conf, false);
         }
         // Skip joint consensus since only one peer has been changed here. Make
@@ -746,10 +430,13 @@ void NodeImpl::ConfigurationCtx::next_stage() {
 开始变更
 ---
 
+`unsafe_apply_configuration` 具体会执行以下这些工作，详见以下注释，其中的每一项工作我们将在之后逐一介绍：
+
 ```cpp
 void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
                                           const Configuration* old_conf,
                                           bool leader_start) {
+    // (1) 生产配置日志，根据 new_conf 和 old_conf 生成联合配置日志或是新配置日志
     LogEntry* entry = new LogEntry();
     entry->AddRef();
     entry->id.term = _current_term;
@@ -761,16 +448,66 @@ void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
         old_conf->list_peers(entry->old_peers);
     }
 
+    // (2) 设置日志应用后的回调函数，
+    //     即该配置日志被复制并成功应用后，就会调用该回调函数
     ConfigurationChangeDone* configuration_change_done =
         new ConfigurationChangeDone(this, _current_term, leader_start, _leader_lease.lease_epoch());
+
+    // (3) 为这个配置日志初始化投票规则，这是实现在新老集群同时达到 Quorum 才能提交
+    //     还是只需要在新集群达到 Quorum 就可以提交的关键
     // Use the new_conf to deal the quorum of this very log
     _ballot_box->append_pending_task(new_conf, old_conf, configuration_change_done);
     ...
+    // (4) 将配置日志追加到 LogManager，其会唤醒 Replicator 向 Follower 同步日志
     _log_manager->append_entries(&entries,
                                  new LeaderStableClosure(
                                         NodeId(_group_id, _server_id),
                                         1u, _ballot_box));
+    // (5) 将配置（联合配置或新配置）设为当前节点配置
     _log_manager->check_and_set_configuration(&_conf);
+}
+```
+
+初始化投票规则
+---
+
+```cpp
+int BallotBox::append_pending_task(const Configuration& conf, const Configuration* old_conf,
+                                   Closure* closure) {
+    // (1) 调用 Ballot::init
+    Ballot bl;
+    if (bl.init(conf, old_conf) != 0) {
+        return -1;
+    }
+    ...
+}
+
+int Ballot::init(const Configuration& conf, const Configuration* old_conf) {
+    _peers.clear();
+    _old_peers.clear();
+    // （1）初始化 quorum 和 old_quorum 为 0
+    _quorum = 0;
+    _old_quorum = 0;
+
+    // (2) 如果是新配置，只设置 _quorum
+    _peers.reserve(conf.size());
+    for (Configuration::const_iterator
+            iter = conf.begin(); iter != conf.end(); ++iter) {
+        _peers.push_back(*iter);
+    }
+    _quorum = _peers.size() / 2 + 1;
+
+    // (3) 如果是联合配置，_old_quorum 也将被设置
+    if (!old_conf) {
+        return 0;
+    }
+    _old_peers.reserve(old_conf->size());
+    for (Configuration::const_iterator
+            iter = old_conf->begin(); iter != old_conf->end(); ++iter) {
+        _old_peers.push_back(*iter);
+    }
+    _old_quorum = _old_peers.size() / 2 + 1;
+    return 0;
 }
 ```
 
@@ -812,70 +549,25 @@ void LogManager::append_entries(
 
 调用 `LogManager::append_entries` 追加配置日志（即 `C{old,new}`） 后，`Replicator` 就会被唤醒向 Follower 同步日志。
 
-Leader 会将普通日志和配置日志（即 `C{old,new}`）复制给新老集群，每收到一个节点的成功响应，都会调用 ``
-
-
-
-
-```cpp
-int BallotBox::append_pending_task(const Configuration& conf, const Configuration* old_conf,
-                                   Closure* closure) {
-    Ballot bl;
-    if (bl.init(conf, old_conf) != 0) {
-        CHECK(false) << "Fail to init ballot";
-        return -1;
-    }
-
-    BAIDU_SCOPED_LOCK(_mutex);
-    CHECK(_pending_index > 0);
-    _pending_meta_queue.push_back(Ballot());
-    _pending_meta_queue.back().swap(bl);
-    _closure_queue->append_pending_closure(closure);
-    return 0;
-}
-```
+Leader 会将普通日志和配置日志（即 `C{old,new}`）复制给新老集群，每收到一个节点的成功响应，都会调用 `BallotBox::commit_at` 将对应日志的计算加一，如果其达到了 `Quorum` 则提交并应用该日志。具体的日志复制流程我们在之前的章节都详细介绍过了，详见[<4.1 复制流程>](/ch04/4.1/replicate.md)。
 
 提交日志
 ---
 
-```cpp
-int Ballot::init(const Configuration& conf, const Configuration* old_conf) {
-    _peers.clear();
-    _old_peers.clear();
-    _quorum = 0;
-    _old_quorum = 0;
-
-    _peers.reserve(conf.size());
-    for (Configuration::const_iterator
-            iter = conf.begin(); iter != conf.end(); ++iter) {
-        _peers.push_back(*iter);
-    }
-    _quorum = _peers.size() / 2 + 1;
-    if (!old_conf) {
-        return 0;
-    }
-    _old_peers.reserve(old_conf->size());
-    for (Configuration::const_iterator
-            iter = old_conf->begin(); iter != old_conf->end(); ++iter) {
-        _old_peers.push_back(*iter);
-    }
-    _old_quorum = _old_peers.size() / 2 + 1;
-    return 0;
-}
-```
+Leader 本地持久化成功或每成功复制日志给一个 Follower，都会调用 BallotBox::commit_at 将对应日志的复制计数加一，如果达到 Quorum，则更新 commitIndex，并将其应用:
 
 ```cpp
-// 将 index 在 [fist_log_index, last_log_index] 之间的日志的投票数加一
 int BallotBox::commit_at(
         int64_t first_log_index, int64_t last_log_index, const PeerId& peer) {
     ...
+    // (1) 将 index 在 [first_log_index, last_log_index] 之间的日志计数加一
     int64_t last_committed_index = 0;
     const int64_t start_at = std::max(_pending_index, first_log_index);
     Ballot::PosHint pos_hint;
     for (int64_t log_index = start_at; log_index <= last_log_index; ++log_index) {
         Ballot& bl = _pending_meta_queue[log_index - _pending_index];
         pos_hint = bl.grant(peer, pos_hint);
-        if (bl.granted()) {
+        if (bl.granted()) {  // (2) 该日志在新老集群都达到 Quorum，则提交该日志，见以下的 granted 函数
             last_committed_index = log_index;
         }
     }
@@ -883,53 +575,42 @@ int BallotBox::commit_at(
     if (last_committed_index == 0) {
         return 0;
     }
-
-    // When removing a peer off the raft group which contains even number of
-    // peers, the quorum would decrease by 1, e.g. 3 of 4 changes to 2 of 3. In
-    // this case, the log after removal may be committed before some previous
-    // logs, since we use the new configuration to deal the quorum of the
-    // removal request, we think it's safe to commit all the uncommitted
-    // previous logs, which is not well proved right now
-    // TODO: add vlog when committing previous logs
-    for (int64_t index = _pending_index; index <= last_committed_index; ++index) {
-        _pending_meta_queue.pop_front();
-    }
-
+    ...
     _pending_index = last_committed_index + 1;
+    // (3) 更新 commitIndex
     _last_committed_index.store(last_committed_index, butil::memory_order_relaxed);
-    lck.unlock();
+    // (4) 调用 FSMCaller::on_committed 开始应用日志
     // The order doesn't matter
     _waiter->on_committed(last_committed_index);
     return 0;
 }
 ```
 
+`granted` 中的 `_quorum` 和 `_old_quorum` 都在以上的<初始化投票规则>中设为相应的值了：
 
+```cpp
+class Ballot {
+public:
+...
+    bool granted() const { return _quorum <= 0 && _old_quorum <= 0; }
+...
+}
+```
 
 应用日志
 ---
 
+`FSMCaller::on_committed` 最终会调用 `FSMCaller::do_committed` 开始应用日志，具体见以下注释：
+
 ```cpp
 void FSMCaller::do_committed(int64_t committed_index) {
-    if (!_error.status().ok()) {
-        return;
-    }
-    int64_t last_applied_index = _last_applied_index.load(
-                                        butil::memory_order_relaxed);
-
-    // We can tolerate the disorder of committed_index
-    if (last_applied_index >= committed_index) {
-        return;
-    }
-    std::vector<Closure*> closure;
-    int64_t first_closure_index = 0;
-    CHECK_EQ(0, _closure_queue->pop_closure_until(committed_index, &closure,
-                                                  &first_closure_index));
-
+    ...
     IteratorImpl iter_impl(_fsm, _log_manager, &closure, first_closure_index,
                  last_applied_index, committed_index, &_applying_index);
     for (; iter_impl.is_good();) {
-        if (iter_impl.entry()->type != ENTRY_TYPE_DATA) {
+            ...
+            // (1) 如果是新配置日志（即 C{new}）被提交，则会调用状态机的 on_configuration_committed
+            //     如果是联合配置日志，则不会
             if (iter_impl.entry()->type == ENTRY_TYPE_CONFIGURATION) {
                 if (iter_impl.entry()->old_peers == NULL) {
                     // Joint stage is not supposed to be noticeable by end users.
@@ -937,10 +618,9 @@ void FSMCaller::do_committed(int64_t committed_index) {
                             Configuration(*iter_impl.entry()->peers),
                             iter_impl.entry()->id.index);
                 }
-            }
-            // For other entries, we have nothing to do besides flush the
-            // pending tasks and run this closure to notify the caller that the
-            // entries before this one were successfully committed and applied.
+            ...
+            // (2) 不管是那种配置日志被提交，都会调用 Closure
+            //     即 ConfigurationChangeDone
             if (iter_impl.done()) {
                 iter_impl.done()->Run();
             }
@@ -949,28 +629,17 @@ void FSMCaller::do_committed(int64_t committed_index) {
         }
         Iterator iter(&iter_impl);
         _fsm->on_apply(iter);
-        LOG_IF(ERROR, iter.valid())
-                << "Node " << _node->node_id()
-                << " Iterator is still valid, did you return before iterator "
-                   " reached the end?";
-        // Try move to next in case that we pass the same log twice.
+        ...
         iter.next();
     }
-    if (iter_impl.has_error()) {
-        set_error(iter_impl.error());
-        iter_impl.run_the_rest_closure_with_error();
-    }
-    const int64_t last_index = iter_impl.index() - 1;
-    const int64_t last_term = _log_manager->get_term(last_index);
-    LogId last_applied_id(last_index, last_term);
-    _last_applied_index.store(committed_index, butil::memory_order_release);
-    _last_applied_term = last_term;
-    _log_manager->set_applied_id(last_applied_id);
+    ...
 }
 ```
 
 回调 Closure
 ---
+
+当配置日志被应用后，其会调用 `ConfigurationChangeDone::Run`，而该函数最终会调用 `ConfigurationCtx::next_stage` 进入下一阶段：
 
 ```cpp
 class ConfigurationChangeDone : public Closure {
@@ -978,51 +647,18 @@ public:
     void Run() {
         if (status().ok()) {
             _node->on_configuration_change_done(_term);
-            if (_leader_start) {
-                _node->leader_lease_start(_lease_epoch);
-                _node->_options.fsm->on_leader_start(_term);
-            }
+            ...
         }
-        delete this;
+        ...
     }
-private:
-    ConfigurationChangeDone(
-            NodeImpl* node, int64_t term, bool leader_start, int64_t lease_epoch)
-        : _node(node)
-        , _term(term)
-        , _leader_start(leader_start)
-        , _lease_epoch(lease_epoch)
-    {
-        _node->AddRef();
-    }
-    ~ConfigurationChangeDone() {
-        _node->Release();
-        _node = NULL;
-    }
-friend class NodeImpl;
-    NodeImpl* _node;
-    int64_t _term;
-    bool _leader_start;
-    int64_t _lease_epoch;
+    ...
 };
-```
 
-```cpp
 void NodeImpl::on_configuration_change_done(int64_t term) {
-    BAIDU_SCOPED_LOCK(_mutex);
-    if (_state > STATE_TRANSFERRING || term != _current_term) {
-        LOG(WARNING) << "node " << node_id()
-                     << " process on_configuration_change_done "
-                     << " at term=" << term
-                     << " while state=" << state2str(_state)
-                     << " and current_term=" << _current_term;
-        // Callback from older version
-        return;
-    }
+    ...
     _conf_ctx.next_stage();
 }
 ```
-
 
 阶段三：同步新配置
 ===
@@ -1046,7 +682,7 @@ void NodeImpl::ConfigurationCtx::next_stage() {
         // implementation.
     case STAGE_JOINT:  // (1) 执行该分支
         _stage = STAGE_STABLE;  // (2) 进入 Stable 阶段
-        return _node->unsafe_apply_configuration(
+        return _node->unsafe_apply_configuration(  // (3) 同样调用 unsafe_apply_configuration 开始变更
                     Configuration(_new_peers), NULL, false);
     case STAGE_STABLE:
         {
@@ -1069,72 +705,18 @@ void NodeImpl::ConfigurationCtx::next_stage() {
 
 开始变更
 ---
-```cpp
-void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
-                                          const Configuration* old_conf,
-                                          bool leader_start) {
-    CHECK(_conf_ctx.is_busy());
-    LogEntry* entry = new LogEntry();
-    entry->AddRef();
-    entry->id.term = _current_term;
-    entry->type = ENTRY_TYPE_CONFIGURATION;
-    entry->peers = new std::vector<PeerId>;
-    new_conf.list_peers(entry->peers);
-    if (old_conf) {
-        entry->old_peers = new std::vector<PeerId>;
-        old_conf->list_peers(entry->old_peers);
-    }
-    ConfigurationChangeDone* configuration_change_done =
-            new ConfigurationChangeDone(this, _current_term, leader_start, _leader_lease.lease_epoch());
-    // Use the new_conf to deal the quorum of this very log
-    _ballot_box->append_pending_task(new_conf, old_conf, configuration_change_done);
-
-    std::vector<LogEntry*> entries;
-    entries.push_back(entry);
-    _log_manager->append_entries(&entries,
-                                 new LeaderStableClosure(
-                                        NodeId(_group_id, _server_id),
-                                        1u, _ballot_box));
-    _log_manager->check_and_set_configuration(&_conf);
-}
-```
-
 应用新配置
 ---
-
-
-
 复制日志
 ---
-
 提交日志
 ---
-
 应用日志
 ---
-
 回调 Closure
 ---
 
-```cpp
-class ConfigurationChangeDone : public Closure {
-public:
-    void Run() {
-        if (status().ok()) {
-            _node->on_configuration_change_done(_term);
-            ...
-        }
-        ...
-    }
-    ...
-};
-
-void NodeImpl::on_configuration_change_done(int64_t term) {
-    ...
-    _conf_ctx.next_stage();
-}
-```
-
+以上这些步骤跟<阶段二：联合共识>的步骤是一样的，你可以从[<开始变更>](#kai-shi-bian-geng)开始重走一遍逻辑。
 
 阶段四：清理工作
 ===
@@ -1142,7 +724,7 @@ void NodeImpl::on_configuration_change_done(int64_t term) {
 进入新阶段
 ---
 
-调用 `next_stage` 进入清理阶段：
+待新配置被提交后，会调用 `next_stage` 进入清理阶段：
 
 ```cpp
 void NodeImpl::ConfigurationCtx::next_stage() {
@@ -1305,45 +887,20 @@ void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate,
 其他：故障恢复
 ===
 
+当执行配置变更的 Leader 中途 Crash 了，新当选的 Leader 继续执行配置变更：
+
 ```cpp
-// in lock
+// (1) 节点当选为 Leader
 void NodeImpl::become_leader() {
     ...
-    // cancel candidate vote timer
-    _vote_timer.stop();  // (1) 停止投票计时器
-    ...
-    _state = STATE_LEADER;  // (2) 将自身角色转变为 Leader
-    _leader_id = _server_id;  // (3) 记录当前 leaderId 为自身的 PeerId
-    ...
-    // (3) 为所有 Follower 创建 Replicator，Replicator 主要负责向 Follower 发送心跳、日志等
-    std::set<PeerId> peers;
-    _conf.list_peers(&peers);
-    for (std::set<PeerId>::const_iterator
-            iter = peers.begin(); iter != peers.end(); ++iter) {
-        ...
-        _replicator_group.add_replicator(*iter);
-    }
-
-    // (4) 设置最小可以提交的 logIndex，在这之前的日志就算复制达到了 Quorum，也不会更新 commitIndex
-    //     注意：这是实现只复制但不提交上一任期日志的关键
-    // init commit manager
-    _ballot_box->reset_pending_index(_log_manager->last_log_index() + 1);
-
-    // (5) 复制并提交本一条任期的配置日志
-    // Register _conf_ctx to reject configuration changing before the first log
-    // is committed.
+    // (2) 调用  ConfigurationCtx::flush
     _conf_ctx.flush(_conf.conf, _conf.old_conf);
-
-    // (6) 启动 StepdownTimer，用于实现 Check Quorum 优化
-    //     详见 <3.2 选举优化> 小节
-    _stepdown_timer.start();
+    ...
 }
-```
 
-```cpp
 void NodeImpl::ConfigurationCtx::flush(const Configuration& conf,
                                        const Configuration& old_conf) {
-    CHECK(!is_busy());
+    ...
     conf.list_peers(&_new_peers);
     if (old_conf.empty()) {
         _stage = STAGE_STABLE;
@@ -1352,9 +909,9 @@ void NodeImpl::ConfigurationCtx::flush(const Configuration& conf,
         _stage = STAGE_JOINT;
         old_conf.list_peers(&_old_peers);
     }
+    // (3) 依旧是调用 unsafe_apply_configuration 开始变更，详见以上 <开始变更>
     _node->unsafe_apply_configuration(conf, old_conf.empty() ? NULL : &old_conf,
                                       true);
-
 }
 ```
 
