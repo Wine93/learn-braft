@@ -25,7 +25,8 @@
 5. 进入同步新配置（`Stable`）阶段：
     * 5.1 应用新配置（即 `C{new}`）为当前节点配置，以该配置视角进行选举和日志复制：
         * 5.1.1 在该阶段，选举只需在新集群达到 `Qourum`
-        * 5.1.2 在该阶段，日志仍会复制给新老集群，只需在新集群达到 `Qourum` 即可提交
+        * 5.1.2 在该阶段，日志只需在新集群达到 `Qourum` 即可提交
+        * 5.1.3 在该阶段，日志仍会被复制给新老集群，因为老集群中的 `Replicator` 还未停止
     * 5.2 Leader 将新配置日志（即 `C{new}`）同时复制给新老集群；同时也复制其他日志
     * 5.3 待新配置在新集群中达到 `Qourum`，则提交并应用该日志：
         * 5.3.1 以新配置作为参数，调用用户状态机的 `on_configuration_committed`
@@ -54,35 +55,23 @@
 
 从上面可以看出，一旦 `C{old,new}` 已达到 `Quorum` 被提交，则可以立马应用 `C{new}`，因为即使此时 Leader 此时挂掉，新 Leader 也将继续推进变更从而使用  `C{new}`，等同于处于事务的隐式提交（implicit commit）一样。详见以下[故障恢复](#其他故障恢复)。
 
+<!--
+
+TODO(Wine93,P0)
 新节点配置
 ---
-
+* https://github.com/baidu/braft/issues/204
+新节点启动的时候需要为空节点，否则可能需要脑裂
+参考 https://github.com/baidu/braft/issues/303
+新加入集群节点的配置必须为空，否则可能会导致脑裂；新节点的配置应由 Leader 同步给它。考虑下图中的场景：
 {1,2,3} {1,2,4}
+-->
 
 干扰集群
 ---
 
-![](image/6.2.png)
+![图 6.2  被移节点干扰集群示例](image/6.2.png)
 
-<!---
-TODO:
-* https://github.com/baidu/braft/issues/204
---->
-
-<!--
-新节点配置
----
-
-新加入集群节点的配置必须为空，否则可能会导致脑裂；新节点的配置应由 Leader 同步给它。考虑下图中的场景：
-
-
-```cpp
-{1,2,3} => {1,4,5} 2 是主?
-```
-
-新节点启动的时候需要为空节点，否则可能需要脑裂
-参考 https://github.com/baidu/braft/issues/303
--->
 
 相关接口
 ---
@@ -212,7 +201,7 @@ void NodeImpl::ConfigurationCtx::start(const Configuration& old_conf,
     }
 ```
 
-注册 Closure
+保存 Closure
 ---
 
 ```cpp
@@ -646,28 +635,42 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
 }
 ```
 
-判断差距
+判断日志差距
 ---
 
 成功安装快照或每次成功同步一批日之后，都会调用 `_notify_on_caught_up` 判断新加入节点日志与当前 Leader 的差距。若差距小于一定值（默认为 1000），
 
 ```cpp
+// (1) 调用 _notify_on_caught_up 判断日志差距
 void Replicator::_notify_on_caught_up(int error_code, bool before_destroy) {
+    // (2) 判断新节点日志与当前 Leader 的差距是否小于一定值（默认为 1000，用户可通过 NodeOption 配置）
+    //     若不满足条件，则继续同步日志
     if (!_is_catchup(_catchup_closure->_max_margin)) {
         return;
     }
     ...
+    // (3) 否则，调用 之前保存的 CatchupClosure，即 OnCaughtUp
     Closure* saved_catchup_closure = _catchup_closure;
-    _catchup_closure = NULL;
+    ...
     return run_closure_in_bthread(saved_catchup_closure);
 }
-```
 
-```cpp
+class OnCaughtUp : public CatchupClosure {
+public:
+    ...
+    virtual void Run() {
+        // (4) 调用 NodeImpl::on_caughtup
+        _node->on_caughtup(_peer, _term, _version, status());
+        ...
+    };
+    ...
+};
+
 void NodeImpl::on_caughtup(const PeerId& peer, int64_t term,
                            int64_t version, const butil::Status& st) {
     ...
     if (st.ok()) {  // Caught up successfully
+        // (5) 调用 NodeImpl::ConfigurationCtx::on_caughtup
         _conf_ctx.on_caughtup(version, peer, true);
         return;
     }
@@ -678,6 +681,8 @@ void NodeImpl::ConfigurationCtx::on_caughtup(
         int64_t version, const PeerId& peer_id, bool succ) {
 
     ...
+    // (6) 将已经满足条件的节点从 _adding_peers 中移除
+    //     如果所有节点均已追赶成功，则调用 next_stage 进入下一阶段（联合共识）
     if (succ) {
         _adding_peers.erase(peer_id);
         if (_adding_peers.empty()) {
@@ -703,7 +708,7 @@ void NodeImpl::ConfigurationCtx::next_stage() {
         if (_nchanges > 1) {
             _stage = STAGE_JOINT;  // (2) 进入联合共识阶段
             Configuration old_conf(_old_peers);
-            return _node->unsafe_apply_configuration(
+            return _node->unsafe_apply_configuration(  // (3) 调用 unsafe_apply_configuration 应用联合日志（即 C{old,new}）
                     Configuration(_new_peers), &old_conf, false);
         }
         // Skip joint consensus since only one peer has been changed here. Make
@@ -732,9 +737,7 @@ void NodeImpl::ConfigurationCtx::next_stage() {
 }
 ```
 
-应用 `C{old,new}`
----
-复制日志
+开始变更
 ---
 
 ```cpp
@@ -764,6 +767,49 @@ void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
     _log_manager->check_and_set_configuration(&_conf);
 }
 ```
+
+应用联合配置
+---
+
+Leader 调用 `check_and_set_configuration` 将当前配置变为联合配置，即 `C{old,new}`：
+
+```cpp
+bool LogManager::check_and_set_configuration(ConfigurationEntry* current) {
+    ...
+    // (1) 从 _config_manager 中获取最新的配置
+    const ConfigurationEntry& last_conf = _config_manager->last_configuration();
+    // (2) 将其变为当前节点配置
+    if (current->id != last_conf.id) {
+        *current = last_conf;
+        return true;
+    }
+    return false;
+}
+
+// (3) 而 _config_manager 的配置是在之前往 LogManager 追加配置日志时，保存在 _config_manager 中的
+void LogManager::append_entries(
+            std::vector<LogEntry*> *entries, StableClosure* done) {
+    ...
+    for (size_t i = 0; i < entries->size(); ++i) {
+        ...
+        if ((*entries)[i]->type == ENTRY_TYPE_CONFIGURATION) {
+            ConfigurationEntry conf_entry(*((*entries)[i]));
+            _config_manager->add(conf_entry);
+        }
+    }
+    ...
+}
+```
+
+复制日志
+---
+
+调用 `LogManager::append_entries` 追加配置日志（即 `C{old,new}`） 后，`Replicator` 就会被唤醒向 Follower 同步日志。
+
+Leader 会将普通日志和配置日志（即 `C{old,new}`）复制给新老集群，每收到一个节点的成功响应，都会调用 ``
+
+
+
 
 ```cpp
 int BallotBox::append_pending_task(const Configuration& conf, const Configuration* old_conf,
@@ -816,19 +862,7 @@ int Ballot::init(const Configuration& conf, const Configuration* old_conf) {
 // 将 index 在 [fist_log_index, last_log_index] 之间的日志的投票数加一
 int BallotBox::commit_at(
         int64_t first_log_index, int64_t last_log_index, const PeerId& peer) {
-    // FIXME(chenzhangyi01): The cricital section is unacceptable because it
-    // blocks all the other Replicators and LogManagers
-    std::unique_lock<raft_mutex_t> lck(_mutex);
-    if (_pending_index == 0) {
-        return EINVAL;
-    }
-    if (last_log_index < _pending_index) {
-        return 0;
-    }
-    if (last_log_index >= _pending_index + (int64_t)_pending_meta_queue.size()) {
-        return ERANGE;
-    }
-
+    ...
     int64_t last_committed_index = 0;
     const int64_t start_at = std::max(_pending_index, first_log_index);
     Ballot::PosHint pos_hint;
@@ -864,22 +898,7 @@ int BallotBox::commit_at(
 }
 ```
 
-```cpp
-bool LogManager::check_and_set_configuration(ConfigurationEntry* current) {
-    if (current == NULL) {
-        CHECK(false) << "current should not be NULL";
-        return false;
-    }
-    BAIDU_SCOPED_LOCK(_mutex);
 
-    const ConfigurationEntry& last_conf = _config_manager->last_configuration();
-    if (current->id != last_conf.id) {
-        *current = last_conf;
-        return true;
-    }
-    return false;
-}
-```
 
 应用日志
 ---
@@ -1042,9 +1061,8 @@ void NodeImpl::ConfigurationCtx::next_stage() {
 }
 ```
 
-应用 `C{new}`
+开始变更
 ---
-
 ```cpp
 void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
                                           const Configuration* old_conf,
@@ -1074,6 +1092,11 @@ void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
     _log_manager->check_and_set_configuration(&_conf);
 }
 ```
+
+应用新配置
+---
+
+
 
 复制日志
 ---
@@ -1329,6 +1352,7 @@ void NodeImpl::ConfigurationCtx::flush(const Configuration& conf,
 }
 ```
 
+<!--
 其他：变更失败
 ===
 
@@ -1353,3 +1377,5 @@ TODO
 * 2PC 怎么保证原子性, 负责变更的 leader 挂掉了?
 
 * 假如新节点错误，会不会阻塞后续的变更？不会，在 catchup 阶段就行不通了
+
+-->
