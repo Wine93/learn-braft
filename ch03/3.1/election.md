@@ -220,18 +220,24 @@ void NodeImpl::handle_election_timeout() {
 ```cpp
 void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
     ...
-    // (1) 获取节点的 lastLog
+    // (1) 如果当前节点已经被集群移除了，则不再参与选举
+    if (!_conf.contains(_server_id)) {
+        ...
+        return;
+    }
+    ...
+    // (2) 获取节点的 lastLog
     const LogId last_log_id = _log_manager->last_log_id(true);
 
     _pre_vote_ctx.init(this, triggered);
     std::set<PeerId> peers;
     _conf.list_peers(&peers);
 
-    // (2) 向组内所有节点发送 `PreVote` 请求
+    // (3) 向组内所有节点发送 `PreVote` 请求
     for (std::set<PeerId>::const_iterator
             iter = peers.begin(); iter != peers.end(); ++iter) {
         ...
-        // (3) 设置回调函数
+        // (4) 设置回调函数
         OnPreVoteRPCDone* done = new OnPreVoteRPCDone(
                 *iter, _current_term, _pre_vote_ctx.version(), this);
         ...
@@ -242,7 +248,7 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
         RaftService_Stub stub(&channel);
         stub.pre_vote(&done->cntl, &done->request, &done->response, done);
     }
-    // (4) 给自己投一票
+    // (5) 给自己投一票
     grant_self(&_pre_vote_ctx, lck);
 }
 ```
@@ -358,30 +364,35 @@ TODO(Wine93):
 void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
                           bool old_leader_stepped_down) {
     ...
-
-    _state = STATE_CANDIDATE;  // (1) 将自身角色转变为 Candidate
-    _current_term++;           // (2) 将自身的 term+1
-    _voted_id = _server_id;    // (3) 记录 votedFor 投给自己
+    // (1) 如果当前节点已经被集群移除了，则不再参与选举
+    if (!_conf.contains(_server_id)) {
+        ...
+        return;
+    }
+    ...
+    _state = STATE_CANDIDATE;  // (2) 将自身角色转变为 Candidate
+    _current_term++;           // (3) 将自身的 term+1
+    _voted_id = _server_id;    // (4) 记录 votedFor 投给自己
 
     ...
-    // (4) 启动投票超时器：如果在 vote_timeout_ms 未得到足够多的选票，则变为 Follower 重新进行 PreVote
+    // (5) 启动投票超时器：如果在 vote_timeout_ms 未得到足够多的选票，则变为 Follower 重新进行 PreVote
     _vote_timer.start();
 
-    // (5) 获取 LastLog 的 index 和 term（LogId 由 index 和 term 组成）
+    // (6) 获取 LastLog 的 index 和 term（LogId 由 index 和 term 组成）
     const LogId last_log_id = _log_manager->last_log_id(true);
     ...
     _vote_ctx.set_last_log_id(last_log_id);
 
-    // (6) 向所有节点广播 `RequestVote` 请求
+    // (7) 向所有节点广播 `RequestVote` 请求
     std::set<PeerId> peers;
     _conf.list_peers(&peers);
     request_peers_to_vote(peers, _vote_ctx.disrupted_leader());
 
-    // (7) 持久化 currentTerm，votedFor
+    // (8) 持久化 currentTerm，votedFor
     status = _meta_storage->
                     set_term_and_votedfor(_current_term, _server_id, _v_group_id);
 
-    // (8) 给自己投一票
+    // (9) 给自己投一票
     grant_self(&_vote_ctx, lck);
 }
 ```
