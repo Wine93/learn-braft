@@ -716,7 +716,7 @@ void NodeImpl::ConfigurationCtx::next_stage() {
 回调 Closure
 ---
 
-以上这些步骤跟<阶段二：联合共识>的步骤是一样的，你可以从[<开始变更>](#kai-shi-bian-geng)开始重走一遍逻辑。
+以上这些步骤跟<阶段二：联合共识>的步骤是一样的，你可以从[<开始变更>](#kai-shi-bian-geng-1)开始重走一遍逻辑。
 
 阶段四：清理工作
 ===
